@@ -2,7 +2,10 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-
+Version: 5.38 (Fase 1 - Final)
+- Restaura o método de autenticação para JWT Bearer Flow com chave privada.
+- Mantém a lógica de busca individual de cada Data Stream para garantir a precisão
+  na verificação de mapeamentos.
 
 Regras de Auditoria:
 1. Segmentos:
@@ -11,7 +14,7 @@ Regras de Auditoria:
 
 2. Ativações:
   - Órfã: Associada a um segmento que foi identificado como órfão.
-ı
+
 3. Data Model Objects (DMOs):
   - Órfão se: For um DMO customizado (termina em __dlm), não for utilizado em nenhum Segmento, 
     Data Graph, CI ou Data Action, E (Criado > 90 dias OU Data de Criação desconhecida).
@@ -34,40 +37,45 @@ import logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode, urljoin
 
+import jwt
 import requests
 import aiohttp
 from dotenv import load_dotenv
 
 # --- Configuration ---
 API_VERSION = "v64.0"
-CONCURRENCY_LIMIT = 10
+CONCURRENCY_LIMIT = 15
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Authentication ---
 def get_access_token():
-    """Authenticates with Salesforce using the Username-Password Flow."""
-    logging.info("🔑 Authenticating with Salesforce using Username-Password Flow...")
+    """Authenticates with Salesforce using the JWT Bearer Flow."""
+    logging.info("🔑 Authenticating with Salesforce using JWT Bearer Flow...")
     load_dotenv()
-
+    
     sf_client_id = os.getenv("SF_CLIENT_ID")
-    sf_client_secret = os.getenv("SF_CLIENT_SECRET")
     sf_username = os.getenv("SF_USERNAME")
-    sf_password = os.getenv("SF_PASSWORD")
-    sf_security_token = os.getenv("SF_SECURITY_TOKEN", "") # Opcional se o IP for confiável
+    sf_audience = os.getenv("SF_AUDIENCE")
     sf_login_url = os.getenv("SF_LOGIN_URL")
 
-    if not all([sf_client_id, sf_client_secret, sf_username, sf_password, sf_login_url]):
-        raise ValueError("Variáveis de ambiente necessárias para o fluxo Username-Password estão faltando (.env).")
+    if not all([sf_client_id, sf_username, sf_audience, sf_login_url]):
+        raise ValueError("One or more required environment variables are missing.")
 
-    params = {
-        'grant_type': 'password',
-        'client_id': sf_client_id,
-        'client_secret': sf_client_secret,
-        'username': sf_username,
-        'password': f"{sf_password}{sf_security_token}"
+    try:
+        with open('private.pem', 'r') as f:
+            private_key = f.read()
+    except FileNotFoundError:
+        logging.error("❌ 'private.pem' file not found.")
+        raise
+
+    payload = {
+        'iss': sf_client_id, 'sub': sf_username, 'aud': sf_audience,
+        'exp': int(time.time()) + 300
     }
+    assertion = jwt.encode(payload, private_key, algorithm='RS256')
+    params = {'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': assertion}
     token_url = f"{sf_login_url}/services/oauth2/token"
 
     try:
@@ -86,11 +94,6 @@ async def fetch_all_pages(session, semaphore, base_url, initial_path, key_name, 
     next_page_url = initial_path
     
     while next_page_url:
-        # Garante que o parâmetro 'includeMappings' seja mantido em todas as páginas
-        if "data-streams" in initial_path and "includeMappings=true" not in next_page_url:
-            separator = '&' if '?' in next_page_url else '?'
-            next_page_url = f"{next_page_url}{separator}includeMappings=true"
-
         current_url = urljoin(base_url, next_page_url) if next_page_url.startswith('/') else next_page_url
             
         try:
@@ -111,10 +114,23 @@ async def fetch_all_pages(session, semaphore, base_url, initial_path, key_name, 
                     
         except aiohttp.ClientError as e:
             logging.error(f"❌ Error fetching {current_url}: {e}")
-            # Retorna uma lista vazia em caso de erro para não parar o script
             return []
             
     return all_records
+
+async def fetch_single_record(session, semaphore, url):
+    """Fetches a single record from a specific URL."""
+    try:
+        async with semaphore:
+            async with session.get(url) as response:
+                if response.status == 404:
+                    logging.warning(f"⚠️ Record not found (404): {url}")
+                    return None
+                response.raise_for_status()
+                return await response.json()
+    except aiohttp.ClientError as e:
+        logging.error(f"❌ Error fetching single record {url}: {e}")
+        return None
 
 async def fetch_tooling_api_query(session, base_url, soql_query, object_name=""):
     """Fetches data from the Tooling API using a SOQL query."""
@@ -165,7 +181,7 @@ async def main():
         tasks = [
             fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/segments", 'segments'),
             fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/activations", 'activations'),
-            fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-streams?includeMappings=true", 'dataStreams'),
+            fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-streams", 'dataStreams'),
             fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-graphs/metadata", 'dataGraphMetadata'),
             fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/metadata?entityType=DataModelObject", 'metadata'),
             fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/metadata?entityType=CalculatedInsight", 'metadata'),
@@ -173,7 +189,19 @@ async def main():
             fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-actions", 'dataActions'),
             fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-kits", 'dataKits')
         ]
-        segments, activations, data_streams, data_graphs, dm_objects, calculated_insights, dmo_tooling_data, data_actions, data_kits = await asyncio.gather(*tasks)
+        segments, activations, data_streams_summary, data_graphs, dm_objects, calculated_insights, dmo_tooling_data, data_actions, data_kits = await asyncio.gather(*tasks)
+
+        # Fetch detailed data for each data stream to get mappings
+        logging.info(f"🔎 Fetching detailed information for {len(data_streams_summary)} data streams to check mappings...")
+        ds_detail_tasks = []
+        for ds in data_streams_summary:
+            ds_name = ds.get('name')
+            if ds_name:
+                url = f"{instance_url}/services/data/{API_VERSION}/ssot/data-streams/{ds_name}?includeMappings=true"
+                ds_detail_tasks.append(fetch_single_record(session, semaphore, url))
+        
+        data_streams = await asyncio.gather(*ds_detail_tasks)
+        data_streams = [ds for ds in data_streams if ds is not None] # Filter out any failed fetches
 
     logging.info("📊 Data fetched. Analyzing dependencies...")
     
