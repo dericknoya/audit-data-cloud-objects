@@ -2,7 +2,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) não utilizados.
 
-Versão: 8.3 - Correção Final na Análise de Segmentos (Campos Relacionados)
+Versão: 8.5
 
 Metodologia:
 - Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
@@ -30,9 +30,10 @@ import aiohttp
 from dotenv import load_dotenv
 
 # --- Configuração de Rede ---
-USE_PROXY = True
-PROXY_URL = "https://felirub:080796@proxynew.itau:8080" # Substitua pelas suas credenciais
-VERIFY_SSL = False
+USE_PROXY = True  # Mude para False se não precisar de proxy
+# **MUDANÇA**: Substitua o valor abaixo pela URL, usuário, senha e porta do seu proxy
+PROXY_URL = "http://usuario:senha@proxy.suaempresa.com:porta" 
+VERIFY_SSL = False # Mude para True para verificar o certificado SSL
 
 # --- Configuração do Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -63,8 +64,8 @@ def get_access_token():
     token_url = f"{sf_login_url}/services/oauth2/token"
     
     try:
-        proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY else None
-        res = requests.post(token_url, data=params, proxies=proxies, verify=VERIFY_SSL)
+        # A chamada de autenticação é feita SEM proxy
+        res = requests.post(token_url, data=params, verify=VERIFY_SSL)
         res.raise_for_status()
         logging.info("✅ Autenticação bem-sucedida.")
         return res.json()
@@ -103,19 +104,15 @@ def _recursive_find_fields(obj, used_fields_set):
     """Função recursiva para encontrar nomes de campos em estruturas JSON complexas."""
     if isinstance(obj, dict):
         for key, value in obj.items():
-            # **MUDANÇA CRÍTICA**: Lógica para tratar campos diretos e relacionados
             if key == 'fieldApiName' and isinstance(value, str) and value:
                 if '.' in value:
-                    # É um campo relacionado (ex: 'DMO__dlm.Campo__c')
                     parts = value.split('.')
                     if len(parts) == 2:
                         dmo_part, field_part = parts
-                        used_fields_set.add(dmo_part)  # Adiciona o DMO como usado
-                        used_fields_set.add(field_part) # Adiciona o campo específico
+                        used_fields_set.add(dmo_part)
+                        used_fields_set.add(field_part)
                 else:
-                    # É um campo direto no objeto principal do segmento
                     used_fields_set.add(value)
-            # Mantém a lógica para CIs e Ativações
             elif key == 'name' and 'type' in obj and isinstance(value, str):
                  used_fields_set.add(value)
             elif isinstance(value, (dict, list)):
