@@ -2,6 +2,21 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) não utilizados.
 
+Versão: 8.5
+
+Metodologia:
+- Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
+- Um campo "não utilizado" é aquele que não é encontrado em Segmentos, Ativações ou CIs.
+- Audita o uso de campos analisando os critérios de Segmentos ('includeCriteria'/'excludeCriteria').
+- Audita o uso de campos buscando os metadados detalhados de cada Ativação.
+- Audita o uso de campos e DMOs dentro de Calculated Insights.
+- O relatório final inclui os Nomes de Exibição do DMO e do Campo para melhor legibilidade.
+- Exclui campos e DMOs de sistema/gerados automaticamente da análise.
+- Adiciona uma coluna 'DELETAR' como a primeira coluna, com o valor padrão 'NAO'.
+""""""
+Este script audita uma instância do Salesforce Data Cloud para identificar 
+campos de DMOs (Data Model Objects) não utilizados.
+
 Versão: 8.9
 
 Metodologia:
@@ -13,6 +28,8 @@ Metodologia:
 - O relatório final inclui os Nomes de Exibição do DMO e do Campo para melhor legibilidade.
 - Exclui campos e DMOs de sistema/gerados automaticamente da análise.
 - Adiciona uma coluna 'DELETAR' como a primeira coluna, com o valor padrão 'NAO'.
+
+https://itauengajamentoworkflow--sfdcenv.sandbox.my.salesforce.com/setup/emailverif?oid=00DHZ000005wWsf&k=Cj4KNQoPMDBESFowMDAwMDV3V3NmEg8wMkc1ZTAwMDAwMEhNUFUaDzAwNWJKMDAwMDBKT1dPbyAFGOTvgdGKMxIQebdKKXhCCAuwW3lKZxJZHRoM04kBGmWLexwzITK0IoIB4WpbD1pDVWZmTfnITpvQ3EbjhgdHtwQxNMP-uU_fcrpuSe-2WuLnOHmg8PrglIOovww3yaNHcQnibApXtQ-YvLuR4Y4Qpaq1vEs8VlcIJq5PPb7ppII010RUBgZ6R5d8wiYNcfigYnwtLQOTsMTwUmjHdwrtcJZuGAX_EBSmSKVNlg%3D%3D
 """
 import os
 import time
@@ -121,13 +138,10 @@ async def audit_dmo_fields():
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
         
         # **MUDANÇA CRÍTICA**: Usa uma única chamada com o parâmetro 'filters'
-        segment_filter = "SegmentStatus in Active,Inactive,Draft"
-        encoded_filter = urlencode({'filters': segment_filter})
-        segment_url = f"/services/data/v64.0/ssot/segments?{encoded_filter}"
-        logging.info(f"🔎 Buscando todos os segmentos via: {segment_url}")
+        logging.info(f"🔎 Buscando todos os segmentos via: /services/data/v64.0/ssot/segments?filters = SegmentStatus in Active")
 
         base_tasks = [
-            fetch_api_data(session, instance_url, segment_url, 'segments'),
+            fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/segments?filters = SegmentStatus in Active", 'segments'),
             fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/metadata?entityType=DataModelObject", 'metadata'),
             fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/activations", 'activations'),
             fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/metadata?entityType=CalculatedInsight", 'metadata'),
