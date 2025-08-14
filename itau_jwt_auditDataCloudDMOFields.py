@@ -1,9 +1,6 @@
-# -*- coding: utf-8 -*-
 """
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) não utilizados.
-
-Versão: 8.1 - Versão Final (Adiciona Suporte a Proxy e SSL)
 
 Metodologia:
 - Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
@@ -30,10 +27,10 @@ import requests
 import aiohttp
 from dotenv import load_dotenv
 
-# --- MUDANÇA: Seção de Configuração de Rede ---
-USE_PROXY = True  # Mude para False se não precisar de proxy
+# --- Configuração de Rede ---
+USE_PROXY = True
 PROXY_URL = "http://seu_usuario:sua_senha@host:porta" # Substitua pelo seu proxy
-VERIFY_SSL = False # Mude para True para verificar o certificado SSL
+VERIFY_SSL = False
 
 # --- Configuração do Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -64,7 +61,6 @@ def get_access_token():
     token_url = f"{sf_login_url}/services/oauth2/token"
     
     try:
-        # **MUDANÇA**: Adiciona suporte a proxy e ssl na chamada de autenticação
         proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY else None
         res = requests.post(token_url, data=params, proxies=proxies, verify=VERIFY_SSL)
         res.raise_for_status()
@@ -75,14 +71,12 @@ def get_access_token():
 
 
 # --- API Fetching ---
-
 async def fetch_api_data(session, instance_url, relative_url, key_name=None):
     """Função genérica assíncrona para buscar dados, com suporte a proxy e ssl."""
     all_records = []
     current_url = urljoin(instance_url, relative_url)
     try:
         while current_url:
-            # **MUDANÇA**: Define os parâmetros de proxy e ssl para a chamada
             kwargs = {'ssl': VERIFY_SSL}
             if USE_PROXY:
                 kwargs['proxy'] = PROXY_URL
@@ -103,7 +97,6 @@ async def fetch_api_data(session, instance_url, relative_url, key_name=None):
         logging.error(f"❌ Erro ao buscar {current_url}: {e}"); return [] if key_name else {}
 
 # --- Helper Functions ---
-
 def _recursive_find_fields(obj, used_fields_set):
     if isinstance(obj, dict):
         for key, value in obj.items():
@@ -117,18 +110,18 @@ def _recursive_find_fields(obj, used_fields_set):
         for item in obj:
             _recursive_find_fields(item, used_fields_set)
 
-def parse_segment_criteria(criteria_str, used_fields_set):
-    if not criteria_str: return
+def parse_json_from_string(json_string, used_fields_set):
+    """Decodifica e analisa uma string JSON para encontrar campos."""
+    if not json_string: return
     try:
-        decoded_str = html.unescape(criteria_str)
+        decoded_str = html.unescape(json_string)
         data = json.loads(decoded_str)
         _recursive_find_fields(data, used_fields_set)
     except (json.JSONDecodeError, TypeError):
-        logging.warning(f"⚠️ Falha ao processar critério de segmento: {criteria_str[:100]}...")
+        logging.warning(f"⚠️ Falha ao processar critério de segmento: {json_string[:100]}...")
 
 
 # --- Main Audit Logic ---
-
 async def audit_dmo_fields():
     auth_data = get_access_token()
     access_token = auth_data['access_token']
@@ -136,7 +129,6 @@ async def audit_dmo_fields():
     logging.info('🚀 Iniciando auditoria de campos de DMO não utilizados...')
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
 
-    # **MUDANÇA**: Connector aiohttp agora não precisa mais da config SSL, pois é passada por chamada
     async with aiohttp.ClientSession(headers=headers) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
         base_tasks = [
@@ -171,14 +163,20 @@ async def audit_dmo_fields():
     logging.info(f"🗺️ Mapeados {total_fields} campos em {len(all_dmo_data)} DMOs customizados (após filtragem).")
 
     used_fields = set()
+
+    # **MUDANÇA**: Análise de Segmentos aprimorada
     for seg in segments_list:
-        if criteria := seg.get('includeCriteria'): parse_segment_criteria(criteria, used_fields)
-        if criteria := seg.get('excludeCriteria'): parse_segment_criteria(criteria, used_fields)
+        # Inspeciona tanto a definição antiga quanto a nova
+        if criteria := seg.get('includeCriteria'): parse_json_from_string(criteria, used_fields)
+        if criteria := seg.get('excludeCriteria'): parse_json_from_string(criteria, used_fields)
+        if criteria := seg.get('filterDefinition'): parse_json_from_string(criteria, used_fields)
     logging.info(f"🔍 Identificados {len(used_fields)} campos únicos em Segmentos.")
+
     initial_count = len(used_fields)
     for act in detailed_activations:
         _recursive_find_fields(act, used_fields)
     logging.info(f"🔍 Identificados {len(used_fields) - initial_count} campos adicionais em Ativações.")
+
     initial_count = len(used_fields)
     for ci in calculated_insights:
         _recursive_find_fields(ci.get('ciObject', ci), used_fields)

@@ -1,5 +1,6 @@
 .env
-.env_jwt
+.envUsrDerick
+.envitau
 private.pem
 audit_objetos_para_exclusao.csv
 audit_campos_dmo_nao_utilizados.csv
