@@ -97,7 +97,6 @@ async def fetch_api_data(session, instance_url, relative_url, key_name=None):
 
 # --- Helper Functions ---
 def _recursive_find_fields_generic(obj, used_fields_set):
-    """Função recursiva genérica para encontrar campos em Ativações e CIs."""
     if isinstance(obj, dict):
         if 'name' in obj and 'type' in obj and isinstance(obj['name'], str):
             used_fields_set.add(obj['name'])
@@ -120,14 +119,31 @@ async def audit_dmo_fields():
 
     async with aiohttp.ClientSession(headers=headers) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
+        
+        # **MUDANÇA CRÍTICA**: Busca todos os segmentos por status
+        logging.info("🔎 Buscando segmentos de todos os status (Active, Inactive, Draft)...")
+        segment_tasks = [
+            fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/segments?status=Active", 'segments'),
+            fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/segments?status=Inactive", 'segments'),
+            fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/segments?status=Draft", 'segments')
+        ]
+        
         base_tasks = [
             fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/metadata?entityType=DataModelObject", 'metadata'),
-            fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/segments", 'segments'),
             fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/activations", 'activations'),
             fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/metadata?entityType=CalculatedInsight", 'metadata'),
         ]
-        dmo_metadata_list, segments_list, activations_summary, calculated_insights = await asyncio.gather(*base_tasks)
         
+        # Executa todas as buscas em paralelo
+        results = await asyncio.gather(*(segment_tasks + base_tasks))
+        
+        # **MUDANÇA CRÍTICA**: Consolida os resultados dos segmentos
+        segments_active, segments_inactive, segments_draft = results[0], results[1], results[2]
+        dmo_metadata_list, activations_summary, calculated_insights = results[3], results[4], results[5]
+        
+        segments_list = segments_active + segments_inactive + segments_draft
+        logging.info(f"✅ Total de {len(segments_list)} segmentos encontrados.")
+
         logging.info("\n--- Etapa 2: Coletando detalhes das Ativações ---")
         activation_detail_tasks = [fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/activations/{act.get('id')}") for act in activations_summary if act.get('id')]
         logging.info(f"🔎 Buscando detalhes para {len(activation_detail_tasks)} ativações...")
@@ -152,20 +168,16 @@ async def audit_dmo_fields():
     logging.info(f"🗺️ Mapeados {total_fields} campos em {len(all_dmo_data)} DMOs customizados (após filtragem).")
 
     used_fields = set()
-
-    # **MUDANÇA CRÍTICA**: Nova lógica de análise de segmentos por busca de texto
+    
     logging.info("🔍 Analisando uso de campos em Segmentos com busca de texto direta...")
     all_segment_criteria_text = ""
     for seg in segments_list:
-        # Concatena todos os critérios em uma única string gigante
         if criteria := seg.get('includeCriteria'): all_segment_criteria_text += html.unescape(criteria)
         if criteria := seg.get('excludeCriteria'): all_segment_criteria_text += html.unescape(criteria)
         if criteria := seg.get('filterDefinition'): all_segment_criteria_text += html.unescape(criteria)
 
-    # Itera sobre todos os campos de todos os DMOs e verifica se são mencionados nos critérios
     for dmo_name, data in all_dmo_data.items():
         for field_api_name in data['fields'].keys():
-            # Busca pela string exata '"nome_do_campo"' (com aspas) para garantir precisão
             if f'"{field_api_name}"' in all_segment_criteria_text:
                 used_fields.add(field_api_name)
     logging.info(f"🔍 Identificados {len(used_fields)} campos únicos em Segmentos.")
