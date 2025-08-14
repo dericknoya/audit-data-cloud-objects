@@ -2,7 +2,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) não utilizados.
 
-Versão: 8.5
+Versão: 8.9
 
 Metodologia:
 - Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
@@ -22,7 +22,7 @@ import json
 import html
 import logging
 from collections import defaultdict
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlencode
 
 import jwt
 import requests
@@ -120,30 +120,22 @@ async def audit_dmo_fields():
     async with aiohttp.ClientSession(headers=headers) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
         
-        # **MUDANÇA CRÍTICA**: Busca todos os segmentos por status
-        logging.info("🔎 Buscando segmentos de todos os status (Active, Inactive, Draft)...")
-        segment_tasks = [
-            fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/segments?status=Active", 'segments'),
-            fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/segments?status=Inactive", 'segments'),
-            fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/segments?status=Draft", 'segments')
-        ]
-        
+        # **MUDANÇA CRÍTICA**: Usa uma única chamada com o parâmetro 'filters'
+        segment_filter = "SegmentStatus in Active,Inactive,Draft"
+        encoded_filter = urlencode({'filters': segment_filter})
+        segment_url = f"/services/data/v64.0/ssot/segments?{encoded_filter}"
+        logging.info(f"🔎 Buscando todos os segmentos via: {segment_url}")
+
         base_tasks = [
+            fetch_api_data(session, instance_url, segment_url, 'segments'),
             fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/metadata?entityType=DataModelObject", 'metadata'),
             fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/activations", 'activations'),
             fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/metadata?entityType=CalculatedInsight", 'metadata'),
         ]
         
-        # Executa todas as buscas em paralelo
-        results = await asyncio.gather(*(segment_tasks + base_tasks))
-        
-        # **MUDANÇA CRÍTICA**: Consolida os resultados dos segmentos
-        segments_active, segments_inactive, segments_draft = results[0], results[1], results[2]
-        dmo_metadata_list, activations_summary, calculated_insights = results[3], results[4], results[5]
-        
-        segments_list = segments_active + segments_inactive + segments_draft
+        segments_list, dmo_metadata_list, activations_summary, calculated_insights = await asyncio.gather(*base_tasks)
         logging.info(f"✅ Total de {len(segments_list)} segmentos encontrados.")
-
+        
         logging.info("\n--- Etapa 2: Coletando detalhes das Ativações ---")
         activation_detail_tasks = [fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/activations/{act.get('id')}") for act in activations_summary if act.get('id')]
         logging.info(f"🔎 Buscando detalhes para {len(activation_detail_tasks)} ativações...")
