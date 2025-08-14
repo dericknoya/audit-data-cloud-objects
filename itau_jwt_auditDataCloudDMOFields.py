@@ -29,7 +29,8 @@ Metodologia:
 - Exclui campos e DMOs de sistema/gerados automaticamente da análise.
 - Adiciona uma coluna 'DELETAR' como a primeira coluna, com o valor padrão 'NAO'.
 
-https://itauengajamentoworkflow--sfdcenv.sandbox.my.salesforce.com/setup/emailverif?oid=00DHZ000005wWsf&k=Cj4KNQoPMDBESFowMDAwMDV3V3NmEg8wMkc1ZTAwMDAwMEhNUFUaDzAwNWJKMDAwMDBKT1dPbyAFGOTvgdGKMxIQebdKKXhCCAuwW3lKZxJZHRoM04kBGmWLexwzITK0IoIB4WpbD1pDVWZmTfnITpvQ3EbjhgdHtwQxNMP-uU_fcrpuSe-2WuLnOHmg8PrglIOovww3yaNHcQnibApXtQ-YvLuR4Y4Qpaq1vEs8VlcIJq5PPb7ppII010RUBgZ6R5d8wiYNcfigYnwtLQOTsMTwUmjHdwrtcJZuGAX_EBSmSKVNlg%3D%3D
+https://itauengajamentoworkflow--sfdcenv.sandbox.my.salesforce.com/setup/emailverif?oid=00DHZ000005wWsf&k=Cj4KNQoPMDBESFowMDAwMDV3V3NmEg8wMkc1ZTAwMDAwMEhNUFUaDzAwNWJKMDAwMDBJQmtRTiAFGPGOgNWKMxIQZqX2F3TNj7c4bbTCL2SZ-RoMM8BzPljZ_74BH9AGIoMB7oqUKlTi_Qn0JX0eJxJSJ5aeGDLS78yeKTEWlimW0A87boj7UFM545RQg5MTN3PisrZNyHjCAsHlsYIB5T6oq2q3yB0utbQ36lOBtLo2MudV0mql5UZ5lvyDqalAyVdI_ahUi5a4Pocl_edt6l3lGdtjQX2WzwZxrvw6TrQm3-VLQSc%3D
+
 """
 import os
 import time
