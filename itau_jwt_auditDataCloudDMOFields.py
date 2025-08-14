@@ -99,7 +99,6 @@ async def fetch_api_data(session, instance_url, relative_url, key_name=None):
 def _recursive_find_fields_generic(obj, used_fields_set):
     """Função recursiva genérica para encontrar campos em Ativações e CIs."""
     if isinstance(obj, dict):
-        # Lógica para CIs e Ativações (que usam a chave 'name')
         if 'name' in obj and 'type' in obj and isinstance(obj['name'], str):
             used_fields_set.add(obj['name'])
         
@@ -154,10 +153,11 @@ async def audit_dmo_fields():
 
     used_fields = set()
 
-    # **MUDANÇA CRÍTICA**: Nova lógica de análise de segmentos
-    logging.info("🔍 Analisando uso de campos em Segmentos...")
+    # **MUDANÇA CRÍTICA**: Nova lógica de análise de segmentos por busca de texto
+    logging.info("🔍 Analisando uso de campos em Segmentos com busca de texto direta...")
     all_segment_criteria_text = ""
     for seg in segments_list:
+        # Concatena todos os critérios em uma única string gigante
         if criteria := seg.get('includeCriteria'): all_segment_criteria_text += html.unescape(criteria)
         if criteria := seg.get('excludeCriteria'): all_segment_criteria_text += html.unescape(criteria)
         if criteria := seg.get('filterDefinition'): all_segment_criteria_text += html.unescape(criteria)
@@ -165,15 +165,9 @@ async def audit_dmo_fields():
     # Itera sobre todos os campos de todos os DMOs e verifica se são mencionados nos critérios
     for dmo_name, data in all_dmo_data.items():
         for field_api_name in data['fields'].keys():
-            # Busca pela string exata '"fieldApiName":"nome_do_campo"'
-            search_string = f'"fieldApiName":"{field_api_name}"'
-            if search_string in all_segment_criteria_text:
+            # Busca pela string exata '"nome_do_campo"' (com aspas) para garantir precisão
+            if f'"{field_api_name}"' in all_segment_criteria_text:
                 used_fields.add(field_api_name)
-            # Busca por campos relacionados "DMO.Campo"
-            search_string_related = f'"fieldApiName":"{dmo_name}.{field_api_name}"'
-            if search_string_related in all_segment_criteria_text:
-                used_fields.add(field_api_name)
-                used_fields.add(dmo_name) # Marca o DMO inteiro como usado também
     logging.info(f"🔍 Identificados {len(used_fields)} campos únicos em Segmentos.")
 
     initial_count = len(used_fields)
