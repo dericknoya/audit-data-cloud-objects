@@ -30,17 +30,15 @@ import aiohttp
 from dotenv import load_dotenv
 
 # --- Configuração de Rede ---
-USE_PROXY = True  # Mude para False se não precisar de proxy
-# **MUDANÇA**: Substitua o valor abaixo pela URL, usuário, senha e porta do seu proxy
-PROXY_URL = "http://usuario:senha@proxy.suaempresa.com:porta" 
-VERIFY_SSL = False # Mude para True para verificar o certificado SSL
+USE_PROXY = True
+PROXY_URL = "http://usuario:senha@proxy.suaempresa.com:porta" # Substitua pelo seu proxy
+VERIFY_SSL = False
 
 # --- Configuração do Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Autenticação ---
 def get_access_token():
-    """Autentica com o Salesforce usando o fluxo JWT Bearer Flow."""
     logging.info("🔑 Autenticando com o Salesforce via JWT (certificado)...")
     load_dotenv()
     
@@ -64,7 +62,6 @@ def get_access_token():
     token_url = f"{sf_login_url}/services/oauth2/token"
     
     try:
-        # A chamada de autenticação é feita SEM proxy
         res = requests.post(token_url, data=params, verify=VERIFY_SSL)
         res.raise_for_status()
         logging.info("✅ Autenticação bem-sucedida.")
@@ -75,7 +72,6 @@ def get_access_token():
 
 # --- API Fetching ---
 async def fetch_api_data(session, instance_url, relative_url, key_name=None):
-    """Função genérica assíncrona para buscar dados, com suporte a proxy e ssl."""
     all_records = []
     current_url = urljoin(instance_url, relative_url)
     try:
@@ -100,36 +96,19 @@ async def fetch_api_data(session, instance_url, relative_url, key_name=None):
         logging.error(f"❌ Erro ao buscar {current_url}: {e}"); return [] if key_name else {}
 
 # --- Helper Functions ---
-def _recursive_find_fields(obj, used_fields_set):
-    """Função recursiva para encontrar nomes de campos em estruturas JSON complexas."""
+def _recursive_find_fields_generic(obj, used_fields_set):
+    """Função recursiva genérica para encontrar campos em Ativações e CIs."""
     if isinstance(obj, dict):
-        for key, value in obj.items():
-            if key == 'fieldApiName' and isinstance(value, str) and value:
-                if '.' in value:
-                    parts = value.split('.')
-                    if len(parts) == 2:
-                        dmo_part, field_part = parts
-                        used_fields_set.add(dmo_part)
-                        used_fields_set.add(field_part)
-                else:
-                    used_fields_set.add(value)
-            elif key == 'name' and 'type' in obj and isinstance(value, str):
-                 used_fields_set.add(value)
-            elif isinstance(value, (dict, list)):
-                _recursive_find_fields(value, used_fields_set)
+        # Lógica para CIs e Ativações (que usam a chave 'name')
+        if 'name' in obj and 'type' in obj and isinstance(obj['name'], str):
+            used_fields_set.add(obj['name'])
+        
+        for value in obj.values():
+            _recursive_find_fields_generic(value, used_fields_set)
+
     elif isinstance(obj, list):
         for item in obj:
-            _recursive_find_fields(item, used_fields_set)
-
-def parse_json_from_string(json_string, used_fields_set):
-    """Decodifica e analisa uma string JSON para encontrar campos."""
-    if not json_string: return
-    try:
-        decoded_str = html.unescape(json_string)
-        data = json.loads(decoded_str)
-        _recursive_find_fields(data, used_fields_set)
-    except (json.JSONDecodeError, TypeError):
-        logging.warning(f"⚠️ Falha ao processar critério de segmento: {json_string[:100]}...")
+            _recursive_find_fields_generic(item, used_fields_set)
 
 
 # --- Main Audit Logic ---
@@ -175,20 +154,36 @@ async def audit_dmo_fields():
 
     used_fields = set()
 
+    # **MUDANÇA CRÍTICA**: Nova lógica de análise de segmentos
+    logging.info("🔍 Analisando uso de campos em Segmentos...")
+    all_segment_criteria_text = ""
     for seg in segments_list:
-        if criteria := seg.get('includeCriteria'): parse_json_from_string(criteria, used_fields)
-        if criteria := seg.get('excludeCriteria'): parse_json_from_string(criteria, used_fields)
-        if criteria := seg.get('filterDefinition'): parse_json_from_string(criteria, used_fields)
+        if criteria := seg.get('includeCriteria'): all_segment_criteria_text += html.unescape(criteria)
+        if criteria := seg.get('excludeCriteria'): all_segment_criteria_text += html.unescape(criteria)
+        if criteria := seg.get('filterDefinition'): all_segment_criteria_text += html.unescape(criteria)
+
+    # Itera sobre todos os campos de todos os DMOs e verifica se são mencionados nos critérios
+    for dmo_name, data in all_dmo_data.items():
+        for field_api_name in data['fields'].keys():
+            # Busca pela string exata '"fieldApiName":"nome_do_campo"'
+            search_string = f'"fieldApiName":"{field_api_name}"'
+            if search_string in all_segment_criteria_text:
+                used_fields.add(field_api_name)
+            # Busca por campos relacionados "DMO.Campo"
+            search_string_related = f'"fieldApiName":"{dmo_name}.{field_api_name}"'
+            if search_string_related in all_segment_criteria_text:
+                used_fields.add(field_api_name)
+                used_fields.add(dmo_name) # Marca o DMO inteiro como usado também
     logging.info(f"🔍 Identificados {len(used_fields)} campos únicos em Segmentos.")
 
     initial_count = len(used_fields)
     for act in detailed_activations:
-        _recursive_find_fields(act, used_fields)
+        _recursive_find_fields_generic(act, used_fields)
     logging.info(f"🔍 Identificados {len(used_fields) - initial_count} campos adicionais em Ativações.")
 
     initial_count = len(used_fields)
     for ci in calculated_insights:
-        _recursive_find_fields(ci.get('ciObject', ci), used_fields)
+        _recursive_find_fields_generic(ci.get('ciObject', ci), used_fields)
         for rel in ci.get('relationships', []):
             if rel.get('fromEntity'): used_fields.add(rel['fromEntity'])
     logging.info(f"🔍 Identificados {len(used_fields) - initial_count} campos/objetos adicionais em Calculated Insights.")
