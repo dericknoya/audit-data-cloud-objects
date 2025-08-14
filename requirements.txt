@@ -1,0 +1,92 @@
+# --- Pacotes base sem dependências ou com poucas dependências ---
+attrs
+certifi
+cffi
+charset_normalizer
+colorama
+decorator
+idna
+packaging
+platformdirs
+pycparser
+six
+sniffio
+typing_extensions
+wcwidth
+
+# --- Utilitários de baixo nível e dependências de rede ---
+anyio
+h11
+httpcore
+pywin32
+pyzmq
+rpds_py
+urllib3
+
+# --- Criptografia e autenticação ---
+cryptography
+PyJWT
+jwt
+
+# --- Utilitários de Python e manipulação de dados ---
+asttokens
+atomicwrites
+cloudpickle
+executing
+frozenlist
+intervaltree
+multidict
+nest_asyncio
+parso
+propcache
+psutil
+pure_eval
+python_dateutil
+python_dotenv
+requests
+rtree
+stack_data
+yarl
+
+# --- Componentes do ecossistema Jupyter e IPython ---
+aiohappyeyeballs
+aiosignal
+async_lru
+comm
+debugpy
+ipython_pygments_lexers
+jedi
+jupyter_core
+jupyter_events
+matplotlib_inline
+prompt_toolkit
+pygments
+tornado
+traitlets
+
+# --- Pacotes principais de rede e frameworks ---
+aiohttp
+httpx
+jupyter_client
+
+# --- Pacotes de validação de Schema ---
+jsonschema_specifications
+referencing
+jsonschema
+
+# --- Kernel do Jupyter e componentes do servidor ---
+ipykernel
+jupyter_lsp
+spyder_kernels
+jupyter_server
+
+# --- Aplicação JupyterLab ---
+jupyterlab
+
+# --- Pacotes relacionados a Argon2 ---
+argon2_cffi_bindings
+argon2_cffi
+
+# --- Outros ---
+dotenv
+pypiwin32
