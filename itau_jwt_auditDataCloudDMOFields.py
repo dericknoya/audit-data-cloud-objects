@@ -2,6 +2,8 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) não utilizados.
 
+Versão: 8.3 - Correção Final na Análise de Segmentos (Campos Relacionados)
+
 Metodologia:
 - Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
 - Um campo "não utilizado" é aquele que não é encontrado em Segmentos, Ativações ou CIs.
@@ -29,7 +31,7 @@ from dotenv import load_dotenv
 
 # --- Configuração de Rede ---
 USE_PROXY = True
-PROXY_URL = "http://seu_usuario:sua_senha@host:porta" # Substitua pelo seu proxy
+PROXY_URL = "https://felirub:080796@proxynew.itau:8080" # Substitua pelas suas credenciais
 VERIFY_SSL = False
 
 # --- Configuração do Logging ---
@@ -98,10 +100,22 @@ async def fetch_api_data(session, instance_url, relative_url, key_name=None):
 
 # --- Helper Functions ---
 def _recursive_find_fields(obj, used_fields_set):
+    """Função recursiva para encontrar nomes de campos em estruturas JSON complexas."""
     if isinstance(obj, dict):
         for key, value in obj.items():
-            if key == 'fieldApiName' and isinstance(value, str):
-                used_fields_set.add(value)
+            # **MUDANÇA CRÍTICA**: Lógica para tratar campos diretos e relacionados
+            if key == 'fieldApiName' and isinstance(value, str) and value:
+                if '.' in value:
+                    # É um campo relacionado (ex: 'DMO__dlm.Campo__c')
+                    parts = value.split('.')
+                    if len(parts) == 2:
+                        dmo_part, field_part = parts
+                        used_fields_set.add(dmo_part)  # Adiciona o DMO como usado
+                        used_fields_set.add(field_part) # Adiciona o campo específico
+                else:
+                    # É um campo direto no objeto principal do segmento
+                    used_fields_set.add(value)
+            # Mantém a lógica para CIs e Ativações
             elif key == 'name' and 'type' in obj and isinstance(value, str):
                  used_fields_set.add(value)
             elif isinstance(value, (dict, list)):
@@ -164,9 +178,7 @@ async def audit_dmo_fields():
 
     used_fields = set()
 
-    # **MUDANÇA**: Análise de Segmentos aprimorada
     for seg in segments_list:
-        # Inspeciona tanto a definição antiga quanto a nova
         if criteria := seg.get('includeCriteria'): parse_json_from_string(criteria, used_fields)
         if criteria := seg.get('excludeCriteria'): parse_json_from_string(criteria, used_fields)
         if criteria := seg.get('filterDefinition'): parse_json_from_string(criteria, used_fields)
@@ -183,7 +195,7 @@ async def audit_dmo_fields():
         for rel in ci.get('relationships', []):
             if rel.get('fromEntity'): used_fields.add(rel['fromEntity'])
     logging.info(f"🔍 Identificados {len(used_fields) - initial_count} campos/objetos adicionais em Calculated Insights.")
-    logging.info(f"Total de campos únicos em uso: {len(used_fields)}")
+    logging.info(f"Total de campos e objetos únicos em uso: {len(used_fields)}")
 
     unused_field_results = []
     field_prefixes_to_exclude = ('ssot__', 'KQ_')
