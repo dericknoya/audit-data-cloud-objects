@@ -6,3 +6,8 @@ private.pem
 audit_objetos_para_exclusao.csv
 audit_campos_dmo_nao_utilizados.csv
 tempCodeRunnerFile.py
+requirements.txt
+auditDataCloudDMOFields.py
+auditDataCloudobjects.py
+delete_dc_objects.py
+delete_dmo_fields.py

@@ -2,7 +2,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) não utilizados.
 
-Versão: 8.5
+Versão: 9.6
 
 Metodologia:
 - Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
@@ -13,24 +13,6 @@ Metodologia:
 - O relatório final inclui os Nomes de Exibição do DMO e do Campo para melhor legibilidade.
 - Exclui campos e DMOs de sistema/gerados automaticamente da análise.
 - Adiciona uma coluna 'DELETAR' como a primeira coluna, com o valor padrão 'NAO'.
-""""""
-Este script audita uma instância do Salesforce Data Cloud para identificar 
-campos de DMOs (Data Model Objects) não utilizados.
-
-Versão: 8.9
-
-Metodologia:
-- Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
-- Um campo "não utilizado" é aquele que não é encontrado em Segmentos, Ativações ou CIs.
-- Audita o uso de campos analisando os critérios de Segmentos ('includeCriteria'/'excludeCriteria').
-- Audita o uso de campos buscando os metadados detalhados de cada Ativação.
-- Audita o uso de campos e DMOs dentro de Calculated Insights.
-- O relatório final inclui os Nomes de Exibição do DMO e do Campo para melhor legibilidade.
-- Exclui campos e DMOs de sistema/gerados automaticamente da análise.
-- Adiciona uma coluna 'DELETAR' como a primeira coluna, com o valor padrão 'NAO'.
-
-https://itauengajamentoworkflow--sfdcenv.sandbox.my.salesforce.com/setup/emailverif?oid=00DHZ000005wWsf&k=Cj4KNQoPMDBESFowMDAwMDV3V3NmEg8wMkc1ZTAwMDAwMEhNUFUaDzAwNWJKMDAwMDBJQmtRTiAFGPGOgNWKMxIQZqX2F3TNj7c4bbTCL2SZ-RoMM8BzPljZ_74BH9AGIoMB7oqUKlTi_Qn0JX0eJxJSJ5aeGDLS78yeKTEWlimW0A87boj7UFM545RQg5MTN3PisrZNyHjCAsHlsYIB5T6oq2q3yB0utbQ36lOBtLo2MudV0mql5UZ5lvyDqalAyVdI_ahUi5a4Pocl_edt6l3lGdtjQX2WzwZxrvw6TrQm3-VLQSc%3D
-
 """
 import os
 import time
@@ -80,7 +62,8 @@ def get_access_token():
     token_url = f"{sf_login_url}/services/oauth2/token"
     
     try:
-        res = requests.post(token_url, data=params, verify=VERIFY_SSL)
+        proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY else None
+        res = requests.post(token_url, data=params, proxies=proxies, verify=VERIFY_SSL)
         res.raise_for_status()
         logging.info("✅ Autenticação bem-sucedida.")
         return res.json()
@@ -92,7 +75,9 @@ def get_access_token():
 async def fetch_api_data(session, instance_url, relative_url, key_name=None):
     all_records = []
     current_url = urljoin(instance_url, relative_url)
+    logging.info(f"Iniciando busca em: {relative_url}")
     try:
+        page_count = 1
         while current_url:
             kwargs = {'ssl': VERIFY_SSL}
             if USE_PROXY:
@@ -101,14 +86,19 @@ async def fetch_api_data(session, instance_url, relative_url, key_name=None):
             async with session.get(current_url, **kwargs) as response:
                 response.raise_for_status(); data = await response.json()
                 if key_name:
-                    all_records.extend(data.get(key_name, []))
+                    records_on_page = data.get(key_name, [])
+                    all_records.extend(records_on_page)
+                    logging.info(f"   Página {page_count}: {len(records_on_page)} registros de '{key_name}' encontrados para '{relative_url}'.")
+                    
                     next_page_url = data.get('nextPageUrl')
                     if next_page_url and not next_page_url.startswith('http'):
                         next_page_url = urljoin(instance_url, next_page_url)
                 else: 
                     return data
-                if current_url == next_page_url: break
+
+                if current_url == next_page_url: break 
                 current_url = next_page_url
+                page_count += 1
         return all_records
     except aiohttp.ClientError as e:
         logging.error(f"❌ Erro ao buscar {current_url}: {e}"); return [] if key_name else {}
@@ -137,19 +127,33 @@ async def audit_dmo_fields():
 
     async with aiohttp.ClientSession(headers=headers) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
-        
-        # **MUDANÇA CRÍTICA**: Usa uma única chamada com o parâmetro 'filters'
-        logging.info(f"🔎 Buscando todos os segmentos via: /services/data/v64.0/ssot/segments?filters = SegmentStatus in Active")
 
-        base_tasks = [
-            fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/segments?filters = SegmentStatus in Active", 'segments'),
+        # Etapa 1.1: Buscar TODOS os IDs de segmentos via SOQL
+        soql_query = "SELECT Id FROM MarketSegmentDefinition"
+        encoded_soql = urlencode({'q': soql_query})
+        soql_url = f"/services/data/v64.0/query?{encoded_soql}"
+        segment_id_records = await fetch_api_data(session, instance_url, soql_url, 'records')
+        segment_ids = [rec['Id'] for rec in segment_id_records]
+        logging.info(f"✅ Etapa 1.1: {len(segment_ids)} IDs de segmentos encontrados via SOQL.")
+
+        # Etapa 1.2: Buscar detalhes de cada segmento individualmente via Connect API
+        segment_detail_tasks = [
+            fetch_api_data(session, instance_url, f"/services/data/v64.0/connect/segments/{seg_id}")
+            for seg_id in segment_ids
+        ]
+        
+        other_tasks = [
             fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/metadata?entityType=DataModelObject", 'metadata'),
             fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/activations", 'activations'),
             fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/metadata?entityType=CalculatedInsight", 'metadata'),
         ]
         
-        segments_list, dmo_metadata_list, activations_summary, calculated_insights = await asyncio.gather(*base_tasks)
-        logging.info(f"✅ Total de {len(segments_list)} segmentos encontrados.")
+        results = await asyncio.gather(*(segment_detail_tasks + other_tasks))
+        
+        segments_list = [res for res in results[:len(segment_detail_tasks)] if res] 
+        dmo_metadata_list, activations_summary, calculated_insights = results[len(segment_detail_tasks):]
+        
+        logging.info(f"✅ Etapa 1.2: {len(segments_list)} detalhes de segmentos obtidos via Connect API.")
         
         logging.info("\n--- Etapa 2: Coletando detalhes das Ativações ---")
         activation_detail_tasks = [fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/activations/{act.get('id')}") for act in activations_summary if act.get('id')]
@@ -166,10 +170,10 @@ async def audit_dmo_fields():
             dmo_name_lower = dmo_name.lower()
             if any(dmo_name_lower.startswith(prefix) for prefix in dmo_prefixes_to_exclude):
                 continue
-            all_dmo_data[dmo_name]['displayName'] = dmo.get('displayName', dmo_name)
+            all_dmo_data[dmo_name]['displayName'] = dmo.get('displayName', dmo.get('name'))
             for field in dmo.get('fields', []):
                 if field_name := field.get('name'):
-                    all_dmo_data[dmo_name]['fields'][field_name] = field.get('displayName', field_name)
+                    all_dmo_data[dmo_name]['fields'][field_name] = field.get('displayName', field.get('name'))
     
     total_fields = sum(len(data['fields']) for data in all_dmo_data.values())
     logging.info(f"🗺️ Mapeados {total_fields} campos em {len(all_dmo_data)} DMOs customizados (após filtragem).")
