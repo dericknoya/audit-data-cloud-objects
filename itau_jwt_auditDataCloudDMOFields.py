@@ -2,7 +2,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) não utilizados.
 
-Versão: 9.6
+Versão: 9.9
 
 Metodologia:
 - Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
@@ -88,9 +88,12 @@ async def fetch_api_data(session, instance_url, relative_url, key_name=None):
                 if key_name:
                     records_on_page = data.get(key_name, [])
                     all_records.extend(records_on_page)
-                    logging.info(f"   Página {page_count}: {len(records_on_page)} registros de '{key_name}' encontrados para '{relative_url}'.")
+                    logging.info(f"   Página {page_count}: {len(records_on_page)} registros de '{key_name}' encontrados.")
                     
-                    next_page_url = data.get('nextPageUrl')
+                    next_page_url = data.get('nextRecordsUrl') # Específico para SOQL
+                    if not next_page_url:
+                         next_page_url = data.get('nextPageUrl') # Fallback para outras APIs
+
                     if next_page_url and not next_page_url.startswith('http'):
                         next_page_url = urljoin(instance_url, next_page_url)
                 else: 
@@ -128,17 +131,17 @@ async def audit_dmo_fields():
     async with aiohttp.ClientSession(headers=headers) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
 
-        # Etapa 1.1: Buscar TODOS os IDs de segmentos via SOQL
-        soql_query = "SELECT Id FROM MarketSegmentDefinition"
+        # Etapa 1.1: Buscar TODOS os IDs de segmentos via SOQL em MarketSegment
+        soql_query = "SELECT Id FROM MarketSegment"
         encoded_soql = urlencode({'q': soql_query})
         soql_url = f"/services/data/v64.0/query?{encoded_soql}"
         segment_id_records = await fetch_api_data(session, instance_url, soql_url, 'records')
         segment_ids = [rec['Id'] for rec in segment_id_records]
-        logging.info(f"✅ Etapa 1.1: {len(segment_ids)} IDs de segmentos encontrados via SOQL.")
+        logging.info(f"✅ Etapa 1.1: {len(segment_ids)} IDs de segmentos encontrados via SOQL em MarketSegment.")
 
-        # Etapa 1.2: Buscar detalhes de cada segmento individualmente via Connect API
+        # Etapa 1.2: Buscar detalhes de cada segmento individualmente
         segment_detail_tasks = [
-            fetch_api_data(session, instance_url, f"/services/data/v64.0/connect/segments/{seg_id}")
+            fetch_api_data(session, instance_url, f"/services/data/v64.0/sobjects/MarketSegment/{seg_id}")
             for seg_id in segment_ids
         ]
         
@@ -150,10 +153,10 @@ async def audit_dmo_fields():
         
         results = await asyncio.gather(*(segment_detail_tasks + other_tasks))
         
-        segments_list = [res for res in results[:len(segment_detail_tasks)] if res] 
+        segments_list = [res for res in results[:len(segment_detail_tasks)] if res]
         dmo_metadata_list, activations_summary, calculated_insights = results[len(segment_detail_tasks):]
         
-        logging.info(f"✅ Etapa 1.2: {len(segments_list)} detalhes de segmentos obtidos via Connect API.")
+        logging.info(f"✅ Etapa 1.2: {len(segments_list)} detalhes de segmentos obtidos.")
         
         logging.info("\n--- Etapa 2: Coletando detalhes das Ativações ---")
         activation_detail_tasks = [fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/activations/{act.get('id')}") for act in activations_summary if act.get('id')]
@@ -183,9 +186,9 @@ async def audit_dmo_fields():
     logging.info("🔍 Analisando uso de campos em Segmentos com busca de texto direta...")
     all_segment_criteria_text = ""
     for seg in segments_list:
-        if criteria := seg.get('includeCriteria'): all_segment_criteria_text += html.unescape(criteria)
-        if criteria := seg.get('excludeCriteria'): all_segment_criteria_text += html.unescape(criteria)
-        if criteria := seg.get('filterDefinition'): all_segment_criteria_text += html.unescape(criteria)
+        # Nomes dos campos no payload de MarketSegment
+        if criteria := seg.get('IncludeCriteria'): all_segment_criteria_text += html.unescape(str(criteria))
+        if criteria := seg.get('ExcludeCriteria'): all_segment_criteria_text += html.unescape(str(criteria))
 
     for dmo_name, data in all_dmo_data.items():
         for field_api_name in data['fields'].keys():

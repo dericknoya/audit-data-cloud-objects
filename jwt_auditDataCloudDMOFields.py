@@ -3,14 +3,13 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) não utilizados.
 
-Versão: 9.7 - Versão Final (Sem Proxy, com SOQL + Connect API e Debug Aprimorado)
+Versão: 9.9 - Versão Final (Estratégia de Busca em MarketSegment via SOQL)
 
 Metodologia:
-- CORREÇÃO: A busca de segmentos agora é feita em duas etapas para máxima confiabilidade:
-  1. Busca de TODOS os IDs de segmentos via SOQL no objeto MarketSegmentDefinition.
-  2. Busca dos detalhes de cada segmento individualmente via Connect API.
-- Adicionado logging detalhado para exibir a contagem final e o conteúdo completo
-  da lista de segmentos após a busca.
+- CORREÇÃO: A busca de segmentos agora usa SOQL no objeto MarketSegment, que suporta
+  paginação completa via 'nextRecordsUrl'. Em seguida, os detalhes de cada
+  segmento são buscados individualmente para obter os critérios. Esta é a abordagem
+  mais confiável e completa.
 - Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
 """
 import os
@@ -80,9 +79,9 @@ async def fetch_api_data(session, instance_url, relative_url, key_name=None):
                 if key_name:
                     records_on_page = data.get(key_name, [])
                     all_records.extend(records_on_page)
-                    logging.info(f"   Página {page_count}: {len(records_on_page)} registros de '{key_name}' encontrados para '{relative_url}'.")
+                    logging.info(f"   Página {page_count}: {len(records_on_page)} registros de '{key_name}' encontrados.")
                     
-                    next_page_url = data.get('nextPageUrl')
+                    next_page_url = data.get('nextRecordsUrl') # Corrigido para SOQL
                     if next_page_url and not next_page_url.startswith('http'):
                         next_page_url = urljoin(instance_url, next_page_url)
                 else: 
@@ -113,6 +112,7 @@ def _recursive_find_fields_generic(obj, used_fields_set):
 async def audit_dmo_fields():
     auth_data = get_access_token()
     access_token = auth_data['access_token']
+    logging.info(access_token)
     instance_url = auth_data['instance_url']
     logging.info('🚀 Iniciando auditoria de campos de DMO não utilizados...')
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
@@ -120,17 +120,18 @@ async def audit_dmo_fields():
     async with aiohttp.ClientSession(headers=headers) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
 
-        # Etapa 1.1: Buscar TODOS os IDs de segmentos via SOQL
-        soql_query = "SELECT Id FROM MarketSegmentDefinition"
+        # **MUDANÇA CRÍTICA**: Busca de Segmentos em 2 etapas
+        # Etapa 1.1: Buscar TODOS os IDs de segmentos via SOQL em MarketSegment
+        soql_query = "SELECT Id FROM MarketSegment"
         encoded_soql = urlencode({'q': soql_query})
         soql_url = f"/services/data/v64.0/query?{encoded_soql}"
         segment_id_records = await fetch_api_data(session, instance_url, soql_url, 'records')
         segment_ids = [rec['Id'] for rec in segment_id_records]
-        logging.info(f"✅ Etapa 1.1: {len(segment_ids)} IDs de segmentos encontrados via SOQL.")
+        logging.info(f"✅ Etapa 1.1: {len(segment_ids)} IDs de segmentos encontrados via SOQL em MarketSegment.")
 
-        # Etapa 1.2: Buscar detalhes de cada segmento individualmente via Connect API
+        # Etapa 1.2: Buscar detalhes de cada segmento individualmente
         segment_detail_tasks = [
-            fetch_api_data(session, instance_url, f"/services/data/v64.0/connect/segments/{seg_id}")
+            fetch_api_data(session, instance_url, f"/services/data/v64.0/sobjects/MarketSegment/{seg_id}")
             for seg_id in segment_ids
         ]
         
@@ -143,12 +144,10 @@ async def audit_dmo_fields():
         results = await asyncio.gather(*(segment_detail_tasks + other_tasks))
         
         segments_list = [res for res in results[:len(segment_detail_tasks)] if res]
+        logging.info(segments_list)
         dmo_metadata_list, activations_summary, calculated_insights = results[len(segment_detail_tasks):]
         
-        # **LOGGING ADICIONADO AQUI**
-        logging.info(f"✅ Etapa 1.2: {len(segments_list)} detalhes de segmentos obtidos via Connect API.")
-        # Aviso: O log abaixo pode ser muito grande se houver muitos segmentos.
-        logging.info(f"CONTEÚDO COMPLETO DE SEGMENTOS (após paginação): {segments_list}")
+        logging.info(f"✅ Etapa 1.2: {len(segments_list)} detalhes de segmentos obtidos.")
         
         logging.info("\n--- Etapa 2: Coletando detalhes das Ativações ---")
         activation_detail_tasks = [fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/activations/{act.get('id')}") for act in activations_summary if act.get('id')]
@@ -178,9 +177,10 @@ async def audit_dmo_fields():
     logging.info("🔍 Analisando uso de campos em Segmentos com busca de texto direta...")
     all_segment_criteria_text = ""
     for seg in segments_list:
-        if criteria := seg.get('includeCriteria'): all_segment_criteria_text += html.unescape(criteria)
-        if criteria := seg.get('excludeCriteria'): all_segment_criteria_text += html.unescape(criteria)
-        if criteria := seg.get('filterDefinition'): all_segment_criteria_text += html.unescape(criteria)
+        if criteria := seg.get('IncludeCriteria'): all_segment_criteria_text += html.unescape(str(criteria))
+        if criteria := seg.get('ExcludeCriteria'): all_segment_criteria_text += html.unescape(str(criteria))
+        # Adicionando um fallback para o nome que vimos na Connect API
+        if criteria := seg.get('filterDefinition'): all_segment_criteria_text += html.unescape(str(criteria))
 
     for dmo_name, data in all_dmo_data.items():
         for field_api_name in data['fields'].keys():
