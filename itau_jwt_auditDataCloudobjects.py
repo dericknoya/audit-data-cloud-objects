@@ -2,10 +2,11 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.45 (Fase 1 - Final)
-- Reintroduz um limite de concorrência (CONCURRENCY_LIMIT) para as chamadas de API.
-- Isso torna o script mais estável em redes com proxies, evitando erros de
-  'Connection Timeout' que ocorriam ao fazer muitas requisições simultâneas.
+Version: 5.46 (Fase 1 - Final)
+- Adiciona uma lógica de retry (nova tentativa) a todas as funções de busca de dados.
+- Se uma chamada de API falhar com um erro de conexão ou timeout, o script tentará
+  novamente até 3 vezes com um pequeno intervalo, aumentando a resiliência a
+  instabilidades de rede.
 
 Regras de Auditoria:
 1. Segmentos:
@@ -46,10 +47,12 @@ import aiohttp
 from dotenv import load_dotenv
 
 # --- Configuration ---
-CONCURRENCY_LIMIT = 10  # Limita o número de chamadas de API simultâneas
-USE_PROXY = True  # Altere para False se não quiser usar o proxy
-PROXY_URL = "https://felirub:080796@proxynew.itau:8080"  # Substitua pelas credenciais corretas
-VERIFY_SSL = False # Altere para True em ambientes de produção seguros
+CONCURRENCY_LIMIT = 10
+USE_PROXY = True
+PROXY_URL = "https://felirub:080796@proxynew.itau:8080"
+VERIFY_SSL = False
+MAX_RETRIES = 3
+RETRY_DELAY = 5 # Segundos
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -95,75 +98,87 @@ def get_access_token():
 
 # --- API Fetching with Production Safeguards ---
 async def fetch_api_data(session, semaphore, base_url, relative_url, key_name=None, ignore_404=False):
-    """Fetches data from a Data Cloud API endpoint, handling pagination."""
+    """Fetches data from a Data Cloud API endpoint, handling pagination and retries."""
     all_records = []
     current_url = urljoin(base_url, relative_url)
     logging.info(f"Iniciando busca em: {relative_url}")
 
-    try:
-        page_count = 1
-        while current_url:
-            async with semaphore:
-                kwargs = {'ssl': VERIFY_SSL}
-                if USE_PROXY:
-                    kwargs['proxy'] = PROXY_URL
-                
-                async with session.get(current_url, **kwargs) as response:
-                    if response.status == 404 and ignore_404:
-                        logging.warning(f"⚠️ Endpoint não encontrado (404): {current_url}. O script continuará.")
-                        break
-                    response.raise_for_status()
-                    data = await response.json()
+    for attempt in range(MAX_RETRIES):
+        try:
+            page_count = 1
+            while current_url:
+                async with semaphore:
+                    kwargs = {'ssl': VERIFY_SSL}
+                    if USE_PROXY:
+                        kwargs['proxy'] = PROXY_URL
                     
-                    if key_name:
-                        records_on_page = data.get(key_name, [])
-                        all_records.extend(records_on_page)
-                        logging.info(f"   Página {page_count}: {len(records_on_page)} registros de '{key_name}' encontrados.")
-                    else:
-                        return data
+                    async with session.get(current_url, **kwargs) as response:
+                        if response.status == 404 and ignore_404:
+                            logging.warning(f"⚠️ Endpoint não encontrado (404): {current_url}. O script continuará.")
+                            return [] if key_name else {}
+                        response.raise_for_status()
+                        data = await response.json()
+                        
+                        if key_name:
+                            records_on_page = data.get(key_name, [])
+                            all_records.extend(records_on_page)
+                            logging.info(f"   Página {page_count}: {len(records_on_page)} registros de '{key_name}' encontrados.")
+                        else:
+                            return data
 
-                    next_page_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
-                    
-                    if next_page_url and not next_page_url.startswith('http'):
-                        next_page_url = urljoin(base_url, next_page_url)
+                        next_page_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
+                        
+                        if next_page_url and not next_page_url.startswith('http'):
+                            next_page_url = urljoin(base_url, next_page_url)
 
-                    if current_url == next_page_url: break
-                    current_url = next_page_url
-                    page_count += 1
-        return all_records
-    except aiohttp.ClientError as e:
-        logging.error(f"❌ Error fetching {current_url}: {e}")
-        return [] if key_name else {}
+                        if current_url == next_page_url: break
+                        current_url = next_page_url
+                        page_count += 1
+            return all_records # Success
+        except aiohttp.ClientError as e:
+            logging.warning(f"⚠️ Tentativa {attempt + 1}/{MAX_RETRIES} falhou para {current_url}: {e}")
+            if attempt + 1 == MAX_RETRIES:
+                logging.error(f"❌ Todas as {MAX_RETRIES} tentativas falharam para {current_url}.")
+                return [] if key_name else {}
+            await asyncio.sleep(RETRY_DELAY)
 
 async def fetch_single_record(session, semaphore, url):
-    """Fetches a single record from a specific URL."""
-    try:
-        async with semaphore:
-            async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
-                if response.status == 404:
-                    logging.warning(f"⚠️ Record not found (404): {url}")
-                    return None
-                response.raise_for_status()
-                return await response.json()
-    except aiohttp.ClientError as e:
-        logging.error(f"❌ Error fetching single record {url}: {e}")
-        return None
+    """Fetches a single record from a specific URL with retries."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with semaphore:
+                async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
+                    if response.status == 404:
+                        logging.warning(f"⚠️ Record not found (404): {url}")
+                        return None
+                    response.raise_for_status()
+                    return await response.json()
+        except aiohttp.ClientError as e:
+            logging.warning(f"⚠️ Tentativa {attempt + 1}/{MAX_RETRIES} falhou para {url}: {e}")
+            if attempt + 1 == MAX_RETRIES:
+                logging.error(f"❌ Todas as {MAX_RETRIES} tentativas falharam para {url}.")
+                return None
+            await asyncio.sleep(RETRY_DELAY)
 
 async def fetch_tooling_api_query(session, semaphore, base_url, soql_query, object_name=""):
-    """Fetches data from the Tooling API using a SOQL query."""
+    """Fetches data from the Tooling API using a SOQL query with retries."""
     params = {'q': soql_query}
     url = f"{base_url}/services/data/v64.0/tooling/query?{urlencode(params)}"
     logging.info(f"🔎 Querying Tooling API for {object_name}...")
-    try:
-        async with semaphore:
-            async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
-                response.raise_for_status()
-                data = await response.json()
-                logging.info(f"✅ Found {data.get('size', 0)} {object_name} records in Tooling API.")
-                return data.get('records', [])
-    except aiohttp.ClientError as e:
-        logging.error(f"❌ Error fetching from Tooling API {url}: {e}")
-        return []
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with semaphore:
+                async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    logging.info(f"✅ Found {data.get('size', 0)} {object_name} records in Tooling API.")
+                    return data.get('records', [])
+        except aiohttp.ClientError as e:
+            logging.warning(f"⚠️ Tentativa {attempt + 1}/{MAX_RETRIES} falhou para Tooling API query: {e}")
+            if attempt + 1 == MAX_RETRIES:
+                logging.error(f"❌ Todas as {MAX_RETRIES} tentativas falharam para a query da Tooling API.")
+                return []
+            await asyncio.sleep(RETRY_DELAY)
 
 # --- Helper Functions ---
 def parse_sf_date(date_str):
@@ -181,7 +196,6 @@ def normalize_api_name(name):
     return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
 
 def find_dmos_in_criteria(criteria_str):
-    """Recursively finds all DMO API names within a segment's criteria JSON."""
     if not criteria_str: return set()
     try:
         decoded_str = html.unescape(criteria_str)
@@ -208,7 +222,6 @@ def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('name') 
 
 # --- Main Audit Logic ---
 async def main():
-    """Main function to run the audit process."""
     auth_data = get_access_token()
     access_token, instance_url = auth_data['access_token'], auth_data['instance_url']
     logging.info('🚀 Iniciando auditoria de exclusão de objetos...')
