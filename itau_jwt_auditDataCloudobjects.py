@@ -2,11 +2,11 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.46 (Fase 1 - Final)
-- Adiciona uma lógica de retry (nova tentativa) a todas as funções de busca de dados.
-- Se uma chamada de API falhar com um erro de conexão ou timeout, o script tentará
-  novamente até 3 vezes com um pequeno intervalo, aumentando a resiliência a
-  instabilidades de rede.
+Version: 5.47 (Fase 1 - Final)
+- Aumenta o timeout global das requisições para dar mais tempo para a API
+  responder, especialmente em redes com proxies ou para segmentos complexos.
+- Mantém a lógica de retry para garantir a resiliência contra falhas de rede
+  intermitentes.
 
 Regras de Auditoria:
 1. Segmentos:
@@ -53,6 +53,7 @@ PROXY_URL = "https://felirub:080796@proxynew.itau:8080"
 VERIFY_SSL = False
 MAX_RETRIES = 3
 RETRY_DELAY = 5 # Segundos
+TIMEOUT_SECONDS = 300 # Aumentado para 5 minutos
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -228,8 +229,9 @@ async def main():
 
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
     connector = aiohttp.TCPConnector(ssl=VERIFY_SSL)
-    async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
+    async with aiohttp.ClientSession(headers=headers, connector=connector, timeout=timeout) as session:
         soql_query = "SELECT Id FROM MarketSegment"
         encoded_soql = urlencode({'q': soql_query})
         soql_url = f"/services/data/v64.0/query?{encoded_soql}"
