@@ -2,13 +2,10 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.41 (Fase 1 - Final)
-- Incorpora a lógica de uso de Proxy para todas as chamadas de API.
-- Altera o método de busca de Segmentos para uma abordagem mais robusta:
-  1. Busca todos os IDs de Segmentos via SOQL no objeto MarketSegment.
-  2. Busca os detalhes completos de cada Segmento individualmente.
-- Isso garante a coleta completa de todos os segmentos, evitando problemas de
-  paginação da API /ssot/segments.
+Version: 5.42 (Fase 1 - Final)
+- Remove a busca por Data Kits, que estava causando erros de API.
+- Corrige o nome da função de busca de dados para 'fetch_api_data' para
+  manter consistência com outros scripts do projeto.
 
 Regras de Auditoria:
 1. Segmentos:
@@ -122,13 +119,13 @@ async def fetch_api_data(session, semaphore, base_url, relative_url, key_name=No
                     data = await response.json()
                     
                     # Handle both list-based and single-record responses
-                    records_on_page = data.get(key_name, []) if key_name else [data]
-                    if key_name is None: # If it's a single record fetch, we're done
-                        return records_on_page[0]
+                    if key_name:
+                        records_on_page = data.get(key_name, [])
+                        all_records.extend(records_on_page)
+                        logging.info(f"   Página {page_count}: {len(records_on_page)} registros de '{key_name}' encontrados.")
+                    else: # If it's a single record fetch, we're done
+                        return data
 
-                    all_records.extend(records_on_page)
-                    logging.info(f"   Página {page_count}: {len(records_on_page)} registros de '{key_name}' encontrados.")
-                    
                     # Handle different pagination keys
                     next_page_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
                     
@@ -143,6 +140,20 @@ async def fetch_api_data(session, semaphore, base_url, relative_url, key_name=No
         logging.error(f"❌ Error fetching {current_url}: {e}")
         return [] if key_name else {}
 
+async def fetch_single_record(session, semaphore, url):
+    """Fetches a single record from a specific URL."""
+    timeout = aiohttp.ClientTimeout(total=TIMEOUT)
+    try:
+        async with semaphore:
+            async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL, timeout=timeout) as response:
+                if response.status == 404:
+                    logging.warning(f"⚠️ Record not found (404): {url}")
+                    return None
+                response.raise_for_status()
+                return await response.json()
+    except aiohttp.ClientError as e:
+        logging.error(f"❌ Error fetching single record {url}: {e}")
+        return None
 
 async def fetch_tooling_api_query(session, semaphore, base_url, soql_query, object_name=""):
     """Fetches data from the Tooling API using a SOQL query."""
@@ -225,20 +236,19 @@ async def main():
         segment_detail_tasks = [fetch_api_data(session, semaphore, instance_url, f"/services/data/{API_VERSION}/sobjects/MarketSegment/{seg_id}") for seg_id in segment_ids]
         
         other_tasks = [
-            fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/activations", 'activations'),
-            fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-streams", 'dataStreams'),
-            fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-graphs/metadata", 'dataGraphMetadata'),
-            fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/metadata?entityType=DataModelObject", 'metadata'),
-            fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/metadata?entityType=CalculatedInsight", 'metadata'),
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/activations", 'activations'),
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-streams", 'dataStreams'),
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-graphs/metadata", 'dataGraphMetadata'),
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/metadata?entityType=DataModelObject", 'metadata'),
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/metadata?entityType=CalculatedInsight", 'metadata'),
             fetch_tooling_api_query(session, instance_url, "SELECT DeveloperName, CreatedDate FROM MktDataModelObject", "DMOs"),
-            fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-actions", 'dataActions'),
-            fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-kits", 'dataKits')
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-actions", 'dataActions')
         ]
         
         results = await asyncio.gather(*(segment_detail_tasks + other_tasks))
         
         segments = [res for res in results[:len(segment_detail_tasks)] if res]
-        activations, data_streams_summary, data_graphs, dm_objects, calculated_insights, dmo_tooling_data, data_actions, data_kits = results[len(segment_detail_tasks):]
+        activations, data_streams_summary, data_graphs, dm_objects, calculated_insights, dmo_tooling_data, data_actions = results[len(segment_detail_tasks):]
         
         logging.info(f"✅ Etapa 1.2: {len(segments)} detalhes de segmentos obtidos.")
 
@@ -255,9 +265,6 @@ async def main():
 
     logging.info("📊 Data fetched. Analyzing dependencies...")
     
-    if not data_kits:
-        logging.warning("⚠️ Não foi possível buscar os Data Kits. A análise pode classificar incorretamente Data Streams usados por Kits como órfãos.")
-
     # --- 1. PRE-PROCESS DATA AND BUILD MAPS ---
     now = datetime.now(timezone.utc)
     thirty_days_ago = now - timedelta(days=30)
