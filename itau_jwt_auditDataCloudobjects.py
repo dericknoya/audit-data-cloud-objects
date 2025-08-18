@@ -2,7 +2,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.41
+Version: 5.41 (Fase 1 - Final)
 - Incorpora a lógica de uso de Proxy para todas as chamadas de API.
 - Altera o método de busca de Segmentos para uma abordagem mais robusta:
   1. Busca todos os IDs de Segmentos via SOQL no objeto MarketSegment.
