@@ -2,10 +2,11 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.42 (Fase 1 - Final)
-- Remove a busca por Data Kits, que estava causando erros de API.
-- Corrige o nome da função de busca de dados para 'fetch_api_data' para
-  manter consistência com outros scripts do projeto.
+Version: 5.44 (Fase 1 - Final)
+- Remove as constantes globais API_VERSION, CONCURRENCY_LIMIT, e TIMEOUT para
+  alinhar o estilo com o script de auditoria de campos.
+- A versão da API agora está diretamente nas URLs das chamadas.
+- A concorrência das chamadas assíncronas não é mais limitada por um semáforo.
 
 Regras de Auditoria:
 1. Segmentos:
@@ -46,9 +47,6 @@ import aiohttp
 from dotenv import load_dotenv
 
 # --- Configuration ---
-API_VERSION = "v64.0"
-CONCURRENCY_LIMIT = 15
-TIMEOUT = 240
 USE_PROXY = True  # Altere para False se não quiser usar o proxy
 PROXY_URL = "https://felirub:080796@proxynew.itau:8080"  # Substitua pelas credenciais corretas
 VERIFY_SSL = False # Altere para True em ambientes de produção seguros
@@ -96,78 +94,70 @@ def get_access_token():
         raise
 
 # --- API Fetching with Production Safeguards ---
-async def fetch_api_data(session, semaphore, base_url, relative_url, key_name=None, ignore_404=False):
+async def fetch_api_data(session, base_url, relative_url, key_name=None, ignore_404=False):
     """Fetches data from a Data Cloud API endpoint, handling pagination."""
     all_records = []
     current_url = urljoin(base_url, relative_url)
-    timeout = aiohttp.ClientTimeout(total=TIMEOUT)
     logging.info(f"Iniciando busca em: {relative_url}")
 
     try:
         page_count = 1
         while current_url:
-            async with semaphore:
-                kwargs = {'ssl': VERIFY_SSL, 'timeout': timeout}
-                if USE_PROXY:
-                    kwargs['proxy'] = PROXY_URL
+            kwargs = {'ssl': VERIFY_SSL}
+            if USE_PROXY:
+                kwargs['proxy'] = PROXY_URL
+            
+            async with session.get(current_url, **kwargs) as response:
+                if response.status == 404 and ignore_404:
+                    logging.warning(f"⚠️ Endpoint não encontrado (404): {current_url}. O script continuará.")
+                    break
+                response.raise_for_status()
+                data = await response.json()
                 
-                async with session.get(current_url, **kwargs) as response:
-                    if response.status == 404 and ignore_404:
-                        logging.warning(f"⚠️ Endpoint não encontrado (404): {current_url}. O script continuará.")
-                        break
-                    response.raise_for_status()
-                    data = await response.json()
-                    
-                    # Handle both list-based and single-record responses
-                    if key_name:
-                        records_on_page = data.get(key_name, [])
-                        all_records.extend(records_on_page)
-                        logging.info(f"   Página {page_count}: {len(records_on_page)} registros de '{key_name}' encontrados.")
-                    else: # If it's a single record fetch, we're done
-                        return data
+                if key_name:
+                    records_on_page = data.get(key_name, [])
+                    all_records.extend(records_on_page)
+                    logging.info(f"   Página {page_count}: {len(records_on_page)} registros de '{key_name}' encontrados.")
+                else:
+                    return data
 
-                    # Handle different pagination keys
-                    next_page_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
-                    
-                    if next_page_url and not next_page_url.startswith('http'):
-                        next_page_url = urljoin(base_url, next_page_url)
+                next_page_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
+                
+                if next_page_url and not next_page_url.startswith('http'):
+                    next_page_url = urljoin(base_url, next_page_url)
 
-                    if current_url == next_page_url: break
-                    current_url = next_page_url
-                    page_count += 1
+                if current_url == next_page_url: break
+                current_url = next_page_url
+                page_count += 1
         return all_records
     except aiohttp.ClientError as e:
         logging.error(f"❌ Error fetching {current_url}: {e}")
         return [] if key_name else {}
 
-async def fetch_single_record(session, semaphore, url):
+async def fetch_single_record(session, url):
     """Fetches a single record from a specific URL."""
-    timeout = aiohttp.ClientTimeout(total=TIMEOUT)
     try:
-        async with semaphore:
-            async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL, timeout=timeout) as response:
-                if response.status == 404:
-                    logging.warning(f"⚠️ Record not found (404): {url}")
-                    return None
-                response.raise_for_status()
-                return await response.json()
+        async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
+            if response.status == 404:
+                logging.warning(f"⚠️ Record not found (404): {url}")
+                return None
+            response.raise_for_status()
+            return await response.json()
     except aiohttp.ClientError as e:
         logging.error(f"❌ Error fetching single record {url}: {e}")
         return None
 
-async def fetch_tooling_api_query(session, semaphore, base_url, soql_query, object_name=""):
+async def fetch_tooling_api_query(session, base_url, soql_query, object_name=""):
     """Fetches data from the Tooling API using a SOQL query."""
     params = {'q': soql_query}
-    url = f"{base_url}/services/data/{API_VERSION}/tooling/query?{urlencode(params)}"
+    url = f"{base_url}/services/data/v64.0/tooling/query?{urlencode(params)}"
     logging.info(f"🔎 Querying Tooling API for {object_name}...")
-    timeout = aiohttp.ClientTimeout(total=TIMEOUT)
     try:
-        async with semaphore:
-            async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL, timeout=timeout) as response:
-                response.raise_for_status()
-                data = await response.json()
-                logging.info(f"✅ Found {data.get('size', 0)} {object_name} records in Tooling API.")
-                return data.get('records', [])
+        async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
+            response.raise_for_status()
+            data = await response.json()
+            logging.info(f"✅ Found {data.get('size', 0)} {object_name} records in Tooling API.")
+            return data.get('records', [])
     except aiohttp.ClientError as e:
         logging.error(f"❌ Error fetching from Tooling API {url}: {e}")
         return []
@@ -221,28 +211,25 @@ async def main():
     logging.info('🚀 Iniciando auditoria de exclusão de objetos...')
 
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
-    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
     connector = aiohttp.TCPConnector(ssl=VERIFY_SSL)
     async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
-        # Etapa 1.1: Buscar TODOS os IDs de segmentos via SOQL
         soql_query = "SELECT Id FROM MarketSegment"
         encoded_soql = urlencode({'q': soql_query})
-        soql_url = f"/services/data/{API_VERSION}/query?{encoded_soql}"
-        segment_id_records = await fetch_api_data(session, semaphore, instance_url, soql_url, 'records')
+        soql_url = f"/services/data/v64.0/query?{encoded_soql}"
+        segment_id_records = await fetch_api_data(session, instance_url, soql_url, 'records')
         segment_ids = [rec['Id'] for rec in segment_id_records]
         logging.info(f"✅ Etapa 1.1: {len(segment_ids)} IDs de segmentos encontrados via SOQL.")
 
-        # Etapa 1.2: Buscar detalhes de cada segmento individualmente
-        segment_detail_tasks = [fetch_api_data(session, semaphore, instance_url, f"/services/data/{API_VERSION}/sobjects/MarketSegment/{seg_id}") for seg_id in segment_ids]
+        segment_detail_tasks = [fetch_api_data(session, instance_url, f"/services/data/v64.0/sobjects/MarketSegment/{seg_id}") for seg_id in segment_ids]
         
         other_tasks = [
-            fetch_api_data(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/activations", 'activations'),
-            fetch_api_data(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-streams", 'dataStreams'),
-            fetch_api_data(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-graphs/metadata", 'dataGraphMetadata'),
-            fetch_api_data(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/metadata?entityType=DataModelObject", 'metadata'),
-            fetch_api_data(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/metadata?entityType=CalculatedInsight", 'metadata'),
+            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/activations", 'activations'),
+            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/data-streams", 'dataStreams'),
+            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/data-graphs/metadata", 'dataGraphMetadata'),
+            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/metadata?entityType=DataModelObject", 'metadata'),
+            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/metadata?entityType=CalculatedInsight", 'metadata'),
             fetch_tooling_api_query(session, instance_url, "SELECT DeveloperName, CreatedDate FROM MktDataModelObject", "DMOs"),
-            fetch_api_data(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-actions", 'dataActions')
+            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/data-actions", 'dataActions'),
         ]
         
         results = await asyncio.gather(*(segment_detail_tasks + other_tasks))
@@ -257,15 +244,14 @@ async def main():
         for ds in data_streams_summary:
             ds_name = ds.get('name')
             if ds_name:
-                url = f"{instance_url}/services/data/{API_VERSION}/ssot/data-streams/{ds_name}?includeMappings=true"
-                ds_detail_tasks.append(fetch_single_record(session, semaphore, url))
+                url = f"{instance_url}/services/data/v64.0/ssot/data-streams/{ds_name}?includeMappings=true"
+                ds_detail_tasks.append(fetch_single_record(session, url))
         
         data_streams = await asyncio.gather(*ds_detail_tasks)
         data_streams = [ds for ds in data_streams if ds is not None]
 
     logging.info("📊 Data fetched. Analyzing dependencies...")
     
-    # --- 1. PRE-PROCESS DATA AND BUILD MAPS ---
     now = datetime.now(timezone.utc)
     thirty_days_ago = now - timedelta(days=30)
     ninety_days_ago = now - timedelta(days=90)
@@ -303,10 +289,8 @@ async def main():
 
     dmo_creation_dates = {normalize_api_name(dmo.get('DeveloperName')): parse_sf_date(dmo.get('CreatedDate')) for dmo in dmo_tooling_data}
     
-    # --- 2. FILTER FOR ORPHAN AND INACTIVE OBJECTS ---
     audit_results = []
 
-    # Analyze Segments and their Activations
     for seg in segments:
         seg_id = str(get_segment_id(seg) or '')[:15]
         if not seg_id: continue
@@ -333,7 +317,6 @@ async def main():
                 deletion_identifier = seg.get('DeveloperName')
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': get_segment_name(seg), 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_pub if days_pub is not None else 'N/A', 'DELETION_IDENTIFIER': deletion_identifier or 'N/A'})
 
-    # Analyze DMOs
     for dmo in dm_objects:
         original_dmo_name = get_dmo_name(dmo)
         if not original_dmo_name or not original_dmo_name.endswith('__dlm'): continue
@@ -350,7 +333,6 @@ async def main():
                 reason = 'Órfão (sem uso e criado > 90 dias)' if created_date else 'Órfão (sem uso, data de criação desconhecida)'
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': original_dmo_name, 'DISPLAY_NAME': get_dmo_display_name(dmo), 'OBJECT_TYPE': 'DATA MODEL', 'REASON': reason, 'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_creation if days_creation is not None else 'N/A', 'DELETION_IDENTIFIER': original_dmo_name})
 
-    # Analyze Data Streams
     for ds in data_streams:
         ds_name = ds['name']
         refreshed_date = parse_sf_date(ds.get('lastRefreshDate'))
@@ -365,14 +347,12 @@ async def main():
             reason = "Inativo (não atualizado > 30 dias, mas possui mapeamento para DMO)"
             audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_name, 'DISPLAY_NAME': ds.get('displayName') or ds_name, 'OBJECT_TYPE': 'DATA STREAM', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Atualização', 'DIAS_ATIVIDADE': days_since_refresh if refreshed_date else 'N/A', 'DELETION_IDENTIFIER': ds_name})
 
-    # Analyze Calculated Insights
     for ci in calculated_insights:
         last_processed_date = parse_sf_date(ci.get('latestSuccessfulProcessTime'))
         days_processed = days_since(last_processed_date)
         if days_processed is not None and days_processed > 90:
             audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ci['name'], 'DISPLAY_NAME': ci.get('displayName') or ci['name'], 'OBJECT_TYPE': 'CALCULATED INSIGHT', 'REASON': 'Inativo (não processado com sucesso > 90 dias)', 'TIPO_ATIVIDADE': 'Último Processamento', 'DIAS_ATIVIDADE': days_processed, 'DELETION_IDENTIFIER': ci['name']})
             
-    # --- 3. WRITE RESULTS TO CSV ---
     if not audit_results:
         logging.info("🎉 Nenhum objeto órfão ou inativo encontrado.")
         return
@@ -384,11 +364,10 @@ async def main():
         with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=header)
             writer.writeheader()
-            for row in audit_results:
-                writer.writerow(row)
+            writer.writerows(audit_results)
         logging.info(f"✅ Auditoria finalizada. {len(audit_results)} objetos encontrados. Arquivo CSV gerado: {csv_file_path}")
     except IOError as e:
-        logging.error(f"❌ Erro ao escrever no arquivo CSV: {e}")
+        logging.error(f"❌ Erro ao gravar o arquivo CSV: {e}")
 
 if __name__ == "__main__":
     start_time = time.time()
