@@ -2,11 +2,10 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.47 (Fase 1 - Final)
-- Aumenta o timeout global das requisições para dar mais tempo para a API
-  responder, especialmente em redes com proxies ou para segmentos complexos.
-- Mantém a lógica de retry para garantir a resiliência contra falhas de rede
-  intermitentes.
+Version: 5.48 (Fase 1 - Final)
+- Corrige a busca do identificador de exclusão para Segmentos.
+- O script agora utiliza o campo 'Name' (que corresponde ao segmentApiName)
+  em vez de 'DeveloperName', que não existe no objeto MarketSegment.
 
 Regras de Auditoria:
 1. Segmentos:
@@ -53,7 +52,7 @@ PROXY_URL = "https://felirub:080796@proxynew.itau:8080"
 VERIFY_SSL = False
 MAX_RETRIES = 3
 RETRY_DELAY = 5 # Segundos
-TIMEOUT_SECONDS = 300 # Aumentado para 5 minutos
+TIMEOUT_SECONDS = 300
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -320,9 +319,9 @@ async def main():
             if not is_used_as_filter:
                 reason = 'Órfão (sem ativação recente e não é filtro)'
                 days_pub = days_since(last_pub_date)
-                deletion_identifier = seg.get('DeveloperName')
+                deletion_identifier = seg.get('Name') # CORREÇÃO: Usa 'Name' em vez de 'DeveloperName'
                 if not deletion_identifier:
-                    logging.warning(f"Não foi possível encontrar o 'DeveloperName' para o segmento {get_segment_name(seg)} (ID: {seg_id}).")
+                    logging.warning(f"Não foi possível encontrar o 'Name' (apiName) para o segmento {get_segment_name(seg)} (ID: {seg_id}).")
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': get_segment_name(seg), 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_pub if days_pub is not None else 'N/A', 'DELETION_IDENTIFIER': deletion_identifier or 'N/A'})
                 for act in activations:
                     if str(act.get('segmentId') or '')[:15] == seg_id:
@@ -333,7 +332,7 @@ async def main():
             else:
                 reason = f"Inativo (usado como filtro em: {', '.join(nested_segment_parents.get(seg_id, []))})"
                 days_pub = days_since(last_pub_date)
-                deletion_identifier = seg.get('DeveloperName')
+                deletion_identifier = seg.get('Name') # CORREÇÃO: Usa 'Name' em vez de 'DeveloperName'
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': get_segment_name(seg), 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_pub if days_pub is not None else 'N/A', 'DELETION_IDENTIFIER': deletion_identifier or 'N/A'})
 
     for dmo in dm_objects:
