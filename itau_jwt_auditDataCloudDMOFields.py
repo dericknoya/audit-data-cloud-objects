@@ -2,7 +2,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) não utilizados.
 
-Versão: 9.9
+Versão: 10.0
 
 Metodologia:
 - Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
@@ -156,7 +156,16 @@ async def audit_dmo_fields():
         segments_list = [res for res in results[:len(segment_detail_tasks)] if res]
         dmo_metadata_list, activations_summary, calculated_insights = results[len(segment_detail_tasks):]
         
+        # --- CÓDIGO DE DEBUG ADICIONADO AQUI ---
         logging.info(f"✅ Etapa 1.2: {len(segments_list)} detalhes de segmentos obtidos.")
+        logging.info(f"Salvando a lista completa de {len(segments_list)} segmentos em 'debug_segments_list.json' para análise.")
+        try:
+            with open('debug_segments_list.json', 'w', encoding='utf-8') as f:
+                json.dump(segments_list, f, ensure_ascii=False, indent=4)
+            logging.info("Arquivo 'debug_segments_list.json' salvo com sucesso.")
+        except Exception as e:
+            logging.error(f"Erro ao salvar o arquivo de debug: {e}")
+        # --- FIM DO CÓDIGO DE DEBUG ---
         
         logging.info("\n--- Etapa 2: Coletando detalhes das Ativações ---")
         activation_detail_tasks = [fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/activations/{act.get('id')}") for act in activations_summary if act.get('id')]
@@ -186,7 +195,6 @@ async def audit_dmo_fields():
     logging.info("🔍 Analisando uso de campos em Segmentos com busca de texto direta...")
     all_segment_criteria_text = ""
     for seg in segments_list:
-        # Nomes dos campos no payload de MarketSegment
         if criteria := seg.get('IncludeCriteria'): all_segment_criteria_text += html.unescape(str(criteria))
         if criteria := seg.get('ExcludeCriteria'): all_segment_criteria_text += html.unescape(str(criteria))
 
