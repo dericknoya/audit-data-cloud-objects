@@ -2,7 +2,13 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.40 
+Version: 5.41
+- Incorpora a lógica de uso de Proxy para todas as chamadas de API.
+- Altera o método de busca de Segmentos para uma abordagem mais robusta:
+  1. Busca todos os IDs de Segmentos via SOQL no objeto MarketSegment.
+  2. Busca os detalhes completos de cada Segmento individualmente.
+- Isso garante a coleta completa de todos os segmentos, evitando problemas de
+  paginação da API /ssot/segments.
 
 Regras de Auditoria:
 1. Segmentos:
@@ -31,9 +37,9 @@ import os
 import time
 import asyncio
 import csv
-import logging
 import json
 import html
+import logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode, urljoin
 
@@ -46,8 +52,8 @@ from dotenv import load_dotenv
 API_VERSION = "v64.0"
 CONCURRENCY_LIMIT = 15
 TIMEOUT = 240
-USE_PROXY = False # Altere para True se precisar de um proxy
-PROXY_URL = "https://felirub:080796@proxynew.itau:8080" # Substitua se USE_PROXY for True
+USE_PROXY = True  # Altere para False se não quiser usar o proxy
+PROXY_URL = "https://felirub:080796@proxynew.itau:8080"  # Substitua pelas credenciais corretas
 VERIFY_SSL = False # Altere para True em ambientes de produção seguros
 
 # --- Logging Setup ---
@@ -83,7 +89,8 @@ def get_access_token():
     token_url = f"{sf_login_url}/services/oauth2/token"
 
     try:
-        res = requests.post(token_url, data=params)
+        proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY else None
+        res = requests.post(token_url, data=params, proxies=proxies, verify=VERIFY_SSL)
         res.raise_for_status()
         logging.info("✅ Authentication successful.")
         return res.json()
@@ -92,59 +99,64 @@ def get_access_token():
         raise
 
 # --- API Fetching with Production Safeguards ---
-async def fetch_all_pages(session, semaphore, base_url, initial_path, key_name, ignore_404=False):
-    """Fetches all pages of data from a paginated Data Cloud API endpoint."""
+async def fetch_api_data(session, semaphore, base_url, relative_url, key_name=None, ignore_404=False):
+    """Fetches data from a Data Cloud API endpoint, handling pagination."""
     all_records = []
-    next_page_url = initial_path
+    current_url = urljoin(base_url, relative_url)
     timeout = aiohttp.ClientTimeout(total=TIMEOUT)
+    logging.info(f"Iniciando busca em: {relative_url}")
 
-    while next_page_url:
-        current_url = urljoin(base_url, next_page_url) if next_page_url.startswith('/') else next_page_url
-        try:
+    try:
+        page_count = 1
+        while current_url:
             async with semaphore:
-                async with session.get(current_url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL, timeout=timeout) as response:
+                kwargs = {'ssl': VERIFY_SSL, 'timeout': timeout}
+                if USE_PROXY:
+                    kwargs['proxy'] = PROXY_URL
+                
+                async with session.get(current_url, **kwargs) as response:
                     if response.status == 404 and ignore_404:
                         logging.warning(f"⚠️ Endpoint não encontrado (404): {current_url}. O script continuará.")
                         break
                     response.raise_for_status()
                     data = await response.json()
-                    records = data.get(key_name, [])
-                    all_records.extend(records)
-                    next_page_url = data.get('nextPageUrl')
-                    if next_page_url:
-                        logging.info(f"   Fetching next page for {key_name}...")
-        except aiohttp.ClientError as e:
-            logging.error(f"❌ Error fetching {current_url}: {e}")
-            return []
-    return all_records
+                    
+                    # Handle both list-based and single-record responses
+                    records_on_page = data.get(key_name, []) if key_name else [data]
+                    if key_name is None: # If it's a single record fetch, we're done
+                        return records_on_page[0]
 
-async def fetch_single_record(session, semaphore, url):
-    """Fetches a single record from a specific URL."""
-    timeout = aiohttp.ClientTimeout(total=TIMEOUT)
-    try:
-        async with semaphore:
-            async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL, timeout=timeout) as response:
-                if response.status == 404:
-                    logging.warning(f"⚠️ Record not found (404): {url}")
-                    return None
-                response.raise_for_status()
-                return await response.json()
+                    all_records.extend(records_on_page)
+                    logging.info(f"   Página {page_count}: {len(records_on_page)} registros de '{key_name}' encontrados.")
+                    
+                    # Handle different pagination keys
+                    next_page_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
+                    
+                    if next_page_url and not next_page_url.startswith('http'):
+                        next_page_url = urljoin(base_url, next_page_url)
+
+                    if current_url == next_page_url: break
+                    current_url = next_page_url
+                    page_count += 1
+        return all_records
     except aiohttp.ClientError as e:
-        logging.error(f"❌ Error fetching single record {url}: {e}")
-        return None
+        logging.error(f"❌ Error fetching {current_url}: {e}")
+        return [] if key_name else {}
 
-async def fetch_tooling_api_query(session, base_url, soql_query, object_name=""):
+
+async def fetch_tooling_api_query(session, semaphore, base_url, soql_query, object_name=""):
     """Fetches data from the Tooling API using a SOQL query."""
     params = {'q': soql_query}
     url = f"{base_url}/services/data/{API_VERSION}/tooling/query?{urlencode(params)}"
     logging.info(f"🔎 Querying Tooling API for {object_name}...")
     timeout = aiohttp.ClientTimeout(total=TIMEOUT)
     try:
-        async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL, timeout=timeout) as response:
-            response.raise_for_status()
-            data = await response.json()
-            logging.info(f"✅ Found {data.get('size', 0)} {object_name} records in Tooling API.")
-            return data.get('records', [])
+        async with semaphore:
+            async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL, timeout=timeout) as response:
+                response.raise_for_status()
+                data = await response.json()
+                logging.info(f"✅ Found {data.get('size', 0)} {object_name} records in Tooling API.")
+                return data.get('records', [])
     except aiohttp.ClientError as e:
         logging.error(f"❌ Error fetching from Tooling API {url}: {e}")
         return []
@@ -166,17 +178,12 @@ def normalize_api_name(name):
 
 def find_dmos_in_criteria(criteria_str):
     """Recursively finds all DMO API names within a segment's criteria JSON."""
-    if not criteria_str:
-        return set()
-    
+    if not criteria_str: return set()
     try:
         decoded_str = html.unescape(criteria_str)
         criteria_json = json.loads(decoded_str)
-    except (json.JSONDecodeError, TypeError):
-        return set()
-
+    except (json.JSONDecodeError, TypeError): return set()
     dmos_found = set()
-
     def recursive_search(obj):
         if isinstance(obj, dict):
             for key, value in obj.items():
@@ -187,12 +194,11 @@ def find_dmos_in_criteria(criteria_str):
         elif isinstance(obj, list):
             for item in obj:
                 recursive_search(item)
-
     recursive_search(criteria_json)
     return dmos_found
 
-def get_segment_id(seg): return seg.get('marketSegmentId') or seg.get('id')
-def get_segment_name(seg): return seg.get('displayName') or seg.get('name') or '(Sem nome)'
+def get_segment_id(seg): return seg.get('marketSegmentId') or seg.get('Id')
+def get_segment_name(seg): return seg.get('displayName') or seg.get('Name') or '(Sem nome)'
 def get_dmo_name(dmo): return dmo.get('name')
 def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('name') or '(Sem nome)'
 
@@ -207,8 +213,18 @@ async def main():
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
     connector = aiohttp.TCPConnector(ssl=VERIFY_SSL)
     async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
-        tasks = [
-            fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/segments", 'segments'),
+        # Etapa 1.1: Buscar TODOS os IDs de segmentos via SOQL
+        soql_query = "SELECT Id FROM MarketSegment"
+        encoded_soql = urlencode({'q': soql_query})
+        soql_url = f"/services/data/{API_VERSION}/query?{encoded_soql}"
+        segment_id_records = await fetch_api_data(session, semaphore, instance_url, soql_url, 'records')
+        segment_ids = [rec['Id'] for rec in segment_id_records]
+        logging.info(f"✅ Etapa 1.1: {len(segment_ids)} IDs de segmentos encontrados via SOQL.")
+
+        # Etapa 1.2: Buscar detalhes de cada segmento individualmente
+        segment_detail_tasks = [fetch_api_data(session, semaphore, instance_url, f"/services/data/{API_VERSION}/sobjects/MarketSegment/{seg_id}") for seg_id in segment_ids]
+        
+        other_tasks = [
             fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/activations", 'activations'),
             fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-streams", 'dataStreams'),
             fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-graphs/metadata", 'dataGraphMetadata'),
@@ -218,7 +234,13 @@ async def main():
             fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-actions", 'dataActions'),
             fetch_all_pages(session, semaphore, instance_url, f"/services/data/{API_VERSION}/ssot/data-kits", 'dataKits')
         ]
-        segments, activations, data_streams_summary, data_graphs, dm_objects, calculated_insights, dmo_tooling_data, data_actions, data_kits = await asyncio.gather(*tasks)
+        
+        results = await asyncio.gather(*(segment_detail_tasks + other_tasks))
+        
+        segments = [res for res in results[:len(segment_detail_tasks)] if res]
+        activations, data_streams_summary, data_graphs, dm_objects, calculated_insights, dmo_tooling_data, data_actions, data_kits = results[len(segment_detail_tasks):]
+        
+        logging.info(f"✅ Etapa 1.2: {len(segments)} detalhes de segmentos obtidos.")
 
         logging.info(f"🔎 Fetching detailed information for {len(data_streams_summary)} data streams to check mappings...")
         ds_detail_tasks = []
@@ -251,7 +273,7 @@ async def main():
             if nested_seg_id:
                 nested_segment_parents.setdefault(nested_seg_id, []).append(parent_name)
 
-    dmos_used_by_segments = {normalize_api_name(s.get('dataModelObject')) for s in segments if s.get('dataModelObject')}
+    dmos_used_by_segments = {normalize_api_name(s.get('SegmentOnObjectApiName')) for s in segments if s.get('SegmentOnObjectApiName')}
     dmos_used_by_data_graphs = {normalize_api_name(obj.get('developerName')) for dg in data_graphs for obj in [dg.get('dgObject', {})] + dg.get('dgObject', {}).get('relatedObjects', []) if obj.get('developerName')}
     dmos_used_by_ci_relationships = {normalize_api_name(rel.get('fromEntity')) for ci in calculated_insights for rel in ci.get('relationships', []) if rel.get('fromEntity')}
     dmos_used_by_data_actions = set()
@@ -269,8 +291,8 @@ async def main():
 
     dmos_used_in_segment_criteria = set()
     for seg in segments:
-        dmos_used_in_segment_criteria.update(find_dmos_in_criteria(seg.get('includeCriteria')))
-        dmos_used_in_segment_criteria.update(find_dmos_in_criteria(seg.get('excludeCriteria')))
+        dmos_used_in_segment_criteria.update(find_dmos_in_criteria(seg.get('IncludeCriteria')))
+        dmos_used_in_segment_criteria.update(find_dmos_in_criteria(seg.get('ExcludeCriteria')))
 
     dmo_creation_dates = {normalize_api_name(dmo.get('DeveloperName')): parse_sf_date(dmo.get('CreatedDate')) for dmo in dmo_tooling_data}
     
@@ -288,9 +310,9 @@ async def main():
             if not is_used_as_filter:
                 reason = 'Órfão (sem ativação recente e não é filtro)'
                 days_pub = days_since(last_pub_date)
-                deletion_identifier = seg.get('apiName')
+                deletion_identifier = seg.get('DeveloperName')
                 if not deletion_identifier:
-                    logging.warning(f"Não foi possível encontrar o 'apiName' para o segmento {get_segment_name(seg)} (ID: {seg_id}).")
+                    logging.warning(f"Não foi possível encontrar o 'DeveloperName' para o segmento {get_segment_name(seg)} (ID: {seg_id}).")
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': get_segment_name(seg), 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_pub if days_pub is not None else 'N/A', 'DELETION_IDENTIFIER': deletion_identifier or 'N/A'})
                 for act in activations:
                     if str(act.get('segmentId') or '')[:15] == seg_id:
@@ -301,7 +323,7 @@ async def main():
             else:
                 reason = f"Inativo (usado como filtro em: {', '.join(nested_segment_parents.get(seg_id, []))})"
                 days_pub = days_since(last_pub_date)
-                deletion_identifier = seg.get('apiName')
+                deletion_identifier = seg.get('DeveloperName')
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': get_segment_name(seg), 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_pub if days_pub is not None else 'N/A', 'DELETION_IDENTIFIER': deletion_identifier or 'N/A'})
 
     # Analyze DMOs
@@ -313,7 +335,7 @@ async def main():
                      normalized_dmo_name not in dmos_used_by_ci_relationships and 
                      normalized_dmo_name not in dmos_used_by_data_graphs and
                      normalized_dmo_name not in dmos_used_by_data_actions and
-                     normalized_dmo_name not in dmos_used_in_segment_criteria) # **NOVA VERIFICAÇÃO**
+                     normalized_dmo_name not in dmos_used_in_segment_criteria)
         if is_unused:
             created_date = dmo_creation_dates.get(normalized_dmo_name)
             days_creation = days_since(created_date)
