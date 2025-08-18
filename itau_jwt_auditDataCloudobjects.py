@@ -2,11 +2,10 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.44 (Fase 1 - Final)
-- Remove as constantes globais API_VERSION, CONCURRENCY_LIMIT, e TIMEOUT para
-  alinhar o estilo com o script de auditoria de campos.
-- A versão da API agora está diretamente nas URLs das chamadas.
-- A concorrência das chamadas assíncronas não é mais limitada por um semáforo.
+Version: 5.45 (Fase 1 - Final)
+- Reintroduz um limite de concorrência (CONCURRENCY_LIMIT) para as chamadas de API.
+- Isso torna o script mais estável em redes com proxies, evitando erros de
+  'Connection Timeout' que ocorriam ao fazer muitas requisições simultâneas.
 
 Regras de Auditoria:
 1. Segmentos:
@@ -47,6 +46,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 # --- Configuration ---
+CONCURRENCY_LIMIT = 10  # Limita o número de chamadas de API simultâneas
 USE_PROXY = True  # Altere para False se não quiser usar o proxy
 PROXY_URL = "https://felirub:080796@proxynew.itau:8080"  # Substitua pelas credenciais corretas
 VERIFY_SSL = False # Altere para True em ambientes de produção seguros
@@ -94,7 +94,7 @@ def get_access_token():
         raise
 
 # --- API Fetching with Production Safeguards ---
-async def fetch_api_data(session, base_url, relative_url, key_name=None, ignore_404=False):
+async def fetch_api_data(session, semaphore, base_url, relative_url, key_name=None, ignore_404=False):
     """Fetches data from a Data Cloud API endpoint, handling pagination."""
     all_records = []
     current_url = urljoin(base_url, relative_url)
@@ -103,61 +103,64 @@ async def fetch_api_data(session, base_url, relative_url, key_name=None, ignore_
     try:
         page_count = 1
         while current_url:
-            kwargs = {'ssl': VERIFY_SSL}
-            if USE_PROXY:
-                kwargs['proxy'] = PROXY_URL
-            
-            async with session.get(current_url, **kwargs) as response:
-                if response.status == 404 and ignore_404:
-                    logging.warning(f"⚠️ Endpoint não encontrado (404): {current_url}. O script continuará.")
-                    break
-                response.raise_for_status()
-                data = await response.json()
+            async with semaphore:
+                kwargs = {'ssl': VERIFY_SSL}
+                if USE_PROXY:
+                    kwargs['proxy'] = PROXY_URL
                 
-                if key_name:
-                    records_on_page = data.get(key_name, [])
-                    all_records.extend(records_on_page)
-                    logging.info(f"   Página {page_count}: {len(records_on_page)} registros de '{key_name}' encontrados.")
-                else:
-                    return data
+                async with session.get(current_url, **kwargs) as response:
+                    if response.status == 404 and ignore_404:
+                        logging.warning(f"⚠️ Endpoint não encontrado (404): {current_url}. O script continuará.")
+                        break
+                    response.raise_for_status()
+                    data = await response.json()
+                    
+                    if key_name:
+                        records_on_page = data.get(key_name, [])
+                        all_records.extend(records_on_page)
+                        logging.info(f"   Página {page_count}: {len(records_on_page)} registros de '{key_name}' encontrados.")
+                    else:
+                        return data
 
-                next_page_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
-                
-                if next_page_url and not next_page_url.startswith('http'):
-                    next_page_url = urljoin(base_url, next_page_url)
+                    next_page_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
+                    
+                    if next_page_url and not next_page_url.startswith('http'):
+                        next_page_url = urljoin(base_url, next_page_url)
 
-                if current_url == next_page_url: break
-                current_url = next_page_url
-                page_count += 1
+                    if current_url == next_page_url: break
+                    current_url = next_page_url
+                    page_count += 1
         return all_records
     except aiohttp.ClientError as e:
         logging.error(f"❌ Error fetching {current_url}: {e}")
         return [] if key_name else {}
 
-async def fetch_single_record(session, url):
+async def fetch_single_record(session, semaphore, url):
     """Fetches a single record from a specific URL."""
     try:
-        async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
-            if response.status == 404:
-                logging.warning(f"⚠️ Record not found (404): {url}")
-                return None
-            response.raise_for_status()
-            return await response.json()
+        async with semaphore:
+            async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
+                if response.status == 404:
+                    logging.warning(f"⚠️ Record not found (404): {url}")
+                    return None
+                response.raise_for_status()
+                return await response.json()
     except aiohttp.ClientError as e:
         logging.error(f"❌ Error fetching single record {url}: {e}")
         return None
 
-async def fetch_tooling_api_query(session, base_url, soql_query, object_name=""):
+async def fetch_tooling_api_query(session, semaphore, base_url, soql_query, object_name=""):
     """Fetches data from the Tooling API using a SOQL query."""
     params = {'q': soql_query}
     url = f"{base_url}/services/data/v64.0/tooling/query?{urlencode(params)}"
     logging.info(f"🔎 Querying Tooling API for {object_name}...")
     try:
-        async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
-            response.raise_for_status()
-            data = await response.json()
-            logging.info(f"✅ Found {data.get('size', 0)} {object_name} records in Tooling API.")
-            return data.get('records', [])
+        async with semaphore:
+            async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
+                response.raise_for_status()
+                data = await response.json()
+                logging.info(f"✅ Found {data.get('size', 0)} {object_name} records in Tooling API.")
+                return data.get('records', [])
     except aiohttp.ClientError as e:
         logging.error(f"❌ Error fetching from Tooling API {url}: {e}")
         return []
@@ -211,25 +214,26 @@ async def main():
     logging.info('🚀 Iniciando auditoria de exclusão de objetos...')
 
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
+    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
     connector = aiohttp.TCPConnector(ssl=VERIFY_SSL)
     async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
         soql_query = "SELECT Id FROM MarketSegment"
         encoded_soql = urlencode({'q': soql_query})
         soql_url = f"/services/data/v64.0/query?{encoded_soql}"
-        segment_id_records = await fetch_api_data(session, instance_url, soql_url, 'records')
+        segment_id_records = await fetch_api_data(session, semaphore, instance_url, soql_url, 'records')
         segment_ids = [rec['Id'] for rec in segment_id_records]
         logging.info(f"✅ Etapa 1.1: {len(segment_ids)} IDs de segmentos encontrados via SOQL.")
 
-        segment_detail_tasks = [fetch_api_data(session, instance_url, f"/services/data/v64.0/sobjects/MarketSegment/{seg_id}") for seg_id in segment_ids]
+        segment_detail_tasks = [fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/sobjects/MarketSegment/{seg_id}") for seg_id in segment_ids]
         
         other_tasks = [
-            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/activations", 'activations'),
-            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/data-streams", 'dataStreams'),
-            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/data-graphs/metadata", 'dataGraphMetadata'),
-            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/metadata?entityType=DataModelObject", 'metadata'),
-            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/metadata?entityType=CalculatedInsight", 'metadata'),
-            fetch_tooling_api_query(session, instance_url, "SELECT DeveloperName, CreatedDate FROM MktDataModelObject", "DMOs"),
-            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/data-actions", 'dataActions'),
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/activations", 'activations'),
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/data-streams", 'dataStreams'),
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/data-graphs/metadata", 'dataGraphMetadata'),
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/metadata?entityType=DataModelObject", 'metadata'),
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/metadata?entityType=CalculatedInsight", 'metadata'),
+            fetch_tooling_api_query(session, semaphore, instance_url, "SELECT DeveloperName, CreatedDate FROM MktDataModelObject", "DMOs"),
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/data-actions", 'dataActions'),
         ]
         
         results = await asyncio.gather(*(segment_detail_tasks + other_tasks))
@@ -245,7 +249,7 @@ async def main():
             ds_name = ds.get('name')
             if ds_name:
                 url = f"{instance_url}/services/data/v64.0/ssot/data-streams/{ds_name}?includeMappings=true"
-                ds_detail_tasks.append(fetch_single_record(session, url))
+                ds_detail_tasks.append(fetch_single_record(session, semaphore, url))
         
         data_streams = await asyncio.gather(*ds_detail_tasks)
         data_streams = [ds for ds in data_streams if ds is not None]
