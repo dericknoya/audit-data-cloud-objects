@@ -12,8 +12,10 @@ Metodologia:
 - BARRA DE PROGRESSO ADICIONAL: Uma nova barra de progresso foi adicionada à
   etapa de análise de segmentos para fornecer feedback em tempo real.
 - CONTROLE DE CONCORRÊNCIA: Limita o número de chamadas de API simultâneas
-  para evitar sobrecarregar o Salesforce.
+  (usando um Semáforo) para evitar sobrecarregar a API do Salesforce.
 - Gera dois relatórios CSV (utilizados e não utilizados) e aplica a regra de 90 dias.
+- A busca de segmentos usa SOQL no objeto MarketSegment para máxima confiabilidade.
+- A busca da data de criação dos DMOs é feita via Tooling API.
 """
 import os
 import time
@@ -31,7 +33,7 @@ import jwt
 import requests
 import aiohttp
 from dotenv import load_dotenv
-from tqdm.asyncio import tqdm
+from tqdm.asyncio import tqdm # Importa a biblioteca de barra de progresso
 
 # --- Configuração de Rede ---
 USE_PROXY = True
@@ -95,6 +97,8 @@ async def fetch_api_data(session, instance_url, relative_url, semaphore, key_nam
 
                         if next_page_url and not next_page_url.startswith('http'):
                             next_page_url = urljoin(instance_url, next_page_url)
+                        else:
+                            current_url = None # Encerra o loop
                     else: 
                         return data
 
@@ -110,7 +114,7 @@ def _recursive_find_and_track_usage(obj, usage_type, object_name, object_api_nam
     if isinstance(obj, dict):
         for key, value in obj.items():
             if key in api_name_keys and isinstance(value, str):
-                usage_context = {"usage_type": usage_type, "object_name": object_name, "object_api_name": object_api_name}
+                usage_context = { "usage_type": usage_type, "object_name": object_name, "object_api_name": object_api_name }
                 if usage_context not in used_fields_details[value]:
                     used_fields_details[value].append(usage_context)
             _recursive_find_and_track_usage(value, usage_type, object_name, object_api_name, used_fields_details)
@@ -181,8 +185,6 @@ async def audit_dmo_fields():
     
     used_fields_details = defaultdict(list)
     
-    # **MUDANÇA CRÍTICA**: Análise de segmentos otimizada
-    logging.info("🔍 Analisando uso de campos em Segmentos...")
     all_field_names_set = {field_name for dmo in all_dmo_data.values() for field_name in dmo['fields']}
     field_name_pattern = re.compile(r'"(?:fieldApiName|fieldName)":"([^"]+)"')
     
@@ -199,13 +201,96 @@ async def audit_dmo_fields():
                 if usage_context not in used_fields_details[field_name]:
                     used_fields_details[field_name].append(usage_context)
     
-    logging.info("🔍 Analisando uso de campos em Ativações...")
     for act in tqdm(detailed_activations, desc="Analisando Ativações"):
         _recursive_find_and_track_usage(act, "Ativação", act.get('name'), act.get('id'), used_fields_details)
 
-    logging.info("🔍 Analisando uso de campos em Calculated Insights...")
     for ci in tqdm(calculated_insights, desc="Analisando CIs"):
         _recursive_find_and_track_usage(ci, "Calculated Insight", ci.get('displayName'), ci.get('name'), used_fields_details)
 
-    # O restante do código para gerar os relatórios permanece o mesmo
-    # ... (código idêntico à versão anterior)
+    unused_field_results = []
+    ninety_days_ago = datetime.now(timezone.utc) - timedelta(days=90)
+    
+    for dmo_name, data in all_dmo_data.items():
+        if dmo_name in used_fields_details: continue
+        is_new_dmo = False
+        if created_date_str := dmo_creation_dates.get(dmo_name):
+            try:
+                dmo_created_date = datetime.fromisoformat(created_date_str.replace('Z', '+00:00'))
+                if dmo_created_date > ninety_days_ago: is_new_dmo = True
+            except (ValueError, TypeError):
+                logging.warning(f"Não foi possível parsear a data de criação para o DMO {dmo_name}: {created_date_str}")
+
+        for field_api_name, field_display_name in data['fields'].items():
+            if field_api_name not in used_fields_details:
+                if is_new_dmo:
+                    usage_context = { "usage_type": "N/A (Recém-criado)", "object_name": "DMO criado nos últimos 90 dias", "object_api_name": "N/A" }
+                    used_fields_details[field_api_name].append(usage_context)
+                else:
+                    unused_field_results.append({
+                        'DELETAR': 'NAO', 'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name,
+                        'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 
+                        'REASON': 'Não utilizado em Segmentos, Ativações ou CIs'
+                    })
+    
+    logging.info(f"📊 Total de {len(used_fields_details)} campos e objetos únicos em uso (incluindo regra de 90 dias).")
+    
+    if not unused_field_results:
+        logging.info("\n🎉 Nenhum campo órfão (com mais de 90 dias) foi encontrado!")
+    else:
+        csv_file_path_unused = 'audit_campos_dmo_nao_utilizados.csv'
+        header_unused = ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON']
+        try:
+            with open(csv_file_path_unused, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=header_unused)
+                writer.writeheader()
+                writer.writerows(unused_field_results)
+            logging.info(f"✅ Relatório de campos NÃO utilizados gerado: {csv_file_path_unused} ({len(unused_field_results)} campos)")
+        except IOError as e:
+            logging.error(f"❌ Erro ao gravar o arquivo CSV de campos não utilizados: {e}")
+
+    used_field_results = []
+    field_to_dmo_map = {}
+    for dmo_name, data in all_dmo_data.items():
+        for field_api_name, field_display_name in data['fields'].items():
+            field_to_dmo_map[field_api_name] = {
+                'DMO_API_NAME': dmo_name, 'DMO_DISPLAY_NAME': data['displayName'], 'FIELD_DISPLAY_NAME': field_display_name
+            }
+
+    for field_api_name, usages in used_fields_details.items():
+        dmo_info = field_to_dmo_map.get(field_api_name)
+        if dmo_info:
+            for usage in usages:
+                used_field_results.append({
+                    'DMO_DISPLAY_NAME': dmo_info['DMO_DISPLAY_NAME'], 'DMO_API_NAME': dmo_info['DMO_API_NAME'],
+                    'FIELD_DISPLAY_NAME': dmo_info['FIELD_DISPLAY_NAME'], 'FIELD_API_NAME': field_api_name,
+                    'USAGE_TYPE': usage['usage_type'], 'USED_IN_OBJECT_NAME': usage['object_name'],
+                    'USED_IN_OBJECT_API_NAME': usage['object_api_name']
+                })
+
+    if not used_field_results:
+        logging.info("ℹ️ Nenhum uso de campo de DMO customizado foi detectado.")
+    else:
+        csv_file_path_used = 'audit_campos_dmo_utilizados.csv'
+        header_used = ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_TYPE', 'USED_IN_OBJECT_NAME', 'USED_IN_OBJECT_API_NAME']
+        try:
+            with open(csv_file_path_used, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=header_used)
+                writer.writeheader()
+                writer.writerows(used_field_results)
+            logging.info(f"✅ Relatório de campos UTILIZADOS gerado: {csv_file_path_used} ({len(used_field_results)} usos)")
+        except IOError as e:
+            logging.error(f"❌ Erro ao gravar o arquivo CSV de campos utilizados: {e}")
+
+
+if __name__ == "__main__":
+    start_time = time.time()
+    try:
+        if os.name == 'nt':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        asyncio.run(audit_dmo_fields())
+    except Exception as e:
+        logging.error(f"Um erro inesperado durante o processo de auditoria: {e}", exc_info=True)
+    finally:
+        end_time = time.time()
+        duration = end_time - start_time
+        logging.info(f"\nTempo total de execução: {duration:.2f} segundos")
