@@ -3,16 +3,15 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 12.6 - Correção Definitiva na Análise de Atributos de Ativações
+Versão: 12.7 - Correção Definitiva na Análise de Atributos de Ativações (Sem Proxy)
 
 Metodologia:
-- CORREÇÃO FINAL: A análise de Ativações foi aprimorada para iterar 
-  especificamente sobre a estrutura 'attributesConfig.attributes', garantindo que
-  todas as referências a DMOs ('entityName') e campos ('name') sejam capturadas.
+- CORREÇÃO FINAL: A análise de Ativações foi substituída por uma função
+  especializada que entende a estrutura 'attributesConfig', garantindo que
+  todas as referências a DMOs ('entityName') e campos ('name') sejam capturadas
+  corretamente, resolvendo o problema de falsos negativos.
 - Gera dois relatórios CSV (utilizados e não utilizados).
 - Aplica a regra de exceção de 90 dias para DMOs recém-criados.
-- A busca de segmentos e datas de criação de DMOs é feita via SOQL/Tooling API.
-- Inclui controle de concorrência e barras de progresso.
 """
 import os
 import time
@@ -33,8 +32,6 @@ from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
 
 # --- Configuração de Rede ---
-USE_PROXY = True
-PROXY_URL = "http://usuario:senha@proxy.suaempresa.com:porta" # Substitua pelo seu proxy
 VERIFY_SSL = False
 
 # --- Configuração do Logging ---
@@ -65,8 +62,7 @@ def get_access_token():
     token_url = f"{sf_login_url}/services/oauth2/token"
     
     try:
-        proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY else None
-        res = requests.post(token_url, data=params, proxies=proxies, verify=VERIFY_SSL)
+        res = requests.post(token_url, data=params, verify=VERIFY_SSL)
         res.raise_for_status()
         logging.info("✅ Autenticação bem-sucedida.")
         return res.json()
@@ -81,11 +77,7 @@ async def fetch_api_data(session, instance_url, relative_url, semaphore, key_nam
         current_url = urljoin(instance_url, relative_url)
         try:
             while current_url:
-                kwargs = {'ssl': VERIFY_SSL}
-                if USE_PROXY:
-                    kwargs['proxy'] = PROXY_URL
-
-                async with session.get(current_url, **kwargs) as response:
+                async with session.get(current_url, ssl=VERIFY_SSL) as response:
                     response.raise_for_status(); data = await response.json()
                     if key_name:
                         all_records.extend(data.get(key_name, []))
@@ -106,18 +98,37 @@ async def fetch_api_data(session, instance_url, relative_url, semaphore, key_nam
             return [] if key_name else {}
 
 # --- Helper Functions ---
-def _recursive_find_and_track_usage(obj, usage_type, object_name, object_api_name, used_fields_details):
-    api_name_keys = ["name", "entityName", "objectApiName", "fieldName", "attributeName", "developerName"]
+def _find_and_track_dependencies(obj, usage_type, object_name, object_api_name, used_fields_details):
+    """
+    Função recursiva aprimorada que encontra e rastreia o uso de campos e DMOs
+    em estruturas aninhadas, com lógica especializada para atributos de ativação.
+    """
     if isinstance(obj, dict):
+        # Lógica especializada para 'attributes' em ativações
+        if 'entityName' in obj and 'name' in obj:
+            dmo_name = obj.get('entityName')
+            field_name = obj.get('name')
+            usage_context = {"usage_type": usage_type, "object_name": object_name, "object_api_name": object_api_name}
+            
+            if dmo_name and usage_context not in used_fields_details[dmo_name]:
+                used_fields_details[dmo_name].append(usage_context)
+            if field_name and usage_context not in used_fields_details[field_name]:
+                used_fields_details[field_name].append(usage_context)
+
+        # Lógica genérica para outras chaves
+        api_name_keys = ["objectApiName", "fieldName", "developerName"]
         for key, value in obj.items():
             if key in api_name_keys and isinstance(value, str):
-                usage_context = { "usage_type": usage_type, "object_name": object_name, "object_api_name": object_api_name }
+                usage_context = {"usage_type": usage_type, "object_name": object_name, "object_api_name": object_api_name}
                 if usage_context not in used_fields_details[value]:
                     used_fields_details[value].append(usage_context)
-            _recursive_find_and_track_usage(value, usage_type, object_name, object_api_name, used_fields_details)
+            
+            # Continua a busca recursivamente
+            _find_and_track_dependencies(value, usage_type, object_name, object_api_name, used_fields_details)
+
     elif isinstance(obj, list):
         for item in obj:
-            _recursive_find_and_track_usage(item, usage_type, object_name, object_api_name, used_fields_details)
+            _find_and_track_dependencies(item, usage_type, object_name, object_api_name, used_fields_details)
 
 
 # --- Main Audit Logic ---
@@ -199,24 +210,10 @@ async def audit_dmo_fields():
                     used_fields_details[field_name].append(usage_context)
     
     for act in tqdm(detailed_activations, desc="Analisando Ativações"):
-        # Lógica genérica como fallback
-        _recursive_find_and_track_usage(act, "Ativação", act.get('name'), act.get('id'), used_fields_details)
-        # **NOVA LÓGICA ESPECIALIZADA PARA ATRIBUTOS**
-        if attributes_config := act.get('attributesConfig'):
-            if attributes := attributes_config.get('attributes'):
-                for attr in attributes:
-                    if dmo_name := attr.get('entityName'):
-                        usage_context = { "usage_type": "Ativação", "object_name": act.get('name'), "object_api_name": act.get('id') }
-                        if usage_context not in used_fields_details[dmo_name]:
-                            used_fields_details[dmo_name].append(usage_context)
-                    if field_name := attr.get('name'):
-                        usage_context = { "usage_type": "Ativação", "object_name": act.get('name'), "object_api_name": act.get('id') }
-                        if usage_context not in used_fields_details[field_name]:
-                            used_fields_details[field_name].append(usage_context)
-
+        _find_and_track_dependencies(act, "Ativação", act.get('name'), act.get('id'), used_fields_details)
 
     for ci in tqdm(calculated_insights, desc="Analisando CIs"):
-        _recursive_find_and_track_usage(ci, "Calculated Insight", ci.get('displayName'), ci.get('name'), used_fields_details)
+        _find_and_track_dependencies(ci, "Calculated Insight", ci.get('displayName'), ci.get('name'), used_fields_details)
 
     unused_field_results = []
     ninety_days_ago = datetime.now(timezone.utc) - timedelta(days=90)
@@ -232,7 +229,7 @@ async def audit_dmo_fields():
                 dmo_created_date = datetime.fromisoformat(created_date_str.replace('Z', '+00:00'))
                 if dmo_created_date > ninety_days_ago: is_new_dmo = True
             except (ValueError, TypeError):
-                logging.warning(f"Não foi possível parsear a data de criação para o DMO {dmo_name}: {created_date_str}")
+                logging.warning(f"Não foi possível parsear a data para o DMO {dmo_name}: {created_date_str}")
 
         for field_api_name, field_display_name in data['fields'].items():
             if field_api_name not in used_fields_details:
