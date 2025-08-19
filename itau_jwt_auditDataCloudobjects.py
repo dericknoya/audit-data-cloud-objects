@@ -2,10 +2,11 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.48 (Fase 1 - Final)
-- Corrige a busca do identificador de exclusão para Segmentos.
-- O script agora utiliza o campo 'Name' (que corresponde ao segmentApiName)
-  em vez de 'DeveloperName', que não existe no objeto MarketSegment.
+Version: 5.49 (Fase 1 - Final)
+- Corrige a lógica de auditoria de DMOs para que objetos criados nos últimos 90 dias
+  NUNCA sejam considerados órfãos, independentemente de seu uso.
+- A verificação de dependências de um DMO agora só é realizada se o objeto for mais
+  antigo que 90 dias, evitando falsos positivos para objetos em desenvolvimento.
 
 Regras de Auditoria:
 1. Segmentos:
@@ -16,9 +17,8 @@ Regras de Auditoria:
   - Órfã: Associada a um segmento que foi identificado como órfão.
 
 3. Data Model Objects (DMOs):
-  - Órfão se: For um DMO customizado, não for utilizado em nenhum Segmento (diretamente, 
-    em relacionamentos ou nos critérios de filtro), Data Graph, CI ou Data Action, 
-    E (Criado > 90 dias OU Data de Criação desconhecida).
+  - Órfão se: Foi criado há mais de 90 dias E é um DMO customizado que não é utilizado
+    em nenhum Segmento, Data Graph, CI ou Data Action.
 
 4. Data Streams:
   - Órfão se: A última atualização foi > 30 dias E o array 'mappings' retornado pela API
@@ -319,7 +319,7 @@ async def main():
             if not is_used_as_filter:
                 reason = 'Órfão (sem ativação recente e não é filtro)'
                 days_pub = days_since(last_pub_date)
-                deletion_identifier = seg.get('Name') # CORREÇÃO: Usa 'Name' em vez de 'DeveloperName'
+                deletion_identifier = seg.get('Name')
                 if not deletion_identifier:
                     logging.warning(f"Não foi possível encontrar o 'Name' (apiName) para o segmento {get_segment_name(seg)} (ID: {seg_id}).")
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': get_segment_name(seg), 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_pub if days_pub is not None else 'N/A', 'DELETION_IDENTIFIER': deletion_identifier or 'N/A'})
@@ -332,22 +332,25 @@ async def main():
             else:
                 reason = f"Inativo (usado como filtro em: {', '.join(nested_segment_parents.get(seg_id, []))})"
                 days_pub = days_since(last_pub_date)
-                deletion_identifier = seg.get('Name') # CORREÇÃO: Usa 'Name' em vez de 'DeveloperName'
+                deletion_identifier = seg.get('Name')
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': get_segment_name(seg), 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_pub if days_pub is not None else 'N/A', 'DELETION_IDENTIFIER': deletion_identifier or 'N/A'})
 
     for dmo in dm_objects:
         original_dmo_name = get_dmo_name(dmo)
         if not original_dmo_name or not original_dmo_name.endswith('__dlm'): continue
         normalized_dmo_name = normalize_api_name(original_dmo_name)
-        is_unused = (normalized_dmo_name not in dmos_used_by_segments and 
-                     normalized_dmo_name not in dmos_used_by_ci_relationships and 
-                     normalized_dmo_name not in dmos_used_by_data_graphs and
-                     normalized_dmo_name not in dmos_used_by_data_actions and
-                     normalized_dmo_name not in dmos_used_in_segment_criteria)
-        if is_unused:
-            created_date = dmo_creation_dates.get(normalized_dmo_name)
-            days_creation = days_since(created_date)
-            if (days_creation is not None and days_creation > 90) or created_date is None:
+        
+        created_date = dmo_creation_dates.get(normalized_dmo_name)
+        days_creation = days_since(created_date)
+        
+        # **LÓGICA CORRIGIDA**: Só verifica DMOs com mais de 90 dias
+        if (days_creation is not None and days_creation > 90) or created_date is None:
+            is_unused = (normalized_dmo_name not in dmos_used_by_segments and 
+                         normalized_dmo_name not in dmos_used_by_ci_relationships and 
+                         normalized_dmo_name not in dmos_used_by_data_graphs and
+                         normalized_dmo_name not in dmos_used_by_data_actions and
+                         normalized_dmo_name not in dmos_used_in_segment_criteria)
+            if is_unused:
                 reason = 'Órfão (sem uso e criado > 90 dias)' if created_date else 'Órfão (sem uso, data de criação desconhecida)'
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': original_dmo_name, 'DISPLAY_NAME': get_dmo_display_name(dmo), 'OBJECT_TYPE': 'DATA MODEL', 'REASON': reason, 'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_creation if days_creation is not None else 'N/A', 'DELETION_IDENTIFIER': original_dmo_name})
 
