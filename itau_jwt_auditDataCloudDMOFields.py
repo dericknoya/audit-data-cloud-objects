@@ -3,7 +3,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 12.2 - Controle de Concorrência e Barra de Progresso
+Versão: 12.2 - Controle de Concorrência, Barra de Progresso e Suporte a Proxy
 
 Metodologia:
 - CONTROLE DE CONCORRÊNCIA: Limita o número de chamadas de API simultâneas
@@ -35,7 +35,9 @@ from dotenv import load_dotenv
 from tqdm.asyncio import tqdm # Importa a biblioteca de barra de progresso
 
 # --- Configuração de Rede ---
-VERIFY_SSL = False # Mude para True para verificar o certificado SSL
+USE_PROXY = True
+PROXY_URL = "http://usuario:senha@proxy.suaempresa.com:porta" # Substitua pelo seu proxy
+VERIFY_SSL = False
 
 # --- Configuração do Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -65,7 +67,8 @@ def get_access_token():
     token_url = f"{sf_login_url}/services/oauth2/token"
     
     try:
-        res = requests.post(token_url, data=params, verify=VERIFY_SSL)
+        proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY else None
+        res = requests.post(token_url, data=params, proxies=proxies, verify=VERIFY_SSL)
         res.raise_for_status()
         logging.info("✅ Autenticação bem-sucedida.")
         return res.json()
@@ -75,13 +78,16 @@ def get_access_token():
 
 # --- API Fetching ---
 async def fetch_api_data(session, instance_url, relative_url, semaphore, key_name=None):
-    # **MUDANÇA**: Adicionado 'semaphore' para controlar a concorrência
     async with semaphore:
         all_records = []
         current_url = urljoin(instance_url, relative_url)
         try:
             while current_url:
-                async with session.get(current_url, ssl=VERIFY_SSL) as response:
+                kwargs = {'ssl': VERIFY_SSL}
+                if USE_PROXY:
+                    kwargs['proxy'] = PROXY_URL
+
+                async with session.get(current_url, **kwargs) as response:
                     response.raise_for_status(); data = await response.json()
                     if key_name:
                         all_records.extend(data.get(key_name, []))
@@ -98,8 +104,8 @@ async def fetch_api_data(session, instance_url, relative_url, semaphore, key_nam
                     if current_url == next_page_url: break
                     current_url = next_page_url
             return all_records
-        except aiohttp.ClientError as e:
-            # Não loga erro aqui para não poluir a barra de progresso
+        except aiohttp.ClientError:
+            # Erros individuais são esperados com muitas requisições, não poluir o log.
             return [] if key_name else {}
 
 # --- Helper Functions ---
@@ -125,14 +131,12 @@ async def audit_dmo_fields():
     logging.info('🚀 Iniciando auditoria de campos de DMO...')
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
     
-    # **NOVO**: Cria um semáforo para limitar as requisições simultâneas
-    CONCURRENT_REQUESTS = 50 # Ajuste este valor conforme necessário
+    CONCURRENT_REQUESTS = 50
     semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
     async with aiohttp.ClientSession(headers=headers) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
         
-        # ... (código de busca de DMOs e IDs de segmentos) ...
         dmo_soql_query = "SELECT DeveloperName, CreatedDate FROM MktDataModelObject"
         encoded_dmo_soql = urlencode({'q': dmo_soql_query})
         dmo_tooling_url = f"/services/data/v64.0/tooling/query?{encoded_dmo_soql}"
@@ -141,7 +145,6 @@ async def audit_dmo_fields():
         encoded_segment_soql = urlencode({'q': segment_soql_query})
         segment_soql_url = f"/services/data/v64.0/query?{encoded_segment_soql}"
 
-        # As buscas iniciais não precisam de semáforo pois são poucas
         initial_tasks = [
             fetch_api_data(session, instance_url, dmo_tooling_url, semaphore, 'records'),
             fetch_api_data(session, instance_url, segment_soql_url, semaphore, 'records'),
@@ -157,7 +160,6 @@ async def audit_dmo_fields():
         logging.info(f"✅ Etapa 1.1: {len(dmo_creation_dates)} datas de criação de DMOs obtidas.")
         logging.info(f"✅ Etapa 1.2: {len(segment_ids)} IDs de segmentos encontrados.")
         
-        # **MUDANÇA**: Usa tqdm.gather para as buscas em massa com barra de progresso
         logging.info(f"\n--- Etapa 2: Buscando detalhes de {len(segment_ids)} segmentos (limite de {CONCURRENT_REQUESTS} requisições simultâneas) ---")
         segment_detail_tasks = [fetch_api_data(session, instance_url, f"/services/data/v64.0/sobjects/MarketSegment/{seg_id}", semaphore) for seg_id in segment_ids]
         segments_list = await tqdm.gather(*segment_detail_tasks, desc="Buscando detalhes dos Segmentos")
@@ -168,8 +170,6 @@ async def audit_dmo_fields():
         detailed_activations = await tqdm.gather(*activation_detail_tasks, desc="Buscando detalhes das Ativações")
         detailed_activations = [res for res in detailed_activations if res]
 
-    # ... (O restante da lógica de análise e geração de CSV permanece o mesmo) ...
-    # (O código abaixo é idêntico à versão anterior)
     logging.info("\n📊 Dados coletados. Analisando o uso dos campos...")
     
     all_dmo_data = defaultdict(lambda: {'fields': {}, 'displayName': ''})
@@ -232,8 +232,53 @@ async def audit_dmo_fields():
     
     logging.info(f"📊 Total de {len(used_fields_details)} campos e objetos únicos em uso (incluindo regra de 90 dias).")
     
-    # Geração dos relatórios...
-    # (código idêntico à versão anterior)
+    if not unused_field_results:
+        logging.info("\n🎉 Nenhum campo órfão (com mais de 90 dias) foi encontrado!")
+    else:
+        csv_file_path_unused = 'audit_campos_dmo_nao_utilizados.csv'
+        header_unused = ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON']
+        try:
+            with open(csv_file_path_unused, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=header_unused)
+                writer.writeheader()
+                writer.writerows(unused_field_results)
+            logging.info(f"✅ Relatório de campos NÃO utilizados gerado: {csv_file_path_unused} ({len(unused_field_results)} campos)")
+        except IOError as e:
+            logging.error(f"❌ Erro ao gravar o arquivo CSV de campos não utilizados: {e}")
+
+    used_field_results = []
+    field_to_dmo_map = {}
+    for dmo_name, data in all_dmo_data.items():
+        for field_api_name, field_display_name in data['fields'].items():
+            field_to_dmo_map[field_api_name] = {
+                'DMO_API_NAME': dmo_name, 'DMO_DISPLAY_NAME': data['displayName'], 'FIELD_DISPLAY_NAME': field_display_name
+            }
+
+    for field_api_name, usages in used_fields_details.items():
+        dmo_info = field_to_dmo_map.get(field_api_name)
+        if dmo_info:
+            for usage in usages:
+                used_field_results.append({
+                    'DMO_DISPLAY_NAME': dmo_info['DMO_DISPLAY_NAME'], 'DMO_API_NAME': dmo_info['DMO_API_NAME'],
+                    'FIELD_DISPLAY_NAME': dmo_info['FIELD_DISPLAY_NAME'], 'FIELD_API_NAME': field_api_name,
+                    'USAGE_TYPE': usage['usage_type'], 'USED_IN_OBJECT_NAME': usage['object_name'],
+                    'USED_IN_OBJECT_API_NAME': usage['object_api_name']
+                })
+
+    if not used_field_results:
+        logging.info("ℹ️ Nenhum uso de campo de DMO customizado foi detectado.")
+    else:
+        csv_file_path_used = 'audit_campos_dmo_utilizados.csv'
+        header_used = ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_TYPE', 'USED_IN_OBJECT_NAME', 'USED_IN_OBJECT_API_NAME']
+        try:
+            with open(csv_file_path_used, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=header_used)
+                writer.writeheader()
+                writer.writerows(used_field_results)
+            logging.info(f"✅ Relatório de campos UTILIZADOS gerado: {csv_file_path_used} ({len(used_field_results)} usos)")
+        except IOError as e:
+            logging.error(f"❌ Erro ao gravar o arquivo CSV de campos utilizados: {e}")
+
 
 if __name__ == "__main__":
     start_time = time.time()
