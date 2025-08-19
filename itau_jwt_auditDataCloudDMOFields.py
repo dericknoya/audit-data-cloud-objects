@@ -3,19 +3,16 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 12.3 - Análise de Segmentos Otimizada com Barra de Progresso
+Versão: 12.6 - Correção Definitiva na Análise de Atributos de Ativações
 
 Metodologia:
-- OTIMIZAÇÃO: A análise de uso de campos em segmentos foi reescrita para ser
-  drasticamente mais rápida, usando expressões regulares para extrair todos
-  os campos de um segmento de uma só vez.
-- BARRA DE PROGRESSO ADICIONAL: Uma nova barra de progresso foi adicionada à
-  etapa de análise de segmentos para fornecer feedback em tempo real.
-- CONTROLE DE CONCORRÊNCIA: Limita o número de chamadas de API simultâneas
-  (usando um Semáforo) para evitar sobrecarregar a API do Salesforce.
-- Gera dois relatórios CSV (utilizados e não utilizados) e aplica a regra de 90 dias.
-- A busca de segmentos usa SOQL no objeto MarketSegment para máxima confiabilidade.
-- A busca da data de criação dos DMOs é feita via Tooling API.
+- CORREÇÃO FINAL: A análise de Ativações foi aprimorada para iterar 
+  especificamente sobre a estrutura 'attributesConfig.attributes', garantindo que
+  todas as referências a DMOs ('entityName') e campos ('name') sejam capturadas.
+- Gera dois relatórios CSV (utilizados e não utilizados).
+- Aplica a regra de exceção de 90 dias para DMOs recém-criados.
+- A busca de segmentos e datas de criação de DMOs é feita via SOQL/Tooling API.
+- Inclui controle de concorrência e barras de progresso.
 """
 import os
 import time
@@ -24,7 +21,7 @@ import csv
 import json
 import html
 import logging
-import re # Importa a biblioteca de expressões regulares
+import re
 from collections import defaultdict
 from urllib.parse import urljoin, urlencode
 from datetime import datetime, timedelta, timezone
@@ -33,7 +30,7 @@ import jwt
 import requests
 import aiohttp
 from dotenv import load_dotenv
-from tqdm.asyncio import tqdm # Importa a biblioteca de barra de progresso
+from tqdm.asyncio import tqdm
 
 # --- Configuração de Rede ---
 USE_PROXY = True
@@ -98,7 +95,7 @@ async def fetch_api_data(session, instance_url, relative_url, semaphore, key_nam
                         if next_page_url and not next_page_url.startswith('http'):
                             next_page_url = urljoin(instance_url, next_page_url)
                         else:
-                            current_url = None # Encerra o loop
+                            current_url = None
                     else: 
                         return data
 
@@ -110,7 +107,7 @@ async def fetch_api_data(session, instance_url, relative_url, semaphore, key_nam
 
 # --- Helper Functions ---
 def _recursive_find_and_track_usage(obj, usage_type, object_name, object_api_name, used_fields_details):
-    api_name_keys = ["name", "entityName", "objectApiName", "fieldName", "attributeName"]
+    api_name_keys = ["name", "entityName", "objectApiName", "fieldName", "attributeName", "developerName"]
     if isinstance(obj, dict):
         for key, value in obj.items():
             if key in api_name_keys and isinstance(value, str):
@@ -202,7 +199,21 @@ async def audit_dmo_fields():
                     used_fields_details[field_name].append(usage_context)
     
     for act in tqdm(detailed_activations, desc="Analisando Ativações"):
+        # Lógica genérica como fallback
         _recursive_find_and_track_usage(act, "Ativação", act.get('name'), act.get('id'), used_fields_details)
+        # **NOVA LÓGICA ESPECIALIZADA PARA ATRIBUTOS**
+        if attributes_config := act.get('attributesConfig'):
+            if attributes := attributes_config.get('attributes'):
+                for attr in attributes:
+                    if dmo_name := attr.get('entityName'):
+                        usage_context = { "usage_type": "Ativação", "object_name": act.get('name'), "object_api_name": act.get('id') }
+                        if usage_context not in used_fields_details[dmo_name]:
+                            used_fields_details[dmo_name].append(usage_context)
+                    if field_name := attr.get('name'):
+                        usage_context = { "usage_type": "Ativação", "object_name": act.get('name'), "object_api_name": act.get('id') }
+                        if usage_context not in used_fields_details[field_name]:
+                            used_fields_details[field_name].append(usage_context)
+
 
     for ci in tqdm(calculated_insights, desc="Analisando CIs"):
         _recursive_find_and_track_usage(ci, "Calculated Insight", ci.get('displayName'), ci.get('name'), used_fields_details)
@@ -210,6 +221,9 @@ async def audit_dmo_fields():
     unused_field_results = []
     ninety_days_ago = datetime.now(timezone.utc) - timedelta(days=90)
     
+    field_prefixes_to_exclude = ('ssot__', 'KQ_')
+    specific_fields_to_exclude = {'DataSource__c', 'DataSourceObject__c', 'InternalOrganization__c'}
+
     for dmo_name, data in all_dmo_data.items():
         if dmo_name in used_fields_details: continue
         is_new_dmo = False
@@ -226,11 +240,13 @@ async def audit_dmo_fields():
                     usage_context = { "usage_type": "N/A (Recém-criado)", "object_name": "DMO criado nos últimos 90 dias", "object_api_name": "N/A" }
                     used_fields_details[field_api_name].append(usage_context)
                 else:
-                    unused_field_results.append({
-                        'DELETAR': 'NAO', 'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name,
-                        'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 
-                        'REASON': 'Não utilizado em Segmentos, Ativações ou CIs'
-                    })
+                    if not field_api_name.startswith(field_prefixes_to_exclude) and \
+                       field_api_name not in specific_fields_to_exclude:
+                        unused_field_results.append({
+                            'DELETAR': 'NAO', 'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name,
+                            'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 
+                            'REASON': 'Não utilizado em Segmentos, Ativações ou CIs'
+                        })
     
     logging.info(f"📊 Total de {len(used_fields_details)} campos e objetos únicos em uso (incluindo regra de 90 dias).")
     
