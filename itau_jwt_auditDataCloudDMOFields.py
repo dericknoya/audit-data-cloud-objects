@@ -3,15 +3,41 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 12.7 - Correção Definitiva na Análise de Atributos de Ativações (Sem Proxy)
+Versão: 12.8 - Documentação Final das Regras de Negócio
 
-Metodologia:
-- CORREÇÃO FINAL: A análise de Ativações foi substituída por uma função
-  especializada que entende a estrutura 'attributesConfig', garantindo que
-  todas as referências a DMOs ('entityName') e campos ('name') sejam capturadas
-  corretamente, resolvendo o problema de falsos negativos.
-- Gera dois relatórios CSV (utilizados e não utilizados).
-- Aplica a regra de exceção de 90 dias para DMOs recém-criados.
+================================================================================
+REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
+================================================================================
+
+Este script gera dois relatórios para fornecer uma visão completa do uso dos 
+campos de DMOs customizados. As regras abaixo definem como um campo é 
+classificado em cada relatório.
+
+--------------------------------------------------------------------------------
+REGRAS PARA UM CAMPO SER CONSIDERADO "UTILIZADO"
+--------------------------------------------------------------------------------
+Um campo é listado no relatório 'audit_campos_dmo_utilizados.csv' se UMA OU MAIS 
+das seguintes condições for verdadeira:
+
+1.  É encontrado nos critérios de pelo menos um **Segmento**.
+2.  É encontrado em qualquer parte da configuração de pelo menos uma **Ativação**.
+3.  É encontrado em qualquer parte da definição de pelo menos um **Calculated Insight**.
+4.  Seu DMO pai foi criado **nos últimos 90 dias** (regra de carência para novos 
+    objetos que ainda não foram implementados em outras áreas).
+
+--------------------------------------------------------------------------------
+REGRAS PARA UM CAMPO SER CONSIDERADO "NÃO UTILIZADO"
+--------------------------------------------------------------------------------
+Um campo é listado no relatório 'audit_campos_dmo_nao_utilizados.csv' SOMENTE 
+SE TODAS as seguintes condições forem verdadeiras:
+
+1.  **NÃO é encontrado** em nenhum Segmento, Ativação ou Calculated Insight.
+2.  Seu DMO pai foi criado **há mais de 90 dias**.
+3.  O campo e seu DMO **não são** objetos de sistema do Salesforce (o script 
+    ignora nomes com prefixos como 'ssot__', 'unified__' ou nomes específicos 
+    como 'DataSource__c').
+
+================================================================================
 """
 import os
 import time
@@ -32,6 +58,8 @@ from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
 
 # --- Configuração de Rede ---
+USE_PROXY = True
+PROXY_URL = "http://usuario:senha@proxy.suaempresa.com:porta" # Substitua pelo seu proxy
 VERIFY_SSL = False
 
 # --- Configuração do Logging ---
@@ -62,7 +90,8 @@ def get_access_token():
     token_url = f"{sf_login_url}/services/oauth2/token"
     
     try:
-        res = requests.post(token_url, data=params, verify=VERIFY_SSL)
+        proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY else None
+        res = requests.post(token_url, data=params, proxies=proxies, verify=VERIFY_SSL)
         res.raise_for_status()
         logging.info("✅ Autenticação bem-sucedida.")
         return res.json()
@@ -77,7 +106,11 @@ async def fetch_api_data(session, instance_url, relative_url, semaphore, key_nam
         current_url = urljoin(instance_url, relative_url)
         try:
             while current_url:
-                async with session.get(current_url, ssl=VERIFY_SSL) as response:
+                kwargs = {'ssl': VERIFY_SSL}
+                if USE_PROXY:
+                    kwargs['proxy'] = PROXY_URL
+
+                async with session.get(current_url, **kwargs) as response:
                     response.raise_for_status(); data = await response.json()
                     if key_name:
                         all_records.extend(data.get(key_name, []))
@@ -99,12 +132,8 @@ async def fetch_api_data(session, instance_url, relative_url, semaphore, key_nam
 
 # --- Helper Functions ---
 def _find_and_track_dependencies(obj, usage_type, object_name, object_api_name, used_fields_details):
-    """
-    Função recursiva aprimorada que encontra e rastreia o uso de campos e DMOs
-    em estruturas aninhadas, com lógica especializada para atributos de ativação.
-    """
+    api_name_keys = ["name", "entityName", "objectApiName", "fieldName", "attributeName", "developerName"]
     if isinstance(obj, dict):
-        # Lógica especializada para 'attributes' em ativações
         if 'entityName' in obj and 'name' in obj:
             dmo_name = obj.get('entityName')
             field_name = obj.get('name')
@@ -115,15 +144,12 @@ def _find_and_track_dependencies(obj, usage_type, object_name, object_api_name, 
             if field_name and usage_context not in used_fields_details[field_name]:
                 used_fields_details[field_name].append(usage_context)
 
-        # Lógica genérica para outras chaves
-        api_name_keys = ["objectApiName", "fieldName", "developerName"]
         for key, value in obj.items():
             if key in api_name_keys and isinstance(value, str):
                 usage_context = {"usage_type": usage_type, "object_name": object_name, "object_api_name": object_api_name}
                 if usage_context not in used_fields_details[value]:
                     used_fields_details[value].append(usage_context)
             
-            # Continua a busca recursivamente
             _find_and_track_dependencies(value, usage_type, object_name, object_api_name, used_fields_details)
 
     elif isinstance(obj, list):
