@@ -2,11 +2,11 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.49 (Fase 1 - Final)
-- Corrige a lógica de auditoria de DMOs para que objetos criados nos últimos 90 dias
-  NUNCA sejam considerados órfãos, independentemente de seu uso.
-- A verificação de dependências de um DMO agora só é realizada se o objeto for mais
-  antigo que 90 dias, evitando falsos positivos para objetos em desenvolvimento.
+Version: 5.50 (Fase 1 - Final)
+- Aprimora a detecção de dependências de DMOs em Ativações.
+- O script agora busca os detalhes completos de cada Ativação e analisa
+  recursivamente todo o payload (incluindo 'attributesConfig' e 'contactPointsConfig')
+  para encontrar qualquer referência a um DMO, garantindo uma análise mais precisa.
 
 Regras de Auditoria:
 1. Segmentos:
@@ -17,8 +17,8 @@ Regras de Auditoria:
   - Órfã: Associada a um segmento que foi identificado como órfão.
 
 3. Data Model Objects (DMOs):
-  - Órfão se: Foi criado há mais de 90 dias E é um DMO customizado que não é utilizado
-    em nenhum Segmento, Data Graph, CI ou Data Action.
+  - Órfão se: For um DMO customizado, não for utilizado em nenhum Segmento, Ativação,
+    Data Graph, CI ou Data Action, E (Criado > 90 dias OU Data de Criação desconhecida).
 
 4. Data Streams:
   - Órfão se: A última atualização foi > 30 dias E o array 'mappings' retornado pela API
@@ -195,6 +195,18 @@ def normalize_api_name(name):
     if not isinstance(name, str): return ""
     return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
 
+def find_dmos_recursively(obj, dmo_set):
+    """Recursively finds all DMOs referenced in a complex object like an Activation."""
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in ['objectName', 'entityName', 'developerName'] and isinstance(value, str) and value.endswith('__dlm'):
+                dmo_set.add(normalize_api_name(value))
+            elif isinstance(value, (dict, list)):
+                find_dmos_recursively(value, dmo_set)
+    elif isinstance(obj, list):
+        for item in obj:
+            find_dmos_recursively(item, dmo_set)
+
 def find_dmos_in_criteria(criteria_str):
     if not criteria_str: return set()
     try:
@@ -202,17 +214,7 @@ def find_dmos_in_criteria(criteria_str):
         criteria_json = json.loads(decoded_str)
     except (json.JSONDecodeError, TypeError): return set()
     dmos_found = set()
-    def recursive_search(obj):
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                if key == 'objectApiName' and isinstance(value, str):
-                    dmos_found.add(normalize_api_name(value))
-                elif isinstance(value, (dict, list)):
-                    recursive_search(value)
-        elif isinstance(obj, list):
-            for item in obj:
-                recursive_search(item)
-    recursive_search(criteria_json)
+    find_dmos_recursively(criteria_json, dmos_found)
     return dmos_found
 
 def get_segment_id(seg): return seg.get('marketSegmentId') or seg.get('Id')
@@ -253,11 +255,16 @@ async def main():
         results = await asyncio.gather(*(segment_detail_tasks + other_tasks))
         
         segments = [res for res in results[:len(segment_detail_tasks)] if res]
-        activations, data_streams_summary, data_graphs, dm_objects, calculated_insights, dmo_tooling_data, data_actions = results[len(segment_detail_tasks):]
+        activations_summary, data_streams_summary, data_graphs, dm_objects, calculated_insights, dmo_tooling_data, data_actions = results[len(segment_detail_tasks):]
         
         logging.info(f"✅ Etapa 1.2: {len(segments)} detalhes de segmentos obtidos.")
 
-        logging.info(f"🔎 Fetching detailed information for {len(data_streams_summary)} data streams to check mappings...")
+        logging.info(f"🔎 Buscando detalhes de {len(activations_summary)} ativações...")
+        activation_detail_tasks = [fetch_single_record(session, semaphore, f"{instance_url}/services/data/v64.0/ssot/activations/{act.get('id')}") for act in activations_summary if act.get('id')]
+        activations = await asyncio.gather(*activation_detail_tasks)
+        activations = [act for act in activations if act is not None]
+
+        logging.info(f"🔎 Buscando detalhes de {len(data_streams_summary)} data streams...")
         ds_detail_tasks = []
         for ds in data_streams_summary:
             ds_name = ds.get('name')
@@ -289,21 +296,16 @@ async def main():
     dmos_used_by_ci_relationships = {normalize_api_name(rel.get('fromEntity')) for ci in calculated_insights for rel in ci.get('relationships', []) if rel.get('fromEntity')}
     dmos_used_by_data_actions = set()
     for da in data_actions:
-        for source in da.get('dataActionSources', []):
-            if source.get('objectDevName'): dmos_used_by_data_actions.add(normalize_api_name(source.get('objectDevName')))
-        for condition in da.get('actionConditions', []):
-            if condition.get('objectName'): dmos_used_by_data_actions.add(normalize_api_name(condition.get('objectName')))
-        for enrichment in da.get('dataActionEnrichmentProperties', []):
-            for field in enrichment.get('dataActionProjectedFields', []):
-                if field.get('objectApiName'): dmos_used_by_data_actions.add(normalize_api_name(field.get('objectApiName')))
-            for edge in enrichment.get('dataActionRelationshipEdges', []):
-                if edge.get('sourceObjectApiName'): dmos_used_by_data_actions.add(normalize_api_name(edge.get('sourceObjectApiName')))
-                if edge.get('targetObjectApiName'): dmos_used_by_data_actions.add(normalize_api_name(edge.get('targetObjectApiName')))
+        find_dmos_recursively(da, dmos_used_by_data_actions)
 
     dmos_used_in_segment_criteria = set()
     for seg in segments:
         dmos_used_in_segment_criteria.update(find_dmos_in_criteria(seg.get('IncludeCriteria')))
         dmos_used_in_segment_criteria.update(find_dmos_in_criteria(seg.get('ExcludeCriteria')))
+
+    dmos_used_by_activations = set()
+    for act in activations:
+        find_dmos_recursively(act, dmos_used_by_activations)
 
     dmo_creation_dates = {normalize_api_name(dmo.get('DeveloperName')): parse_sf_date(dmo.get('CreatedDate')) for dmo in dmo_tooling_data}
     
@@ -343,13 +345,13 @@ async def main():
         created_date = dmo_creation_dates.get(normalized_dmo_name)
         days_creation = days_since(created_date)
         
-        # **LÓGICA CORRIGIDA**: Só verifica DMOs com mais de 90 dias
         if (days_creation is not None and days_creation > 90) or created_date is None:
             is_unused = (normalized_dmo_name not in dmos_used_by_segments and 
                          normalized_dmo_name not in dmos_used_by_ci_relationships and 
                          normalized_dmo_name not in dmos_used_by_data_graphs and
                          normalized_dmo_name not in dmos_used_by_data_actions and
-                         normalized_dmo_name not in dmos_used_in_segment_criteria)
+                         normalized_dmo_name not in dmos_used_in_segment_criteria and
+                         normalized_dmo_name not in dmos_used_by_activations) # **NOVA VERIFICAÇÃO**
             if is_unused:
                 reason = 'Órfão (sem uso e criado > 90 dias)' if created_date else 'Órfão (sem uso, data de criação desconhecida)'
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': original_dmo_name, 'DISPLAY_NAME': get_dmo_display_name(dmo), 'OBJECT_TYPE': 'DATA MODEL', 'REASON': reason, 'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_creation if days_creation is not None else 'N/A', 'DELETION_IDENTIFIER': original_dmo_name})
