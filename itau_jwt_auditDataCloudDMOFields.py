@@ -115,12 +115,13 @@ async def fetch_api_data(session, instance_url, relative_url, semaphore, key_nam
                     if key_name:
                         all_records.extend(data.get(key_name, []))
                         
+                        # **MUDANÇA CRÍTICA**: Procura por qualquer um dos campos de paginação
                         next_page_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
 
                         if next_page_url and not next_page_url.startswith('http'):
                             next_page_url = urljoin(instance_url, next_page_url)
                         else:
-                            current_url = None
+                            current_url = next_page_url # Atribui o valor (que pode ser None para encerrar)
                     else: 
                         return data
 
