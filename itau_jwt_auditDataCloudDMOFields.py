@@ -134,7 +134,6 @@ async def fetch_api_data(session, instance_url, relative_url, semaphore, key_nam
 def _find_and_track_dependencies(obj, usage_type, object_name, object_api_name, used_fields_details):
     api_name_keys = ["name", "entityName", "objectApiName", "fieldName", "attributeName", "developerName"]
     if isinstance(obj, dict):
-        # **LÓGICA ESPECIALIZADA**: Identifica a relação entre DMO e campo em atributos de ativação
         if 'entityName' in obj and 'name' in obj:
             dmo_name = obj.get('entityName')
             field_name = obj.get('name')
@@ -145,7 +144,6 @@ def _find_and_track_dependencies(obj, usage_type, object_name, object_api_name, 
             if field_name and usage_context not in used_fields_details[field_name]:
                 used_fields_details[field_name].append(usage_context)
 
-        # Lógica genérica para outras chaves e para continuar a recursão
         for key, value in obj.items():
             if key in api_name_keys and isinstance(value, str):
                 usage_context = {"usage_type": usage_type, "object_name": object_name, "object_api_name": object_api_name}
