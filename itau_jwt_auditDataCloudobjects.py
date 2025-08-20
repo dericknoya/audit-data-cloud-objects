@@ -2,12 +2,14 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.76 (Fase 1 - Final)
-- Alinha completamente a lógica de busca de dados com o script de auditoria de campos.
-- Remove a chamada incorreta ao endpoint '/ssot/activations'.
-- A lista de Ativações agora é obtida exclusivamente a partir dos IDs coletados
-  via '/jobs/query' em 'MktSgmntActvtnAudAttribute', garantindo a coleta de
-  todos os registros de forma confiável.
+Version: 5.72 (Fase 1 - Final)
+- Alinha a lógica de busca de dados com o script de auditoria de campos para
+  maior robustez e consistência.
+- A busca de Ativações agora utiliza o endpoint '/jobs/query' para obter uma
+  lista completa de IDs antes de buscar os detalhes, garantindo a coleta de
+  todos os registros.
+- Remove constantes globais desnecessárias (API_VERSION, TIMEOUT, etc.) para
+  padronizar o estilo do código.
 
 Regras de Auditoria:
 1. Segmentos:
@@ -52,6 +54,8 @@ from tqdm.asyncio import tqdm
 USE_PROXY = True
 PROXY_URL = "https://felirub:080796@proxynew.itau:8080"
 VERIFY_SSL = False
+MAX_RETRIES = 3
+RETRY_DELAY = 5 # Segundos
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -96,48 +100,108 @@ def get_access_token():
         raise
 
 # --- API Fetching with Production Safeguards ---
-async def fetch_api_data(session, instance_url, relative_url, semaphore, key_name=None):
-    """Fetches data from a Data Cloud API endpoint, handling pagination."""
-    async with semaphore:
-        all_records = []
-        current_url = urljoin(instance_url, relative_url)
+async def fetch_api_data(session, semaphore, base_url, relative_url, key_name=None, ignore_404=False):
+    """Fetches data from a Data Cloud API endpoint, handling pagination and retries."""
+    all_records = []
+    current_url = urljoin(base_url, relative_url)
+    
+    for attempt in range(MAX_RETRIES):
         try:
+            page_count = 1
             while current_url:
-                kwargs = {'ssl': VERIFY_SSL}
+                async with semaphore:
+                    kwargs = {'ssl': VERIFY_SSL}
+                    if USE_PROXY:
+                        kwargs['proxy'] = PROXY_URL
+                    
+                    async with session.get(current_url, **kwargs) as response:
+                        if response.status == 404 and ignore_404:
+                            logging.warning(f"⚠️ Endpoint não encontrado (404): {current_url}. O script continuará.")
+                            return [] if key_name else {}
+                        response.raise_for_status()
+                        data = await response.json()
+                        
+                        if key_name:
+                            records_on_page = data.get(key_name, [])
+                            all_records.extend(records_on_page)
+                        else:
+                            return data
+
+                        next_page_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
+                        
+                        if next_page_url and not next_page_url.startswith('http'):
+                            next_page_url = urljoin(base_url, next_page_url)
+
+                        if current_url == next_page_url: break
+                        current_url = next_page_url
+                        page_count += 1
+            return all_records # Success
+        except aiohttp.ClientError as e:
+            logging.warning(f"⚠️ Tentativa {attempt + 1}/{MAX_RETRIES} falhou para {current_url}: {e}")
+            if attempt + 1 == MAX_RETRIES:
+                logging.error(f"❌ Todas as {MAX_RETRIES} tentativas falharam para {current_url}.")
+                return [] if key_name else {}
+            await asyncio.sleep(RETRY_DELAY)
+
+async def fetch_jobs_query(session, semaphore, base_url, payload, object_name=""):
+    """Executes a query against the /jobs/query endpoint with retries."""
+    url = f"{base_url}/services/data/v64.0/jobs/query"
+    logging.info(f"🔎 Querying Jobs API for {object_name}...")
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with semaphore:
+                kwargs = {'ssl': VERIFY_SSL, 'json': payload}
                 if USE_PROXY:
                     kwargs['proxy'] = PROXY_URL
-
-                async with session.get(current_url, **kwargs) as response:
+                async with session.post(url, **kwargs) as response:
                     response.raise_for_status()
                     data = await response.json()
-                    if key_name:
-                        all_records.extend(data.get(key_name, []))
-                        next_page_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
-
-                        if next_page_url and not next_page_url.startswith('http'):
-                            current_url = urljoin(instance_url, next_page_url)
-                        else:
-                            current_url = next_page_url
-                    else: 
-                        return data
-            return all_records
+                    logging.info(f"✅ Found {len(data.get('records', []))} {object_name} records in Jobs API.")
+                    return data.get('records', [])
         except aiohttp.ClientError as e:
-            logging.error(f"❌ Error fetching {current_url}: {e}")
-            return [] if key_name else {}
+            logging.warning(f"⚠️ Tentativa {attempt + 1}/{MAX_RETRIES} falhou para Jobs API query: {e}")
+            if attempt + 1 == MAX_RETRIES:
+                logging.error(f"❌ Todas as {MAX_RETRIES} tentativas falharam para a query da Jobs API.")
+                return []
+            await asyncio.sleep(RETRY_DELAY)
 
 async def fetch_single_record(session, semaphore, url):
-    """Fetches a single record from a specific URL."""
-    async with semaphore:
+    """Fetches a single record from a specific URL with retries."""
+    for attempt in range(MAX_RETRIES):
         try:
-            async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
-                if response.status == 404:
-                    logging.warning(f"⚠️ Record not found (404): {url}")
-                    return None
-                response.raise_for_status()
-                return await response.json()
+            async with semaphore:
+                async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
+                    if response.status == 404:
+                        logging.warning(f"⚠️ Record not found (404): {url}")
+                        return None
+                    response.raise_for_status()
+                    return await response.json()
         except aiohttp.ClientError as e:
-            logging.error(f"❌ Error fetching single record {url}: {e}")
-            return None
+            logging.warning(f"⚠️ Tentativa {attempt + 1}/{MAX_RETRIES} falhou para {url}: {e}")
+            if attempt + 1 == MAX_RETRIES:
+                logging.error(f"❌ Todas as {MAX_RETRIES} tentativas falharam para {url}.")
+                return None
+            await asyncio.sleep(RETRY_DELAY)
+
+async def fetch_tooling_api_query(session, semaphore, base_url, soql_query, object_name=""):
+    """Fetches data from the Tooling API using a SOQL query with retries."""
+    params = {'q': soql_query}
+    url = f"{base_url}/services/data/v64.0/tooling/query?{urlencode(params)}"
+    logging.info(f"🔎 Querying Tooling API for {object_name}...")
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with semaphore:
+                async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    logging.info(f"✅ Found {data.get('size', 0)} {object_name} records in Tooling API.")
+                    return data.get('records', [])
+        except aiohttp.ClientError as e:
+            logging.warning(f"⚠️ Tentativa {attempt + 1}/{MAX_RETRIES} falhou para Tooling API query: {e}")
+            if attempt + 1 == MAX_RETRIES:
+                logging.error(f"❌ Todas as {MAX_RETRIES} tentativas falharam para a query da Tooling API.")
+                return []
+            await asyncio.sleep(RETRY_DELAY)
 
 # --- Helper Functions ---
 def parse_sf_date(date_str):
@@ -155,7 +219,7 @@ def normalize_api_name(name):
     return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
 
 def find_dmos_recursively(obj, dmo_set):
-    """Recursively finds all DMOs referenced in a complex object."""
+    """Recursively finds all DMOs referenced in a complex object like an Activation."""
     if isinstance(obj, dict):
         for key, value in obj.items():
             if key in ['objectName', 'entityName', 'developerName'] and isinstance(value, str) and value.endswith('__dlm'):
@@ -188,41 +252,45 @@ async def main():
     logging.info('🚀 Iniciando auditoria de exclusão de objetos...')
 
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
-    semaphore = asyncio.Semaphore(50)
+    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
     connector = aiohttp.TCPConnector(ssl=VERIFY_SSL)
-    async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
-        logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
+    async with aiohttp.ClientSession(headers=headers, connector=connector, timeout=timeout) as session:
+        soql_query_segments = "SELECT Id FROM MarketSegment"
+        encoded_soql_segments = urlencode({'q': soql_query_segments})
+        soql_url_segments = f"/services/data/v64.0/query?{encoded_soql_segments}"
         
-        dmo_soql_query = "SELECT DeveloperName, CreatedDate FROM MktDataModelObject"
-        segment_soql_query = "SELECT Id FROM MarketSegment"
-        activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute"
+        activation_attributes_query = {"query": "SELECT Id, QueryPath, Name, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute"}
+
+        segment_id_records, activation_attributes = await asyncio.gather(
+            fetch_api_data(session, semaphore, instance_url, soql_url_segments, 'records'),
+            fetch_jobs_query(session, semaphore, instance_url, activation_attributes_query, "Activation Attributes")
+        )
         
-        initial_tasks = [
-            fetch_api_data(session, instance_url, f"/services/data/v64.0/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
-            fetch_api_data(session, instance_url, f"/services/data/v64.0/query?{urlencode({'q': segment_soql_query})}", semaphore, 'records'),
-            fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
-            fetch_api_data(session, instance_url, f"/services/data/v64.0/tooling/query?{urlencode({'q': activation_attributes_query})}", semaphore, 'records'),
-            fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
-            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/data-streams", semaphore, 'dataStreams'),
-            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/data-graphs/metadata", semaphore, 'dataGraphMetadata'),
-            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/data-actions", semaphore, 'dataActions'),
-        ]
-        results = await tqdm.gather(*initial_tasks, desc="Coletando metadados iniciais")
-        dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams_summary, data_graphs, data_actions = results
-        
-        dmo_creation_dates = {rec['DeveloperName']: rec['CreatedDate'] for rec in dmo_tooling_data}
         segment_ids = [rec['Id'] for rec in segment_id_records]
         activation_ids = list(set(rec['MarketSegmentActivationId'] for rec in activation_attributes if rec.get('MarketSegmentActivationId')))
-        logging.info(f"✅ Etapa 1.1: {len(dmo_creation_dates)} datas de criação de DMOs, {len(segment_ids)} IDs de Segmentos e {len(activation_ids)} IDs de Ativações únicos encontrados.")
+        logging.info(f"✅ Etapa 1.1: {len(segment_ids)} IDs de Segmentos e {len(activation_ids)} IDs de Ativações únicos encontrados.")
 
-        segment_detail_tasks = [fetch_api_data(session, instance_url, f"/services/data/v64.0/sobjects/MarketSegment/{seg_id}", semaphore) for seg_id in segment_ids]
+        segment_detail_tasks = [fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/sobjects/MarketSegment/{seg_id}") for seg_id in segment_ids]
         activation_detail_tasks = [fetch_single_record(session, semaphore, f"{instance_url}/services/data/v64.0/ssot/activations/{act_id}") for act_id in activation_ids]
+        
+        other_tasks = [
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/data-streams", 'dataStreams'),
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/data-graphs/metadata", 'dataGraphMetadata'),
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/metadata?entityType=DataModelObject", 'metadata'),
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/metadata?entityType=CalculatedInsight", 'metadata'),
+            fetch_tooling_api_query(session, semaphore, instance_url, "SELECT DeveloperName, CreatedDate FROM MktDataModelObject", "DMOs"),
+            fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/data-actions", 'dataActions'),
+        ]
         
         segments = await tqdm.gather(*segment_detail_tasks, desc="Buscando detalhes dos Segmentos")
         activations = await tqdm.gather(*activation_detail_tasks, desc="Buscando detalhes das Ativações")
         
+        other_results = await asyncio.gather(*other_tasks)
+        
         segments = [res for res in segments if res]
         activations = [res for res in activations if res]
+        data_streams_summary, data_graphs, dm_objects, calculated_insights, dmo_tooling_data, data_actions = other_results
         
         logging.info(f"✅ Etapa 1.2: {len(segments)} detalhes de Segmentos e {len(activations)} de Ativações obtidos.")
 
@@ -271,6 +339,8 @@ async def main():
         if query_path_str := attr.get('QueryPath'):
             dmos_used_by_activations.update(find_dmos_in_criteria(query_path_str))
 
+    dmo_creation_dates = {normalize_api_name(dmo.get('DeveloperName')): parse_sf_date(dmo.get('CreatedDate')) for dmo in dmo_tooling_data}
+    
     audit_results = []
 
     for seg in segments:
@@ -304,8 +374,7 @@ async def main():
         if not original_dmo_name or not original_dmo_name.endswith('__dlm'): continue
         normalized_dmo_name = normalize_api_name(original_dmo_name)
         
-        created_date_str = dmo_creation_dates.get(normalized_dmo_name)
-        created_date = parse_sf_date(created_date_str)
+        created_date = dmo_creation_dates.get(normalized_dmo_name)
         days_creation = days_since(created_date)
         
         if (days_creation is not None and days_creation > 90) or created_date is None:
