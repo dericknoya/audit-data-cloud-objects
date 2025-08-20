@@ -99,7 +99,7 @@ def get_access_token():
         logging.error(f"❌ Erro na autenticação com Salesforce: {e.response.text if e.response else e}"); raise
 
 
-# --- Funções da API ---
+# --- API Fetching ---
 async def fetch_api_data(session, instance_url, relative_url, semaphore, key_name=None):
     async with semaphore:
         all_records = []
@@ -107,150 +107,82 @@ async def fetch_api_data(session, instance_url, relative_url, semaphore, key_nam
         try:
             while current_url:
                 kwargs = {'ssl': VERIFY_SSL}
-                if USE_PROXY: kwargs['proxy'] = PROXY_URL
+                if USE_PROXY:
+                    kwargs['proxy'] = PROXY_URL
+
                 async with session.get(current_url, **kwargs) as response:
                     response.raise_for_status(); data = await response.json()
                     if key_name:
                         all_records.extend(data.get(key_name, []))
                         next_page_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
-                        current_url = urljoin(instance_url, next_page_url) if next_page_url and not next_page_url.startswith('http') else next_page_url
-                    else: return data
+
+                        if next_page_url and not next_page_url.startswith('http'):
+                            current_url = urljoin(instance_url, next_page_url)
+                        else:
+                            current_url = next_page_url
+                    else: 
+                        return data
             return all_records
-        except aiohttp.ClientError: return [] if key_name else {}
+        except aiohttp.ClientError:
+            return [] if key_name else {}
 
-# --- Novas Funções para a Bulk API 2.0 ---
-async def create_bulk_query_job(session, instance_url, query, semaphore):
-    async with semaphore:
-        url = urljoin(instance_url, "/services/data/v60.0/jobs/query")
-        payload = {"operation": "query", "query": query}
-        kwargs = {'ssl': VERIFY_SSL}
-        if USE_PROXY: kwargs['proxy'] = PROXY_URL
-        try:
-            async with session.post(url, json=payload, **kwargs) as response:
-                response.raise_for_status()
-                return await response.json()
-        except aiohttp.ClientError as e:
-            logging.error(f"❌ Erro ao criar o Bulk Job para a query '{query[:50]}...': {e}")
-            return None
-
-async def monitor_job_status(session, instance_url, job_id, semaphore):
-    async with semaphore:
-        url = urljoin(instance_url, f"/services/data/v60.0/jobs/query/{job_id}")
-        kwargs = {'ssl': VERIFY_SSL}
-        if USE_PROXY: kwargs['proxy'] = PROXY_URL
-        while True:
-            try:
-                async with session.get(url, **kwargs) as response:
-                    response.raise_for_status()
-                    job_info = await response.json()
-                    state = job_info.get("state")
-                    if state in ["JobComplete", "Failed", "Aborted"]:
-                        return job_info
-                await asyncio.sleep(15)
-            except aiohttp.ClientError as e:
-                logging.error(f"❌ Erro ao monitorar o Job {job_id}: {e}")
-                return {"state": "Failed"}
-
-async def get_bulk_query_results(session, instance_url, job_id, semaphore):
-    async with semaphore:
-        all_records = []
-        locator = None
-        while True:
-            endpoint = f"/services/data/v60.0/jobs/query/{job_id}/results"
-            req_headers = {}
-            if locator and locator != 'null':
-                req_headers['Sforce-Locator'] = locator
-            
-            url = urljoin(instance_url, endpoint)
-            kwargs = {'ssl': VERIFY_SSL, 'headers': req_headers}
-            if USE_PROXY: kwargs['proxy'] = PROXY_URL
-            
-            try:
-                async with session.get(url, **kwargs) as response:
-                    response.raise_for_status()
-                    csv_text = await response.text()
-                    reader = csv.DictReader(csv_text.splitlines())
-                    all_records.extend(list(reader))
-                    
-                    locator = response.headers.get('Sforce-Locator')
-                    if not locator or locator == 'null': break
-            except aiohttp.ClientError as e:
-                logging.error(f"❌ Erro ao buscar resultados para o Job {job_id}: {e}")
-                break
-        return all_records
-
-# --- Funções de Análise e Geração de Relatórios ---
+# --- Helper Functions ---
 def _find_and_track_dependencies(obj, usage_type, object_name, object_api_name, used_fields_details):
     api_name_keys = ["name", "entityName", "objectApiName", "fieldName", "attributeName", "developerName"]
     if isinstance(obj, dict):
-        if 'entityName' in obj and 'name' in obj:
-            dmo_name, field_name = obj.get('entityName'), obj.get('name')
-            usage_context = {"usage_type": usage_type, "object_name": object_name, "object_api_name": object_api_name}
-            if dmo_name and usage_context not in used_fields_details[dmo_name]: used_fields_details[dmo_name].append(usage_context)
-            if field_name and usage_context not in used_fields_details[field_name]: used_fields_details[field_name].append(usage_context)
         for key, value in obj.items():
             if key in api_name_keys and isinstance(value, str):
                 usage_context = {"usage_type": usage_type, "object_name": object_name, "object_api_name": object_api_name}
-                if usage_context not in used_fields_details[value]: used_fields_details[value].append(usage_context)
+                if usage_context not in used_fields_details[value]:
+                    used_fields_details[value].append(usage_context)
             _find_and_track_dependencies(value, usage_type, object_name, object_api_name, used_fields_details)
     elif isinstance(obj, list):
         for item in obj:
             _find_and_track_dependencies(item, usage_type, object_name, object_api_name, used_fields_details)
 
 
-# --- Lógica Principal ---
+# --- Main Audit Logic ---
 async def audit_dmo_fields():
     auth_data = get_access_token()
     access_token, instance_url = auth_data['access_token'], auth_data['instance_url']
     logging.info('🚀 Iniciando auditoria de campos de DMO...')
-    headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json', "Accept-Encoding": "gzip"}
+    headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
     
-    CONCURRENT_REQUESTS = 10 
+    CONCURRENT_REQUESTS = 50
     semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
     async with aiohttp.ClientSession(headers=headers) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
+
         dmo_soql_query = "SELECT DeveloperName, CreatedDate FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
+        activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute"
         
         initial_tasks = [
             fetch_api_data(session, instance_url, f"/services/data/v60.0/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
             fetch_api_data(session, instance_url, f"/services/data/v60.0/query?{urlencode({'q': segment_soql_query})}", semaphore, 'records'),
             fetch_api_data(session, instance_url, "/services/data/v60.0/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
+            fetch_api_data(session, instance_url, f"/services/data/v60.0/query?{urlencode({'q': activation_attributes_query})}", semaphore, 'records'),
             fetch_api_data(session, instance_url, "/services/data/v60.0/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
         ]
         results = await tqdm.gather(*initial_tasks, desc="Coletando metadados iniciais")
-        dmo_details_records, segment_id_records, dmo_metadata_list, calculated_insights = results
+        dmo_details_records, segment_id_records, dmo_metadata_list, activation_attributes, calculated_insights = results
         
         dmo_creation_dates = {rec['DeveloperName']: rec['CreatedDate'] for rec in dmo_details_records}
         segment_ids = [rec['Id'] for rec in segment_id_records]
         logging.info(f"✅ Etapa 1.1: {len(dmo_creation_dates)} datas de criação de DMOs obtidas.")
         logging.info(f"✅ Etapa 1.2: {len(segment_ids)} IDs de segmentos encontrados.")
+        logging.info(f"✅ Etapa 1.3: {len(activation_attributes)} atributos de ativação encontrados via SOQL.")
         
         logging.info(f"\n--- Etapa 2: Buscando detalhes de {len(segment_ids)} segmentos ---")
         segment_detail_tasks = [fetch_api_data(session, instance_url, f"/services/data/v60.0/sobjects/MarketSegment/{seg_id}", semaphore) for seg_id in segment_ids]
         segments_list = await tqdm.gather(*segment_detail_tasks, desc="Buscando detalhes dos Segmentos")
         
-        logging.info(f"\n--- Etapa 3: Analisando DMOs de Activation Audience via Bulk API ---")
-        audience_dmo_names = [rec['DeveloperName'] for rec in dmo_details_records if rec.get('DeveloperName', '').startswith(('AA_', 'AAL_'))]
-        logging.info(f"🔎 {len(audience_dmo_names)} DMOs de Activation Audience identificados.")
-        
-        job_creation_tasks = [create_bulk_query_job(session, instance_url, f"SELECT Activation_Id__c, Activation_Record__c FROM {dmo_name}", semaphore) for dmo_name in audience_dmo_names]
-        created_jobs = await tqdm.gather(*job_creation_tasks, desc="Criando Bulk API Jobs")
-        valid_jobs = [job for job in created_jobs if job]
-        
-        logging.info(f"🔎 Monitorando {len(valid_jobs)} Bulk API Jobs...")
-        monitoring_tasks = [monitor_job_status(session, instance_url, job['id'], semaphore) for job in valid_jobs]
-        completed_jobs = await tqdm.gather(*monitoring_tasks, desc="Processando Ativações no Salesforce")
-
-        results_tasks = [get_bulk_query_results(session, instance_url, job['id'], semaphore) for job in completed_jobs if job.get('state') == 'JobComplete']
-        all_audience_records_lists = await tqdm.gather(*results_tasks, desc="Baixando resultados das Ativações")
-        all_audience_records = [record for sublist in all_audience_records_lists for record in sublist]
-
     logging.info("\n📊 Dados coletados. Analisando o uso dos campos...")
     
     all_dmo_data = defaultdict(lambda: {'fields': {}, 'displayName': ''})
-    dmo_prefixes_to_exclude = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership')
+    dmo_prefixes_to_exclude = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
+
     for dmo in dmo_metadata_list:
         if (dmo_name := dmo.get('name')) and dmo_name.endswith('__dlm'):
             if any(dmo_name.lower().startswith(prefix) for prefix in dmo_prefixes_to_exclude): continue
@@ -271,25 +203,19 @@ async def audit_dmo_fields():
                 usage_context = { "usage_type": "Segmento", "object_name": seg.get('Name'), "object_api_name": seg.get('Id') }
                 if usage_context not in used_fields_details[field_name]:
                     used_fields_details[field_name].append(usage_context)
-    
-    unique_activation_samples = {}
-    for record in tqdm(all_audience_records, desc="Desduplicando amostras de ativações"):
-        act_id = record.get('Activation_Id__c')
-        if act_id and act_id not in unique_activation_samples:
-            unique_activation_samples[act_id] = record.get('Activation_Record__c')
-    
-    logging.info(f"🔎 {len(unique_activation_samples)} ativações únicas encontradas para análise.")
-    for record_json_str in tqdm(unique_activation_samples.values(), desc="Analisando amostras de ativações"):
-        if not record_json_str: continue
-        try:
-            activated_data = json.loads(record_json_str)
-            for field_name in activated_data.keys():
-                if field_name in all_field_names_set or field_name.endswith('__c'):
-                    usage_context = { "usage_type": "Ativação", "object_name": "N/A (via DMO de Audience)", "object_api_name": "N/A" }
-                    if usage_context not in used_fields_details[field_name]:
-                        used_fields_details[field_name].append(usage_context)
-        except json.JSONDecodeError:
-            logging.warning("Não foi possível analisar o JSON do campo Activation_Record__c.")
+
+    for attr in tqdm(activation_attributes, desc="Analisando Atributos de Ativação"):
+        if query_path_str := attr.get('QueryPath'):
+            try:
+                query_path_json = json.loads(query_path_str)
+                _find_and_track_dependencies(query_path_json, "Ativação", attr.get('Name'), attr.get('MarketSegmentActivationId'), used_fields_details)
+            except (json.JSONDecodeError, TypeError):
+                found_fields = set(field_name_pattern.findall(html.unescape(str(query_path_str))))
+                for field_name in found_fields:
+                     if field_name in all_field_names_set:
+                        usage_context = { "usage_type": "Ativação", "object_name": attr.get('Name'), "object_api_name": attr.get('MarketSegmentActivationId')}
+                        if usage_context not in used_fields_details[field_name]:
+                            used_fields_details[field_name].append(usage_context)
 
     for ci in tqdm(calculated_insights, desc="Analisando CIs"):
         _find_and_track_dependencies(ci, "Calculated Insight", ci.get('displayName'), ci.get('name'), used_fields_details)
