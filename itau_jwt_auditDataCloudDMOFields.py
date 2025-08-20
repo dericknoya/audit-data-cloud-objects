@@ -193,31 +193,14 @@ async def audit_dmo_fields():
         audience_dmo_names = [rec['DeveloperName'] for rec in dmo_details_records if rec.get('DeveloperName', '').startswith(('AA_', 'AAL_'))]
         logging.info(f"🔎 {len(audience_dmo_names)} DMOs de Activation Audience identificados.")
         
-        activation_ids_by_dmo = defaultdict(list)
-        group_by_tasks = []
+        sample_tasks = []
         for dmo_name in audience_dmo_names:
-            query = f"SELECT Activation_Id__c FROM {dmo_name} GROUP BY Activation_Id__c"
+            query = f"SELECT Activation_Id__c, Activation_Record__c FROM {dmo_name} LIMIT 200"
             url = f"/services/data/v64.0/query?{urlencode({'q': query})}"
-            group_by_tasks.append(fetch_api_data(session, instance_url, url, semaphore, 'records'))
+            sample_tasks.append(fetch_api_data(session, instance_url, url, semaphore, 'records'))
 
-        results_by_dmo = await tqdm.gather(*group_by_tasks, desc="Buscando IDs de Ativação nos DMOs")
-        
-        for i, records in enumerate(results_by_dmo):
-            if records:
-                dmo_name = audience_dmo_names[i]
-                for rec in records:
-                    if act_id := rec.get('Activation_Id__c'):
-                         activation_ids_by_dmo[dmo_name].append(act_id)
-
-        sample_record_tasks = []
-        for dmo_name, activation_ids in activation_ids_by_dmo.items():
-            for act_id in set(activation_ids):
-                query = f"SELECT Activation_Record__c FROM {dmo_name} WHERE Activation_Id__c = '{act_id}' LIMIT 1"
-                url = f"/services/data/v64.0/query?{urlencode({'q': query})}"
-                sample_record_tasks.append(fetch_api_data(session, instance_url, url, semaphore, 'records'))
-
-        logging.info(f"🔎 Buscando amostras para {len(sample_record_tasks)} ativações únicas encontradas...")
-        audience_records_samples = await tqdm.gather(*sample_record_tasks, desc="Obtendo amostras de ativações")
+        logging.info(f"🔎 Coletando amostras de registros dos {len(audience_dmo_names)} DMOs de Audience...")
+        audience_samples_results = await tqdm.gather(*sample_tasks, desc="Coletando amostras de ativações")
 
     logging.info("\n📊 Dados coletados. Analisando o uso dos campos...")
     
@@ -248,14 +231,20 @@ async def audit_dmo_fields():
                 if usage_context not in used_fields_details[field_name]:
                     used_fields_details[field_name].append(usage_context)
     
-    for i, sample_list in enumerate(tqdm(audience_records_samples, desc="Analisando amostras de ativações")):
-        if not sample_list: continue
-        record_json_str = sample_list[0].get('Activation_Record__c')
+    unique_activation_samples = {}
+    for sample_list in audience_samples_results:
+        for record in sample_list:
+            act_id = record.get('Activation_Id__c')
+            if act_id and act_id not in unique_activation_samples:
+                unique_activation_samples[act_id] = record.get('Activation_Record__c')
+    
+    logging.info(f"🔎 {len(unique_activation_samples)} ativações únicas encontradas para análise.")
+    for record_json_str in tqdm(unique_activation_samples.values(), desc="Analisando amostras de ativações"):
         if not record_json_str: continue
         try:
             activated_data = json.loads(record_json_str)
             for field_name in activated_data.keys():
-                if field_name in all_field_names_set:
+                if field_name in all_field_names_set or field_name.endswith('__c'):
                     usage_context = { "usage_type": "Ativação", "object_name": "N/A (via DMO de Audience)", "object_api_name": "N/A" }
                     if usage_context not in used_fields_details[field_name]:
                         used_fields_details[field_name].append(usage_context)
