@@ -2,13 +2,11 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.57 (Fase 1 - Final)
-- Alinha a lógica de busca de dados com o script de auditoria de campos para
-  maior robustez e consistência.
-- Adiciona uma query em 'MktSgmntActvtnAudAttribute' para analisar o campo
-  'QueryPath', garantindo a identificação de DMOs usados em atributos de ativação.
-- Remove logs repetitivos durante a busca de segmentos, utilizando apenas a
-  barra de progresso para feedback visual.
+Version: 5.66 (Fase 1 - Final)
+- Remove completamente a chamada ao endpoint '/ssot/activations'.
+- A lista de Ativações agora é obtida exclusivamente a partir dos IDs coletados
+  via '/jobs/query' em 'MktSgmntActvtnAudAttribute', alinhando o script com a
+  lógica mais robusta e consistente do projeto.
 
 Regras de Auditoria:
 1. Segmentos:
@@ -105,7 +103,8 @@ async def fetch_api_data(session, semaphore, base_url, relative_url, key_name=No
     """Fetches data from a Data Cloud API endpoint, handling pagination and retries."""
     all_records = []
     current_url = urljoin(base_url, relative_url)
-    
+    logging.info(f"Iniciando busca em: {relative_url}")
+
     for attempt in range(MAX_RETRIES):
         try:
             page_count = 1
@@ -261,18 +260,16 @@ async def main():
         encoded_soql_segments = urlencode({'q': soql_query_segments})
         soql_url_segments = f"/services/data/v64.0/query?{encoded_soql_segments}"
         
-        jobs_query_activations = {"query": "SELECT ActivationId FROM Activation"}
-        activation_attributes_query = {"query": "SELECT QueryPath FROM MktSgmntActvtnAudAttribute"}
+        activation_attributes_query = {"query": "SELECT Id, QueryPath, Name, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute"}
 
-        segment_id_records, activation_id_records, activation_attributes = await asyncio.gather(
+        segment_id_records, activation_attributes = await asyncio.gather(
             fetch_api_data(session, semaphore, instance_url, soql_url_segments, 'records'),
-            fetch_jobs_query(session, semaphore, instance_url, jobs_query_activations, "Activation IDs"),
             fetch_jobs_query(session, semaphore, instance_url, activation_attributes_query, "Activation Attributes")
         )
         
         segment_ids = [rec['Id'] for rec in segment_id_records]
-        activation_ids = [rec['ActivationId'] for rec in activation_id_records]
-        logging.info(f"✅ Etapa 1.1: {len(segment_ids)} IDs de Segmentos e {len(activation_ids)} IDs de Ativações encontrados.")
+        activation_ids = list(set(rec['MarketSegmentActivationId'] for rec in activation_attributes if rec.get('MarketSegmentActivationId')))
+        logging.info(f"✅ Etapa 1.1: {len(segment_ids)} IDs de Segmentos e {len(activation_ids)} IDs de Ativações únicos encontrados.")
 
         segment_detail_tasks = [fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/sobjects/MarketSegment/{seg_id}") for seg_id in segment_ids]
         activation_detail_tasks = [fetch_single_record(session, semaphore, f"{instance_url}/services/data/v64.0/ssot/activations/{act_id}") for act_id in activation_ids]
