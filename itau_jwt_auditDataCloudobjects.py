@@ -2,12 +2,13 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.56 (Fase 1 - Final)
-- Refina a busca de dependências de DMOs em Ativações, alinhando com a lógica
-  do script de auditoria de campos.
-- Adiciona uma query em 'MktSgmntActvtnAudAttribute' via '/jobs/query' para
-  analisar o campo 'QueryPath', garantindo a identificação de DMOs usados
-  em atributos de ativação.
+Version: 5.57 (Fase 1 - Final)
+- Alinha a lógica de busca de dados com o script de auditoria de campos para
+  maior robustez e consistência.
+- Adiciona uma query em 'MktSgmntActvtnAudAttribute' para analisar o campo
+  'QueryPath', garantindo a identificação de DMOs usados em atributos de ativação.
+- Remove logs repetitivos durante a busca de segmentos, utilizando apenas a
+  barra de progresso para feedback visual.
 
 Regras de Auditoria:
 1. Segmentos:
@@ -104,8 +105,7 @@ async def fetch_api_data(session, semaphore, base_url, relative_url, key_name=No
     """Fetches data from a Data Cloud API endpoint, handling pagination and retries."""
     all_records = []
     current_url = urljoin(base_url, relative_url)
-    logging.info(f"Iniciando busca em: {relative_url}")
-
+    
     for attempt in range(MAX_RETRIES):
         try:
             page_count = 1
@@ -340,7 +340,7 @@ async def main():
         find_dmos_recursively(act, dmos_used_by_activations)
     for attr in activation_attributes:
         if query_path_str := attr.get('QueryPath'):
-            find_dmos_in_criteria(query_path_str)
+            dmos_used_by_activations.update(find_dmos_in_criteria(query_path_str))
 
     dmo_creation_dates = {normalize_api_name(dmo.get('DeveloperName')): parse_sf_date(dmo.get('CreatedDate')) for dmo in dmo_tooling_data}
     
