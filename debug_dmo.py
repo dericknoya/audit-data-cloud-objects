@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Script de diagnóstico para isolar a busca de dados em DMOs de Activation Audience.
+Script de diagnóstico para isolar e paginar a busca de dados em DMOs de Activation Audience.
 
-Versão: 1.0 - Debug
+Versão: 1.1 - Adicionada Paginação Completa
 """
+import os
+import time
 import asyncio
 import csv
+import json
+import html
 import logging
 from urllib.parse import urljoin, urlencode
 
@@ -13,8 +17,7 @@ import jwt
 import requests
 import aiohttp
 from dotenv import load_dotenv
-import os
-import time
+from tqdm.asyncio import tqdm
 
 # --- Configuração de Rede ---
 USE_PROXY = True
@@ -62,18 +65,29 @@ def get_access_token():
 async def fetch_api_data(session, instance_url, relative_url, key_name=None):
     all_records = []
     current_url = urljoin(instance_url, relative_url)
-    logging.info(f"  -> Tentando buscar dados de: {current_url}")
+    logging.info(f"  -> Iniciando busca em: {relative_url}")
     try:
-        kwargs = {'ssl': VERIFY_SSL}
-        if USE_PROXY:
-            kwargs['proxy'] = PROXY_URL
-        async with session.get(current_url, **kwargs) as response:
-            response.raise_for_status()
-            data = await response.json()
-            if key_name:
-                all_records.extend(data.get(key_name, []))
-            else:
-                return data
+        page_count = 1
+        while current_url:
+            kwargs = {'ssl': VERIFY_SSL}
+            if USE_PROXY:
+                kwargs['proxy'] = PROXY_URL
+
+            async with session.get(current_url, **kwargs) as response:
+                response.raise_for_status(); data = await response.json()
+                
+                records_on_page = data.get(key_name, [])
+                all_records.extend(records_on_page)
+                logging.info(f"  -> Página {page_count}: {len(records_on_page)} registros recebidos.")
+
+                next_page_url = data.get('nextRecordsUrl')
+
+                if next_page_url and not next_page_url.startswith('http'):
+                    current_url = urljoin(instance_url, next_page_url)
+                else:
+                    current_url = next_page_url # Será None se for a última página
+                
+                page_count += 1
         return all_records
     except aiohttp.ClientError as e:
         logging.error(f"  -> ❌ Erro ao buscar dados: {e}")
@@ -101,7 +115,6 @@ async def debug_audience_dmo_query():
         for dmo_name in target_dmos:
             logging.info(f"--- Processando DMO: {dmo_name} ---")
             
-            # Usando LIMIT 10 para um teste rápido e seguro
             query = f"SELECT Activation_Id__c, Activation_Record__c FROM {dmo_name}"
             logging.info(f"  -> Montando query: {query}")
             
@@ -109,7 +122,7 @@ async def debug_audience_dmo_query():
             
             records = await fetch_api_data(session, instance_url, url, 'records')
             
-            logging.info(f"  -> Query para {dmo_name} retornou {len(records)} registro(s).")
+            logging.info(f"  -> Query para {dmo_name} retornou um total de {len(records)} registro(s) após paginação.")
 
             if records:
                 for rec in records:
@@ -123,8 +136,7 @@ async def debug_audience_dmo_query():
     logging.info(f"Total de registros coletados para o CSV: {len(all_results_for_csv)}")
 
     if not all_results_for_csv:
-        logging.warning("Nenhum registro foi retornado. O arquivo CSV será gerado vazio.")
-        logging.warning("Causa provável: O usuário da API não tem permissão de LEITURA para os registros dentro desses DMOs.")
+        logging.warning("Nenhum registro foi retornado.")
 
     # Gerar CSV com os resultados
     csv_file_path = 'debug_audience_dmo_output.csv'
