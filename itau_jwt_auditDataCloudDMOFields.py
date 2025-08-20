@@ -190,8 +190,13 @@ async def audit_dmo_fields():
         segments_list = await tqdm.gather(*segment_detail_tasks, desc="Buscando detalhes dos Segmentos")
         
         logging.info(f"\n--- Etapa 3: Analisando DMOs de Activation Audience ---")
-        audience_dmo_names = [rec['DeveloperName'] for rec in dmo_details_records if rec.get('DeveloperName', '').startswith(('AA_', 'AAL_'))]
-        logging.info(f"🔎 {len(audience_dmo_names)} DMOs de Activation Audience identificados.")
+        
+        # **MUDANÇA CRÍTICA**: Focando em DMOs de Audience específicos para debug
+        audience_dmo_names = [
+            "AA_SFMC_85U5e000000fxbrEAA__dlm",
+            "AA_SFMC_85U5e000000fxcLEAQ__dlm"
+        ]
+        logging.info(f"🔎 Análise restrita a {len(audience_dmo_names)} DMOs de Activation Audience específicos.")
         
         all_audience_records = []
         fetch_tasks = []
@@ -200,7 +205,7 @@ async def audit_dmo_fields():
             url = f"/services/data/v64.0/query?{urlencode({'q': query})}"
             fetch_tasks.append(fetch_api_data(session, instance_url, url, semaphore, 'records'))
 
-        logging.info(f"🔎 Coletando todos os registros dos {len(audience_dmo_names)} DMOs de Audience (pode levar tempo)...")
+        logging.info(f"🔎 Coletando todos os registros dos DMOs de Audience selecionados (pode levar tempo)...")
         results_by_dmo = await tqdm.gather(*fetch_tasks, desc="Coletando dados de ativações")
         for record_list in results_by_dmo:
             all_audience_records.extend(record_list)
