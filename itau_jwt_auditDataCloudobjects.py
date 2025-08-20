@@ -2,33 +2,35 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.73 (Fase 1 - Final)
-- A lógica de análise de DMOs em Ativações foi aprimorada, adotando um método
-  de parsing recursivo mais robusto para inspecionar o campo 'QueryPath' do
-  objeto 'MktSgmntActvtnAudAttribute'.
-- Isso garante uma detecção de dependências mais precisa e completa, alinhando
-  o script com as melhores práticas de análise de metadados complexos.
+Version: 5.72 (Fase 1 - Final)
+- Alinha a lógica de busca de dados com o script de auditoria de campos para
+  maior robustez e consistência.
+- A busca de Ativações agora utiliza o endpoint '/jobs/query' para obter uma
+  lista completa de IDs antes de buscar os detalhes, garantindo a coleta de
+  todos os registros.
+- Remove constantes globais desnecessárias (API_VERSION, TIMEOUT, etc.) para
+  padronizar o estilo do código.
 
 Regras de Auditoria:
 1. Segmentos:
-   - Órfão: Não publicado nos últimos 30 dias E não utilizado como filtro aninhado.
-   - Inativo: Última publicação > 30 dias, MAS é utilizado como filtro aninhado.
+  - Órfão: Não publicado nos últimos 30 dias E não utilizado como filtro aninhado.
+  - Inativo: Última publicação > 30 dias, MAS é utilizado como filtro aninhado.
 
 2. Ativações:
-   - Órfã: Associada a um segmento que foi identificado como órfão.
+  - Órfã: Associada a um segmento que foi identificado como órfão.
 
 3. Data Model Objects (DMOs):
-   - Órfão se: For um DMO customizado, não for utilizado em nenhum Segmento, Ativação
-     (incluindo seus atributos), Data Graph, CI ou Data Action, E (Criado > 90 dias
-     OU Data de Criação desconhecida).
+  - Órfão se: For um DMO customizado, não for utilizado em nenhum Segmento, Ativação
+    (incluindo seus atributos), Data Graph, CI ou Data Action, E (Criado > 90 dias
+    OU Data de Criação desconhecida).
 
 4. Data Streams:
-   - Órfão se: A última atualização foi > 30 dias E o array 'mappings' retornado pela API
-     estiver vazio.
-   - Inativo se: A última atualização foi > 30 dias, MAS o array 'mappings' não está vazio.
+  - Órfão se: A última atualização foi > 30 dias E o array 'mappings' retornado pela API
+    estiver vazio.
+  - Inativo se: A última atualização foi > 30 dias, MAS o array 'mappings' não está vazio.
 
 5. Calculated Insights (CIs):
-   - Inativo se: Último processamento bem-sucedido > 90 dias.
+  - Inativo se: Último processamento bem-sucedido > 90 dias.
 
 O resultado é salvo em um arquivo CSV chamado 'audit_objetos_para_exclusao.csv'.
 """
@@ -49,13 +51,11 @@ from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
 
 # --- Configuration ---
-CONCURRENCY_LIMIT = 10
 USE_PROXY = True
 PROXY_URL = "https://felirub:080796@proxynew.itau:8080"
 VERIFY_SSL = False
 MAX_RETRIES = 3
 RETRY_DELAY = 5 # Segundos
-TIMEOUT_SECONDS = 300
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -104,9 +104,7 @@ async def fetch_api_data(session, semaphore, base_url, relative_url, key_name=No
     """Fetches data from a Data Cloud API endpoint, handling pagination and retries."""
     all_records = []
     current_url = urljoin(base_url, relative_url)
-    tqdm.gather(*current_url, desc="Buscando Segmentos")
-    # logging.info(f"Iniciando busca em: {relative_url}")
-
+    
     for attempt in range(MAX_RETRIES):
         try:
             page_count = 1
@@ -221,7 +219,7 @@ def normalize_api_name(name):
     return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
 
 def find_dmos_recursively(obj, dmo_set):
-    """Recursively finds all DMOs referenced in a complex object."""
+    """Recursively finds all DMOs referenced in a complex object like an Activation."""
     if isinstance(obj, dict):
         for key, value in obj.items():
             if key in ['objectName', 'entityName', 'developerName'] and isinstance(value, str) and value.endswith('__dlm'):
@@ -231,45 +229,6 @@ def find_dmos_recursively(obj, dmo_set):
     elif isinstance(obj, list):
         for item in obj:
             find_dmos_recursively(item, dmo_set)
-
-### INÍCIO DO NOVO HELPER ###
-def _find_dmos_in_activation_recursive_parser(obj, dmo_set):
-    """
-    Analisa recursivamente um objeto (dict ou list) para encontrar nomes de DMOs.
-    Esta é uma versão aprimorada que busca em um conjunto mais amplo de chaves.
-    """
-    api_name_keys = ["name", "entityName", "objectApiName", "developerName", "objectName"]
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if key in api_name_keys and isinstance(value, str) and value.endswith('__dlm'):
-                dmo_set.add(normalize_api_name(value))
-            # Continua a busca recursiva em sub-dicionários ou listas
-            elif isinstance(value, (dict, list)):
-                 _find_dmos_in_activation_recursive_parser(value, dmo_set)
-    elif isinstance(obj, list):
-        for item in obj:
-            _find_dmos_in_activation_recursive_parser(item, dmo_set)
-
-
-def find_dmos_in_activation_attributes(activation_attributes):
-    """
-    Processa uma lista de atributos de ativação para extrair todos os DMOs
-    referenciados nos campos 'QueryPath'.
-    """
-    dmos_found = set()
-    for attr in activation_attributes:
-        if query_path_str := attr.get('QueryPath'):
-            try:
-                # O QueryPath é um JSON dentro de uma string
-                query_path_json = json.loads(query_path_str)
-                _find_dmos_in_activation_recursive_parser(query_path_json, dmos_found)
-            except (json.JSONDecodeError, TypeError):
-                # Fallback para caso o JSON seja inválido
-                logging.warning(f"Não foi possível decodificar o JSON do QueryPath para o atributo da ativação {attr.get('MarketSegmentActivationId')}.")
-                continue
-    return dmos_found
-### FIM DO NOVO HELPER ###
-
 
 def find_dmos_in_criteria(criteria_str):
     if not criteria_str: return set()
@@ -301,19 +260,19 @@ async def main():
         encoded_soql_segments = urlencode({'q': soql_query_segments})
         soql_url_segments = f"/services/data/v64.0/query?{encoded_soql_segments}"
         
-        activation_attributes_query = {"query": "SELECT QueryPath, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute"}
-        activations_query = {"query": "SELECT Id, Name, LastPublishDate, MarketSegmentId FROM MarketSegmentActivation"}
+        activation_attributes_query = {"query": "SELECT Id, QueryPath, Name, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute"}
 
-        segment_id_records, activation_attributes, activations = await asyncio.gather(
+        segment_id_records, activation_attributes = await asyncio.gather(
             fetch_api_data(session, semaphore, instance_url, soql_url_segments, 'records'),
-            fetch_jobs_query(session, semaphore, instance_url, activation_attributes_query, "Activation Attributes"),
-            fetch_jobs_query(session, semaphore, instance_url, activations_query, "Activations Metadata")
+            fetch_jobs_query(session, semaphore, instance_url, activation_attributes_query, "Activation Attributes")
         )
         
         segment_ids = [rec['Id'] for rec in segment_id_records]
-        logging.info(f"✅ Etapa 1.1: {len(segment_ids)} IDs de Segmentos e {len(activations)} Ativações encontrados.")
+        activation_ids = list(set(rec['MarketSegmentActivationId'] for rec in activation_attributes if rec.get('MarketSegmentActivationId')))
+        logging.info(f"✅ Etapa 1.1: {len(segment_ids)} IDs de Segmentos e {len(activation_ids)} IDs de Ativações únicos encontrados.")
 
         segment_detail_tasks = [fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/sobjects/MarketSegment/{seg_id}") for seg_id in segment_ids]
+        activation_detail_tasks = [fetch_single_record(session, semaphore, f"{instance_url}/services/data/v64.0/ssot/activations/{act_id}") for act_id in activation_ids]
         
         other_tasks = [
             fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/data-streams", 'dataStreams'),
@@ -325,13 +284,15 @@ async def main():
         ]
         
         segments = await tqdm.gather(*segment_detail_tasks, desc="Buscando detalhes dos Segmentos")
+        activations = await tqdm.gather(*activation_detail_tasks, desc="Buscando detalhes das Ativações")
         
         other_results = await asyncio.gather(*other_tasks)
         
         segments = [res for res in segments if res]
+        activations = [res for res in activations if res]
         data_streams_summary, data_graphs, dm_objects, calculated_insights, dmo_tooling_data, data_actions = other_results
         
-        logging.info(f"✅ Etapa 1.2: {len(segments)} detalhes de Segmentos obtidos.")
+        logging.info(f"✅ Etapa 1.2: {len(segments)} detalhes de Segmentos e {len(activations)} de Ativações obtidos.")
 
         ds_detail_tasks = []
         for ds in data_streams_summary:
@@ -349,7 +310,7 @@ async def main():
     thirty_days_ago = now - timedelta(days=30)
     ninety_days_ago = now - timedelta(days=90)
 
-    segment_publications = {str(act.get('MarketSegmentId') or '')[:15]: parse_sf_date(act.get('LastPublishDate')) for act in activations if act.get('MarketSegmentId') and act.get('LastPublishDate')}
+    segment_publications = {str(act.get('segmentId') or '')[:15]: parse_sf_date(act.get('lastPublishDate')) for act in activations if act.get('segmentId') and act.get('lastPublishDate')}
     nested_segment_parents = {}
     for seg in segments:
         parent_name = get_segment_name(seg)
@@ -370,12 +331,13 @@ async def main():
     for seg in segments:
         dmos_used_in_segment_criteria.update(find_dmos_in_criteria(seg.get('IncludeCriteria')))
         dmos_used_in_segment_criteria.update(find_dmos_in_criteria(seg.get('ExcludeCriteria')))
-    
-    ### INÍCIO DA LÓGICA ATUALIZADA ###
-    # A análise de DMOs em Ativações agora usa a função de parsing aprimorada.
-    dmos_used_by_activations = find_dmos_in_activation_attributes(activation_attributes)
-    logging.info(f"🔎 Análise de atributos de ativação encontrou {len(dmos_used_by_activations)} DMOs únicos.")
-    ### FIM DA LÓGICA ATUALIZADA ###
+
+    dmos_used_by_activations = set()
+    for act in activations:
+        find_dmos_recursively(act, dmos_used_by_activations)
+    for attr in activation_attributes:
+        if query_path_str := attr.get('QueryPath'):
+            dmos_used_by_activations.update(find_dmos_in_criteria(query_path_str))
 
     dmo_creation_dates = {normalize_api_name(dmo.get('DeveloperName')): parse_sf_date(dmo.get('CreatedDate')) for dmo in dmo_tooling_data}
     
@@ -396,9 +358,9 @@ async def main():
                     logging.warning(f"Não foi possível encontrar o 'Name' (apiName) para o segmento {get_segment_name(seg)} (ID: {seg_id}).")
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': get_segment_name(seg), 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_pub if days_pub is not None else 'N/A', 'DELETION_IDENTIFIER': deletion_identifier or 'N/A'})
                 for act in activations:
-                    if str(act.get('MarketSegmentId') or '')[:15] == seg_id:
-                        act_id = act.get('Id')
-                        act_name = act.get('Name')
+                    if str(act.get('segmentId') or '')[:15] == seg_id:
+                        act_id = act.get('id')
+                        act_name = act.get('name')
                         act_reason = f"Órfã (associada ao segmento órfão: '{get_segment_name(seg)}')"
                         audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': act_id, 'DISPLAY_NAME': act_name, 'OBJECT_TYPE': 'ACTIVATION', 'REASON': act_reason, 'TIPO_ATIVIDADE': 'N/A', 'DIAS_ATIVIDADE': 'N/A', 'DELETION_IDENTIFIER': act_id})
             else:
