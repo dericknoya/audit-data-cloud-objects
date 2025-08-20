@@ -193,14 +193,17 @@ async def audit_dmo_fields():
         audience_dmo_names = [rec['DeveloperName'] for rec in dmo_details_records if rec.get('DeveloperName', '').startswith(('AA_', 'AAL_'))]
         logging.info(f"🔎 {len(audience_dmo_names)} DMOs de Activation Audience identificados.")
         
-        sample_tasks = []
+        all_audience_records = []
+        fetch_tasks = []
         for dmo_name in audience_dmo_names:
-            query = f"SELECT Activation_Id__c, Activation_Record__c FROM {dmo_name} LIMIT 200"
+            query = f"SELECT Activation_Id__c, Activation_Record__c FROM {dmo_name}"
             url = f"/services/data/v64.0/query?{urlencode({'q': query})}"
-            sample_tasks.append(fetch_api_data(session, instance_url, url, semaphore, 'records'))
+            fetch_tasks.append(fetch_api_data(session, instance_url, url, semaphore, 'records'))
 
-        logging.info(f"🔎 Coletando amostras de registros dos {len(audience_dmo_names)} DMOs de Audience...")
-        audience_samples_results = await tqdm.gather(*sample_tasks, desc="Coletando amostras de ativações")
+        logging.info(f"🔎 Coletando todos os registros dos {len(audience_dmo_names)} DMOs de Audience (pode levar tempo)...")
+        results_by_dmo = await tqdm.gather(*fetch_tasks, desc="Coletando dados de ativações")
+        for record_list in results_by_dmo:
+            all_audience_records.extend(record_list)
 
     logging.info("\n📊 Dados coletados. Analisando o uso dos campos...")
     
@@ -232,11 +235,10 @@ async def audit_dmo_fields():
                     used_fields_details[field_name].append(usage_context)
     
     unique_activation_samples = {}
-    for sample_list in audience_samples_results:
-        for record in sample_list:
-            act_id = record.get('Activation_Id__c')
-            if act_id and act_id not in unique_activation_samples:
-                unique_activation_samples[act_id] = record.get('Activation_Record__c')
+    for record in tqdm(all_audience_records, desc="Desduplicando amostras de ativações"):
+        act_id = record.get('Activation_Id__c')
+        if act_id and act_id not in unique_activation_samples:
+            unique_activation_samples[act_id] = record.get('Activation_Record__c')
     
     logging.info(f"🔎 {len(unique_activation_samples)} ativações únicas encontradas para análise.")
     for record_json_str in tqdm(unique_activation_samples.values(), desc="Analisando amostras de ativações"):
