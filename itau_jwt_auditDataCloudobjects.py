@@ -2,11 +2,12 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.50 (Fase 1 - Final)
-- Aprimora a detecção de dependências de DMOs em Ativações.
-- O script agora busca os detalhes completos de cada Ativação e analisa
-  recursivamente todo o payload (incluindo 'attributesConfig' e 'contactPointsConfig')
-  para encontrar qualquer referência a um DMO, garantindo uma análise mais precisa.
+Version: 5.56 (Fase 1 - Final)
+- Refina a busca de dependências de DMOs em Ativações, alinhando com a lógica
+  do script de auditoria de campos.
+- Adiciona uma query em 'MktSgmntActvtnAudAttribute' via '/jobs/query' para
+  analisar o campo 'QueryPath', garantindo a identificação de DMOs usados
+  em atributos de ativação.
 
 Regras de Auditoria:
 1. Segmentos:
@@ -17,8 +18,9 @@ Regras de Auditoria:
   - Órfã: Associada a um segmento que foi identificado como órfão.
 
 3. Data Model Objects (DMOs):
-  - Órfão se: For um DMO customizado, não for utilizado em nenhum Segmento, Ativação,
-    Data Graph, CI ou Data Action, E (Criado > 90 dias OU Data de Criação desconhecida).
+  - Órfão se: For um DMO customizado, não for utilizado em nenhum Segmento, Ativação
+    (incluindo seus atributos), Data Graph, CI ou Data Action, E (Criado > 90 dias
+    OU Data de Criação desconhecida).
 
 4. Data Streams:
   - Órfão se: A última atualização foi > 30 dias E o array 'mappings' retornado pela API
@@ -44,6 +46,7 @@ import jwt
 import requests
 import aiohttp
 from dotenv import load_dotenv
+from tqdm.asyncio import tqdm
 
 # --- Configuration ---
 CONCURRENCY_LIMIT = 10
@@ -122,7 +125,6 @@ async def fetch_api_data(session, semaphore, base_url, relative_url, key_name=No
                         if key_name:
                             records_on_page = data.get(key_name, [])
                             all_records.extend(records_on_page)
-                            logging.info(f"   Página {page_count}: {len(records_on_page)} registros de '{key_name}' encontrados.")
                         else:
                             return data
 
@@ -140,6 +142,28 @@ async def fetch_api_data(session, semaphore, base_url, relative_url, key_name=No
             if attempt + 1 == MAX_RETRIES:
                 logging.error(f"❌ Todas as {MAX_RETRIES} tentativas falharam para {current_url}.")
                 return [] if key_name else {}
+            await asyncio.sleep(RETRY_DELAY)
+
+async def fetch_jobs_query(session, semaphore, base_url, payload, object_name=""):
+    """Executes a query against the /jobs/query endpoint with retries."""
+    url = f"{base_url}/services/data/v64.0/jobs/query"
+    logging.info(f"🔎 Querying Jobs API for {object_name}...")
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with semaphore:
+                kwargs = {'ssl': VERIFY_SSL, 'json': payload}
+                if USE_PROXY:
+                    kwargs['proxy'] = PROXY_URL
+                async with session.post(url, **kwargs) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    logging.info(f"✅ Found {len(data.get('records', []))} {object_name} records in Jobs API.")
+                    return data.get('records', [])
+        except aiohttp.ClientError as e:
+            logging.warning(f"⚠️ Tentativa {attempt + 1}/{MAX_RETRIES} falhou para Jobs API query: {e}")
+            if attempt + 1 == MAX_RETRIES:
+                logging.error(f"❌ Todas as {MAX_RETRIES} tentativas falharam para a query da Jobs API.")
+                return []
             await asyncio.sleep(RETRY_DELAY)
 
 async def fetch_single_record(session, semaphore, url):
@@ -233,17 +257,27 @@ async def main():
     timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
     connector = aiohttp.TCPConnector(ssl=VERIFY_SSL)
     async with aiohttp.ClientSession(headers=headers, connector=connector, timeout=timeout) as session:
-        soql_query = "SELECT Id FROM MarketSegment"
-        encoded_soql = urlencode({'q': soql_query})
-        soql_url = f"/services/data/v64.0/query?{encoded_soql}"
-        segment_id_records = await fetch_api_data(session, semaphore, instance_url, soql_url, 'records')
+        soql_query_segments = "SELECT Id FROM MarketSegment"
+        encoded_soql_segments = urlencode({'q': soql_query_segments})
+        soql_url_segments = f"/services/data/v64.0/query?{encoded_soql_segments}"
+        
+        jobs_query_activations = {"query": "SELECT ActivationId FROM Activation"}
+        activation_attributes_query = {"query": "SELECT QueryPath FROM MktSgmntActvtnAudAttribute"}
+
+        segment_id_records, activation_id_records, activation_attributes = await asyncio.gather(
+            fetch_api_data(session, semaphore, instance_url, soql_url_segments, 'records'),
+            fetch_jobs_query(session, semaphore, instance_url, jobs_query_activations, "Activation IDs"),
+            fetch_jobs_query(session, semaphore, instance_url, activation_attributes_query, "Activation Attributes")
+        )
+        
         segment_ids = [rec['Id'] for rec in segment_id_records]
-        logging.info(f"✅ Etapa 1.1: {len(segment_ids)} IDs de segmentos encontrados via SOQL.")
+        activation_ids = [rec['ActivationId'] for rec in activation_id_records]
+        logging.info(f"✅ Etapa 1.1: {len(segment_ids)} IDs de Segmentos e {len(activation_ids)} IDs de Ativações encontrados.")
 
         segment_detail_tasks = [fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/sobjects/MarketSegment/{seg_id}") for seg_id in segment_ids]
+        activation_detail_tasks = [fetch_single_record(session, semaphore, f"{instance_url}/services/data/v64.0/ssot/activations/{act_id}") for act_id in activation_ids]
         
         other_tasks = [
-            fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/activations", 'activations'),
             fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/data-streams", 'dataStreams'),
             fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/data-graphs/metadata", 'dataGraphMetadata'),
             fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/metadata?entityType=DataModelObject", 'metadata'),
@@ -252,19 +286,17 @@ async def main():
             fetch_api_data(session, semaphore, instance_url, f"/services/data/v64.0/ssot/data-actions", 'dataActions'),
         ]
         
-        results = await asyncio.gather(*(segment_detail_tasks + other_tasks))
+        segments = await tqdm.gather(*segment_detail_tasks, desc="Buscando detalhes dos Segmentos")
+        activations = await tqdm.gather(*activation_detail_tasks, desc="Buscando detalhes das Ativações")
         
-        segments = [res for res in results[:len(segment_detail_tasks)] if res]
-        activations_summary, data_streams_summary, data_graphs, dm_objects, calculated_insights, dmo_tooling_data, data_actions = results[len(segment_detail_tasks):]
+        other_results = await asyncio.gather(*other_tasks)
         
-        logging.info(f"✅ Etapa 1.2: {len(segments)} detalhes de segmentos obtidos.")
+        segments = [res for res in segments if res]
+        activations = [res for res in activations if res]
+        data_streams_summary, data_graphs, dm_objects, calculated_insights, dmo_tooling_data, data_actions = other_results
+        
+        logging.info(f"✅ Etapa 1.2: {len(segments)} detalhes de Segmentos e {len(activations)} de Ativações obtidos.")
 
-        logging.info(f"🔎 Buscando detalhes de {len(activations_summary)} ativações...")
-        activation_detail_tasks = [fetch_single_record(session, semaphore, f"{instance_url}/services/data/v64.0/ssot/activations/{act.get('id')}") for act in activations_summary if act.get('id')]
-        activations = await asyncio.gather(*activation_detail_tasks)
-        activations = [act for act in activations if act is not None]
-
-        logging.info(f"🔎 Buscando detalhes de {len(data_streams_summary)} data streams...")
         ds_detail_tasks = []
         for ds in data_streams_summary:
             ds_name = ds.get('name')
@@ -272,7 +304,7 @@ async def main():
                 url = f"{instance_url}/services/data/v64.0/ssot/data-streams/{ds_name}?includeMappings=true"
                 ds_detail_tasks.append(fetch_single_record(session, semaphore, url))
         
-        data_streams = await asyncio.gather(*ds_detail_tasks)
+        data_streams = await tqdm.gather(*ds_detail_tasks, desc="Buscando detalhes dos Data Streams")
         data_streams = [ds for ds in data_streams if ds is not None]
 
     logging.info("📊 Data fetched. Analyzing dependencies...")
@@ -306,6 +338,9 @@ async def main():
     dmos_used_by_activations = set()
     for act in activations:
         find_dmos_recursively(act, dmos_used_by_activations)
+    for attr in activation_attributes:
+        if query_path_str := attr.get('QueryPath'):
+            find_dmos_in_criteria(query_path_str)
 
     dmo_creation_dates = {normalize_api_name(dmo.get('DeveloperName')): parse_sf_date(dmo.get('CreatedDate')) for dmo in dmo_tooling_data}
     
@@ -351,7 +386,7 @@ async def main():
                          normalized_dmo_name not in dmos_used_by_data_graphs and
                          normalized_dmo_name not in dmos_used_by_data_actions and
                          normalized_dmo_name not in dmos_used_in_segment_criteria and
-                         normalized_dmo_name not in dmos_used_by_activations) # **NOVA VERIFICAÇÃO**
+                         normalized_dmo_name not in dmos_used_by_activations)
             if is_unused:
                 reason = 'Órfão (sem uso e criado > 90 dias)' if created_date else 'Órfão (sem uso, data de criação desconhecida)'
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': original_dmo_name, 'DISPLAY_NAME': get_dmo_display_name(dmo), 'OBJECT_TYPE': 'DATA MODEL', 'REASON': reason, 'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_creation if days_creation is not None else 'N/A', 'DELETION_IDENTIFIER': original_dmo_name})
