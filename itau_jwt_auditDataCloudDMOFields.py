@@ -126,34 +126,6 @@ async def fetch_api_data(session, instance_url, relative_url, semaphore, key_nam
         except aiohttp.ClientError:
             return [] if key_name else {}
 
-async def fetch_paginated_data_with_offset(session, instance_url, relative_url, semaphore, key_name):
-    async with semaphore:
-        all_records = []
-        offset = 0
-        batch_size = 200
-        
-        while True:
-            params = {'batchSize': batch_size, 'offset': offset}
-            paginated_url = f"{relative_url}?{urlencode(params)}"
-            full_url = urljoin(instance_url, paginated_url)
-            try:
-                kwargs = {'ssl': VERIFY_SSL}
-                if USE_PROXY:
-                    kwargs['proxy'] = PROXY_URL
-                
-                async with session.get(full_url, **kwargs) as response:
-                    response.raise_for_status(); data = await response.json()
-                    records_on_page = data.get(key_name, [])
-                    all_records.extend(records_on_page)
-                    
-                    if len(records_on_page) < batch_size: break
-                    offset += len(records_on_page)
-            except aiohttp.ClientError as e:
-                logging.error(f"❌ Erro ao buscar {full_url}: {e}")
-                break
-        return all_records
-
-
 # --- Helper Functions ---
 def _find_and_track_dependencies(obj, usage_type, object_name, object_api_name, used_fields_details):
     api_name_keys = ["name", "entityName", "objectApiName", "fieldName", "attributeName", "developerName"]
@@ -187,7 +159,7 @@ async def audit_dmo_fields():
     async with aiohttp.ClientSession(headers=headers) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
 
-        dmo_soql_query = "SELECT DeveloperName, CreatedDate FROM MktDataModelObject"
+        dmo_soql_query = "SELECT DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
         
         initial_tasks = [
@@ -199,9 +171,18 @@ async def audit_dmo_fields():
         results = await tqdm.gather(*initial_tasks, desc="Coletando metadados iniciais")
         dmo_details_records, segment_id_records, dmo_metadata_list, calculated_insights = results
         
-        dmo_creation_dates = {rec['DeveloperName']: rec['CreatedDate'] for rec in dmo_details_records}
+        dmo_details_map = {rec['DeveloperName']: {'CreatedDate': rec['CreatedDate'], 'CreatedById': rec['CreatedById']} for rec in dmo_details_records}
+        
+        user_ids_to_fetch = {rec['CreatedById'] for rec in dmo_details_records if rec.get('CreatedById')}
+        user_map = {}
+        if user_ids_to_fetch:
+            id_list_str = "','".join(user_ids_to_fetch)
+            user_soql_query = f"SELECT Id, Name FROM User WHERE Id IN ('{id_list_str}')"
+            user_records = await fetch_api_data(session, instance_url, f"/services/data/v64.0/query?{urlencode({'q': user_soql_query})}", semaphore, 'records')
+            user_map = {rec['Id']: rec['Name'] for rec in user_records}
+
         segment_ids = [rec['Id'] for rec in segment_id_records]
-        logging.info(f"✅ Etapa 1.1: {len(dmo_creation_dates)} datas de criação de DMOs obtidas.")
+        logging.info(f"✅ Etapa 1.1: {len(dmo_details_map)} detalhes de DMOs obtidos.")
         logging.info(f"✅ Etapa 1.2: {len(segment_ids)} IDs de segmentos encontrados.")
         
         logging.info(f"\n--- Etapa 2: Buscando detalhes de {len(segment_ids)} segmentos ---")
@@ -242,13 +223,17 @@ async def audit_dmo_fields():
 
     logging.info("\n📊 Dados coletados. Analisando o uso dos campos...")
     
-    all_dmo_data = defaultdict(lambda: {'fields': {}, 'displayName': ''})
+    # **MUDANÇA CRÍTICA**: Removidos 'aa_' e 'aal_' da lista de exclusão
     dmo_prefixes_to_exclude = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership')
+    all_dmo_data = defaultdict(lambda: {'fields': {}, 'displayName': '', 'createdBy': 'N/A'})
 
     for dmo in dmo_metadata_list:
         if (dmo_name := dmo.get('name')) and dmo_name.endswith('__dlm'):
             if any(dmo_name.lower().startswith(prefix) for prefix in dmo_prefixes_to_exclude): continue
             all_dmo_data[dmo_name]['displayName'] = dmo.get('displayName', dmo.get('name'))
+            dmo_detail = dmo_details_map.get(dmo_name, {})
+            created_by_id = dmo_detail.get('CreatedById')
+            all_dmo_data[dmo_name]['createdBy'] = user_map.get(created_by_id, 'Desconhecido')
             for field in dmo.get('fields', []):
                 if field_name := field.get('name'):
                     all_dmo_data[dmo_name]['fields'][field_name] = field.get('displayName', field.get('name'))
@@ -292,7 +277,7 @@ async def audit_dmo_fields():
     for dmo_name, data in all_dmo_data.items():
         if dmo_name in used_fields_details: continue
         is_new_dmo = False
-        if created_date_str := dmo_creation_dates.get(dmo_name):
+        if created_date_str := dmo_details_map.get(dmo_name, {}).get('CreatedDate'):
             try:
                 dmo_created_date = datetime.fromisoformat(created_date_str.replace('Z', '+00:00'))
                 if dmo_created_date > ninety_days_ago: is_new_dmo = True
@@ -308,7 +293,8 @@ async def audit_dmo_fields():
                     if not any(field_api_name.startswith(p) for p in field_prefixes_to_exclude) and \
                        field_api_name not in specific_fields_to_exclude:
                         unused_field_results.append({
-                            'DELETAR': 'NAO', 'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name,
+                            'DELETAR': 'NAO', 'DMO_DISPLAY_NAME': data['displayName'], 
+                            'DMO_API_NAME': dmo_name, 'DMO_CREATED_BY': data['createdBy'],
                             'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 
                             'REASON': 'Não utilizado em Segmentos, Ativações ou CIs'
                         })
@@ -319,7 +305,7 @@ async def audit_dmo_fields():
         logging.info("\n🎉 Nenhum campo órfão (com mais de 90 dias) foi encontrado!")
     else:
         csv_file_path_unused = 'audit_campos_dmo_nao_utilizados.csv'
-        header_unused = ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON']
+        header_unused = ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'DMO_CREATED_BY', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON']
         try:
             with open(csv_file_path_unused, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=header_unused)
@@ -334,7 +320,8 @@ async def audit_dmo_fields():
     for dmo_name, data in all_dmo_data.items():
         for field_api_name, field_display_name in data['fields'].items():
             field_to_dmo_map[field_api_name] = {
-                'DMO_API_NAME': dmo_name, 'DMO_DISPLAY_NAME': data['displayName'], 'FIELD_DISPLAY_NAME': field_display_name
+                'DMO_API_NAME': dmo_name, 'DMO_DISPLAY_NAME': data['displayName'], 
+                'FIELD_DISPLAY_NAME': field_display_name, 'DMO_CREATED_BY': data['createdBy']
             }
 
     for field_api_name, usages in used_fields_details.items():
@@ -345,16 +332,16 @@ async def audit_dmo_fields():
                 for usage in usages:
                     used_field_results.append({
                         'DMO_DISPLAY_NAME': dmo_info['DMO_DISPLAY_NAME'], 'DMO_API_NAME': dmo_info['DMO_API_NAME'],
-                        'FIELD_DISPLAY_NAME': dmo_info['FIELD_DISPLAY_NAME'], 'FIELD_API_NAME': field_api_name,
-                        'USAGE_TYPE': usage['usage_type'], 'USED_IN_OBJECT_NAME': usage['object_name'],
-                        'USED_IN_OBJECT_API_NAME': usage['object_api_name']
+                        'DMO_CREATED_BY': dmo_info['DMO_CREATED_BY'], 'FIELD_DISPLAY_NAME': dmo_info['FIELD_DISPLAY_NAME'], 
+                        'FIELD_API_NAME': field_api_name, 'USAGE_TYPE': usage['usage_type'], 
+                        'USED_IN_OBJECT_NAME': usage['object_name'], 'USED_IN_OBJECT_API_NAME': usage['object_api_name']
                     })
 
     if not used_field_results:
         logging.info("ℹ️ Nenhum uso de campo de DMO customizado foi detectado.")
     else:
         csv_file_path_used = 'audit_campos_dmo_utilizados.csv'
-        header_used = ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_TYPE', 'USED_IN_OBJECT_NAME', 'USED_IN_OBJECT_API_NAME']
+        header_used = ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'DMO_CREATED_BY', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_TYPE', 'USED_IN_OBJECT_NAME', 'USED_IN_OBJECT_API_NAME']
         try:
             with open(csv_file_path_used, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=header_used)
