@@ -272,8 +272,8 @@ async def main():
         user_id_to_name_map = {}
         if all_creator_ids:
             logging.info(f"--- Etapa 4: Buscando nomes de {len(all_creator_ids)} criadores... ---")
-            user_records = await fetch_records_in_bulk(session, semaphore, "User", ["Id", "Name"], list(all_creator_ids))
-            user_id_to_name_map = {user['Id']: user['Name'] for user in user_records}
+            user_records = await fetch_records_in_bulk(session, semaphore, "User", ["Id", "Username"], list(all_creator_ids))
+            user_id_to_name_map = {user['Id']: user['Username'] for user in user_records}
             logging.info("✅ Nomes de criadores coletados.")
 
         now = datetime.now(timezone.utc)
