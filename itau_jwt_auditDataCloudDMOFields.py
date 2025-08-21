@@ -2,7 +2,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 18.2 (Escopo de Auditoria Ampliado)
+Versão: 18.2 (Relatório de Uso Sumarizado)
 
 ================================================================================
 REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
@@ -215,7 +215,6 @@ async def audit_dmo_fields():
         dmo_soql_query = "SELECT DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
         activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute"
-        # NOVO: Query para buscar os Pontos de Contato de Ativação
         contact_point_query = "SELECT Id, Name, MarketSegmentActivationId, ContactPointFilterExpression, ContactPointPath FROM MktSgmntActvtnContactPoint"
         
         initial_tasks = [
@@ -224,10 +223,9 @@ async def audit_dmo_fields():
             fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
             execute_query_job(session, activation_attributes_query, semaphore),
             fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
-            execute_query_job(session, contact_point_query, semaphore), # NOVO: Executando a nova query
+            execute_query_job(session, contact_point_query, semaphore),
         ]
         results = await tqdm.gather(*initial_tasks, desc="Coletando metadados iniciais")
-        # NOVO: Desempacotando o novo resultado
         dmo_tooling_data, segment_id_records, dmo_metadata_list, activation_attributes, calculated_insights, contact_point_usages = results
         
         dmo_creation_info = {rec['DeveloperName']: {'CreatedDate': rec['CreatedDate'], 'CreatedById': rec.get('CreatedById')} for rec in dmo_tooling_data}
@@ -250,7 +248,6 @@ async def audit_dmo_fields():
     logging.info("\n📊 Dados coletados. Analisando o uso dos campos...")
     
     all_dmo_fields = defaultdict(lambda: {'fields': {}, 'displayName': '', 'creatorName': 'Desconhecido'})
-    # NOVO: Adicionados os novos prefixos à lista de exclusão
     dmo_prefixes_to_exclude = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
 
     for dmo in dmo_metadata_list:
@@ -275,7 +272,6 @@ async def audit_dmo_fields():
     for ci in tqdm(calculated_insights, desc="Analisando CIs"):
         find_fields_in_structure(ci, used_fields_details, "Calculated Insight", ci.get('displayName'), ci.get('name'))
 
-    # NOVO: Analisando o uso de campos nos Pontos de Contato
     for cp in tqdm(contact_point_usages, desc="Analisando Pontos de Contato"):
         find_fields_in_structure(cp.get('ContactPointPath'), used_fields_details, "Ponto de Contato de Ativação", cp.get('Name'), cp.get('Id'))
         find_fields_in_structure(cp.get('ContactPointFilterExpression'), used_fields_details, "Ponto de Contato de Ativação", cp.get('Name'), cp.get('Id'))
@@ -299,27 +295,51 @@ async def audit_dmo_fields():
     
     used_field_results, unused_field_results = [], []
     
+    # CRIA UM MAPA reverso para encontrar facilmente as informações de um campo
+    field_to_dmo_map = {}
+    for dmo_name, data in all_dmo_fields.items():
+        for field_api_name, field_display_name in data['fields'].items():
+            field_to_dmo_map[field_api_name] = {
+                'DMO_API_NAME': dmo_name,
+                'DMO_DISPLAY_NAME': data['displayName'],
+                'FIELD_DISPLAY_NAME': field_display_name,
+                'CREATED_BY_NAME': data['creatorName']
+            }
+
+    # Gera o relatório de campos NÃO utilizados (lógica inalterada)
     for dmo_name, data in all_dmo_fields.items():
         for field_api_name, field_display_name in data['fields'].items():
             if any(field_api_name.startswith(p) for p in field_prefixes_to_exclude) or field_api_name in specific_fields_to_exclude:
                 continue
             
-            if field_api_name in used_fields_details:
-                for usage in used_fields_details[field_api_name]:
-                    used_field_results.append({
-                        'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name, 'FIELD_DISPLAY_NAME': field_display_name, 
-                        'FIELD_API_NAME': field_api_name, 'USAGE_TYPE': usage['usage_type'], 
-                        'USED_IN_OBJECT_NAME': usage['object_name'], 'USED_IN_OBJECT_API_NAME': usage['object_api_name'],
-                        'CREATED_BY_NAME': data['creatorName']
-                    })
-            else:
+            if field_api_name not in used_fields_details:
                  unused_field_results.append({
                     'DELETAR': 'NAO', 'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name,
                     'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 
-                    'REASON': 'Não utilizado em Segmentos, Ativações ou CIs', 'CREATED_BY_NAME': data['creatorName']
+                    'REASON': 'Não utilizado em Segmentos, Ativações, CIs ou Pontos de Contato', 'CREATED_BY_NAME': data['creatorName']
                 })
 
-    logging.info(f"📊 Total de {len(used_fields_details)} campos únicos em uso.")
+    # ALTERAÇÃO CRÍTICA: Lógica de sumarização para o relatório de campos UTILIZADOS
+    logging.info(f"📊 Sumarizando {len(used_fields_details)} campos únicos em uso...")
+    for field_api_name, usages in used_fields_details.items():
+        if any(field_api_name.startswith(p) for p in field_prefixes_to_exclude) or field_api_name in specific_fields_to_exclude:
+            continue
+
+        dmo_info = field_to_dmo_map.get(field_api_name)
+        if dmo_info:
+            usage_count = len(usages)
+            usage_types = sorted(list(set(u['usage_type'] for u in usages)))
+            used_field_results.append({
+                'DMO_DISPLAY_NAME': dmo_info['DMO_DISPLAY_NAME'], 
+                'DMO_API_NAME': dmo_info['DMO_API_NAME'], 
+                'FIELD_DISPLAY_NAME': dmo_info['FIELD_DISPLAY_NAME'], 
+                'FIELD_API_NAME': field_api_name, 
+                'USAGE_COUNT': usage_count, 
+                'USAGE_TYPES': ", ".join(usage_types),
+                'CREATED_BY_NAME': dmo_info['CREATED_BY_NAME']
+            })
+
+    logging.info(f"📊 Total de {len(used_field_results)} linhas geradas para o relatório de campos utilizados.")
     
     if unused_field_results:
         csv_file_path_unused = 'audit_campos_dmo_nao_utilizados.csv'
@@ -332,10 +352,11 @@ async def audit_dmo_fields():
         
     if used_field_results:
         csv_file_path_used = 'audit_campos_dmo_utilizados.csv'
-        header_used = ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_TYPE', 'USED_IN_OBJECT_NAME', 'USED_IN_OBJECT_API_NAME', 'CREATED_BY_NAME']
+        # ALTERAÇÃO: Cabeçalho atualizado para o novo formato sumarizado
+        header_used = ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_COUNT', 'USAGE_TYPES', 'CREATED_BY_NAME']
         with open(csv_file_path_used, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=header_used); writer.writeheader(); writer.writerows(used_field_results)
-        logging.info(f"✅ Relatório de campos UTILIZADOS gerado: {csv_file_path_used} ({len(used_field_results)} usos)")
+        logging.info(f"✅ Relatório de campos UTILIZADOS gerado: {csv_file_path_used} ({len(used_field_results)} campos)")
     else:
         logging.info("ℹ️ Nenhum uso de campo de DMO customizado foi detectado.")
 
