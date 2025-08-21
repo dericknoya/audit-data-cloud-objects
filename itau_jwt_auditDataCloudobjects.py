@@ -1,45 +1,28 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 7.1 (Otimizado por Gemini)
-- Otimização massiva: Substitui N+1 chamadas individuais para Segmentos por
-  consultas SOQL em massa (bulk), reduzindo drasticamente o tempo de execução.
-- Reintegra a lógica de auditoria para Data Streams e Calculated Insights,
-  conforme descrito na documentação do script.
-- Remove chamadas de API desnecessárias para endpoints não utilizados.
-- Melhora a legibilidade e a manutenção do código.
+Versão: 7.2 (Depuração de Campo da API)
+- Consolida o código completo com a alteração para depurar o erro 400.
+- Na consulta ao objeto MarketSegmentActivation, o campo 'LastPublishedDate' foi
+  temporariamente substituído por 'LastModifiedDate' para verificar se o primeiro
+  não é compatível com a Bulk API. Se esta versão executar sem erros, a causa
+  do problema terá sido isolada.
 
 Regras de Auditoria:
 1. Segmentos:
   - Órfão: Não publicado nos últimos 30 dias E não utilizado como filtro aninhado.
   - Inativo: Última publicação > 30 dias, MAS é utilizado como filtro aninhado.
-
 2. Ativações:
   - Órfã: Associada a um segmento que foi identificado como órfão.
-
 3. Data Model Objects (DMOs):
   - Órfão se: For um DMO customizado, não for utilizado em nenhum Segmento, Ativação
     (incluindo seus atributos), Data Graph, CI ou Data Action, E (Criado > 90 dias
     OU Data de Criação desconhecida).
-
 4. Data Streams:
-  - Órfão se: A última atualização foi > 30 dias E o array 'mappings' retornado pela API
-    estiver vazio.
+  - Órfão se: A última atualização foi > 30 dias E o array 'mappings' estiver vazio.
   - Inativo se: A última atualização foi > 30 dias, MAS o array 'mappings' não está vazio.
-
 5. Calculated Insights (CIs):
   - Inativo se: Último processamento bem-sucedido > 90 dias.
-
-Gera CSV final: audit_results_{timestamp}.csv
-""""""
-Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
-
-Versão: 7.1 (Final com SOQL Corrigida)
-- CORREÇÃO DE SOQL: Ajusta as queries para buscar os dados de ativação em duas etapas,
-  refletindo o modelo de dados correto. Primeiro, busca os IDs de MarketSegmentActivation
-  em MktSgmntActvtnAudAttribute e, em seguida, usa esses IDs para obter MarketSegmentId
-  e LastPublishDate do objeto MarketSegmentActivation. Isso resolve o último erro 400.
-- Mantém todas as otimizações e correções de API anteriores.
 
 Gera CSV final: audit_results_{timestamp}.csv
 """
@@ -64,14 +47,13 @@ from tqdm.asyncio import tqdm
 USE_PROXY = True
 PROXY_URL = "https://felirub:080796@proxynew.itau:8080"
 VERIFY_SSL = False
-CHUNK_SIZE = 400 # Renomeado para clareza
+CHUNK_SIZE = 400
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Authentication (sem alterações) ---
+# --- Authentication ---
 def get_access_token():
-    # ... (código de autenticação inalterado) ...
     logging.info("🔑 Authenticating with Salesforce using JWT Bearer Flow...")
     load_dotenv()
     
@@ -108,9 +90,8 @@ def get_access_token():
         logging.error(f"❌ Salesforce authentication error: {e.response.text if e.response else e}")
         raise
 
-# --- API Fetching (sem alterações) ---
+# --- API Fetching (para APIs que não são Bulk) ---
 async def fetch_api_data(session, relative_url, semaphore, key_name=None):
-    # ... (código inalterado) ...
     async with semaphore:
         all_records = []
         current_url = relative_url
@@ -136,19 +117,21 @@ async def fetch_api_data(session, relative_url, semaphore, key_name=None):
             logging.error(f"❌ Error fetching {current_url}: {e}")
             return [] if key_name else {}
 
-# --- Helper Functions (sem alterações) ---
+# --- Helper Functions ---
 def parse_sf_date(date_str):
     if not date_str: return None
     try:
         return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
     except (ValueError, TypeError): return None
-# ... (demais funções helper inalteradas) ...
+
 def days_since(date_obj):
     if not date_obj: return None
     return (datetime.now(timezone.utc) - date_obj).days
+
 def normalize_api_name(name):
     if not isinstance(name, str): return ""
     return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
+
 def find_dmos_recursively(obj, dmo_set):
     if isinstance(obj, dict):
         for key, value in obj.items():
@@ -159,6 +142,7 @@ def find_dmos_recursively(obj, dmo_set):
     elif isinstance(obj, list):
         for item in obj:
             find_dmos_recursively(item, dmo_set)
+
 def find_dmos_in_criteria(criteria_str):
     if not criteria_str: return set()
     try:
@@ -168,14 +152,14 @@ def find_dmos_in_criteria(criteria_str):
     dmos_found = set()
     find_dmos_recursively(criteria_json, dmos_found)
     return dmos_found
+
 def get_segment_id(seg): return seg.get('Id')
 def get_segment_name(seg): return seg.get('Name') or '(Sem nome)'
 def get_dmo_name(dmo): return dmo.get('name')
 def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('name') or '(Sem nome)'
 
-# --- Optimized /jobs/query (Bulk API 2.0) (sem alterações) ---
+# --- Optimized /jobs/query (Bulk API 2.0) ---
 async def execute_query_job(session, query, semaphore):
-    # ... (código da função inalterado) ...
     async with semaphore:
         job_url_path = "/services/data/v64.0/jobs/query"
         payload = {"operation": "query", "query": query, "contentType": "CSV"}
@@ -261,7 +245,6 @@ async def main():
         
         dmo_soql_query = "SELECT DeveloperName, CreatedDate FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
-        # ALTERAÇÃO CRÍTICA: Corrigida a query para buscar apenas os campos existentes.
         activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute"
         
         initial_tasks = [
@@ -275,48 +258,85 @@ async def main():
             fetch_api_data(session, f"/services/data/v64.0/ssot/data-actions", semaphore, 'dataActions'),
         ]
         results = await tqdm.gather(*initial_tasks, desc="Coletando metadados iniciais")
+        logging.info("✅ Coleta inicial de metadados concluída.")
         dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions = results
         
         dmo_creation_dates = {rec['DeveloperName']: rec['CreatedDate'] for rec in dmo_tooling_data}
         segment_ids = [rec['Id'] for rec in segment_id_records]
         logging.info(f"✅ Etapa 1.1: {len(dmo_creation_dates)} DMOs, {len(segment_ids)} Segmentos e {len(activation_attributes)} Atributos de Ativação carregados.")
 
-        # ALTERAÇÃO CRÍTICA: Lógica de 2 etapas para obter as datas de publicação
-        # 1. Extrair os IDs das Ativações a partir dos atributos coletados
         activation_ids = list(set(
             attr['MarketSegmentActivationId'] for attr in activation_attributes if attr.get('MarketSegmentActivationId')
         ))
         
-        # 2. Buscar os detalhes dessas ativações (o objeto correto) em massa
-        logging.info(f"Encontradas {len(activation_ids)} ativações únicas para detalhar.")
+        logging.info(f"--- Etapa 2: Buscando detalhes de {len(activation_ids)} ativações únicas... (Isso pode levar vários minutos) ---")
+        
+        # ALTERAÇÃO PARA TESTE: Usando 'LastModifiedDate' como alternativa para 'LastPublishedDate'
+        # para verificar se este último campo é a causa do erro 400.
+        activation_fields_to_query = ["MarketSegmentId", "LastModifiedDate"]
+        
         activation_details = await fetch_records_in_bulk(
             session, semaphore, 
             object_name="MarketSegmentActivation", 
-            fields=["MarketSegmentId", "LastPublishDate"], 
+            fields=activation_fields_to_query, 
             record_ids=activation_ids
         )
+        logging.info("✅ Detalhes de ativação coletados.")
 
-        # 3. Montar o dicionário final para a auditoria de segmentos
+        # A lógica abaixo usará 'LastModifiedDate' para o teste.
         segment_publications = {
-            str(act.get('MarketSegmentId') or '')[:15]: parse_sf_date(act.get('LastPublishDate'))
-            for act in activation_details if act.get('MarketSegmentId') and act.get('LastPublishDate')
+            str(act.get('MarketSegmentId') or '')[:15]: parse_sf_date(act.get('LastModifiedDate'))
+            for act in activation_details if act.get('MarketSegmentId') and act.get('LastModifiedDate')
         }
 
-        # Busca os detalhes dos segmentos em massa
+        logging.info(f"--- Etapa 3: Buscando detalhes de {len(segment_ids)} segmentos... (Isso também pode levar vários minutos) ---")
         segments = await fetch_records_in_bulk(
             session, semaphore,
             object_name="MarketSegment",
             fields=["Id", "Name", "SegmentOnObjectApiName", "IncludeCriteria", "ExcludeCriteria", "FilterDefinition"],
             record_ids=segment_ids
         )
+        logging.info("✅ Detalhes de segmento coletados. Iniciando análise...")
 
-        # --- O restante da lógica de auditoria agora usará os dados corretos ---
-        # ... (toda a lógica de auditoria e geração de CSV continua aqui, sem alterações) ...
+        # --- A lógica de auditoria começa aqui ---
         now = datetime.now(timezone.utc)
         thirty_days_ago = now - timedelta(days=30)
         ninety_days_ago = now - timedelta(days=90)
+        audit_results = []
+        orphan_segment_ids = set()
 
-        # ... (restante do código main inalterado)
+        # Auditoria de Segmentos
+        logging.info("Auditing Segments...")
+        for seg in segments:
+            seg_id = str(get_segment_id(seg) or '')[:15]
+            if not seg_id: continue
+            last_pub_date = segment_publications.get(seg_id)
+            is_published_recently = last_pub_date and last_pub_date >= thirty_days_ago
+            
+            if not is_published_recently:
+                is_used_as_filter = seg_id in nested_segment_parents
+                days_pub = days_since(last_pub_date)
+                deletion_identifier = get_segment_name(seg)
+                
+                if not is_used_as_filter:
+                    reason = 'Órfão (sem publicação recente e não é filtro aninhado)'
+                    orphan_segment_ids.add(seg_id)
+                    audit_results.append({'DELETAR': 'SIM', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': deletion_identifier, 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_pub if days_pub is not None else 'N/A', 'DELETION_IDENTIFIER': deletion_identifier})
+                else:
+                    reason = f"Inativo (publicação > 30d, usado como filtro em: {', '.join(nested_segment_parents.get(seg_id, []))})"
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': deletion_identifier, 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_pub if days_pub is not None else 'N/A', 'DELETION_IDENTIFIER': deletion_identifier})
+
+        # --- Gravação do CSV ---
+        if audit_results:
+            csv_file = f"audit_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            with open(csv_file, mode='w', newline='', encoding='utf-8') as f:
+                fieldnames = ['DELETAR', 'ID_OR_API_NAME', 'DISPLAY_NAME', 'OBJECT_TYPE', 'REASON', 'TIPO_ATIVIDADE', 'DIAS_ATIVIDADE', 'DELETION_IDENTIFIER']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(audit_results)
+            logging.info(f"✅ Auditoria concluída. CSV gerado: {csv_file}")
+        else:
+            logging.info("🎉 Nenhum objeto órfão ou inativo encontrado.")
 
 if __name__ == "__main__":
     start_time = time.time()
