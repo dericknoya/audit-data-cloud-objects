@@ -2,14 +2,12 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar objetos
 não utilizados com base em um conjunto de regras.
 
-Version: 5.72 (Fase 1 - Final)
-- Alinha a lógica de busca de dados com o script de auditoria de campos para
-  maior robustez e consistência.
-- A busca de Ativações agora utiliza o endpoint '/jobs/query' para obter uma
-  lista completa de IDs antes de buscar os detalhes, garantindo a coleta de
-  todos os registros.
-- Remove constantes globais desnecessárias (API_VERSION, TIMEOUT, etc.) para
-  padronizar o estilo do código.
+Version: 5.85 (Fase 1 - Final)
+- Alinha completamente a lógica de busca de dados com o script de auditoria de campos.
+- Remove a chamada incorreta ao endpoint '/ssot/activations'.
+- A lista de Ativações agora é obtida exclusivamente a partir dos IDs coletados
+  via Tooling API em 'MktSgmntActvtnAudAttribute', garantindo a coleta de
+  todos os registros de forma confiável.
 
 Regras de Auditoria:
 1. Segmentos:
@@ -34,340 +32,322 @@ Regras de Auditoria:
 
 O resultado é salvo em um arquivo CSV chamado 'audit_objetos_para_exclusao.csv'.
 """
+"""
+Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
+
+Versão: 5.90
+- Integra otimização do /jobs/query para polling assíncrono.
+- Remove uso do endpoint /ssot/activations.
+- Mantém auditoria de Segmentos, DMOs, Data Streams e Calculated Insights.
+
+Gera CSV final: audit_objetos_para_exclusao.csv
+"""
 import os
 import time
 import asyncio
 import csv
 import json
+import html
 import logging
-import gzip
-import io
-from datetime import datetime, timezone
-from urllib.parse import urljoin
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode, urljoin
 
-# Libs de terceiros (pip install requests pyjwt cryptography aiohttp python-dotenv)
-import requests
 import jwt
+import requests
 import aiohttp
 from dotenv import load_dotenv
+from tqdm.asyncio import tqdm
 
-# ==============================================================================
-# 1. CONFIGURAÇÃO E PARÂMETROS DE AUDITORIA
-# ==============================================================================
-load_dotenv()
+# --- Configuration ---
+USE_PROXY = True
+PROXY_URL = "https://felirub:080796@proxynew.itau:8080"
+VERIFY_SSL = False
 
-# --- Configuração de Rede ---
-USE_PROXY = False 
-PROXY_URL = "" 
-VERIFY_SSL = True
-
-# --- Configuração do Logging ---
+# --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Credenciais (carregadas do arquivo .env) ---
-SF_LOGIN_URL = os.getenv("SF_LOGIN_URL")
-SF_CLIENT_ID = os.getenv("SF_CLIENT_ID")
-SF_USERNAME = os.getenv("SF_USERNAME")
-SF_AUDIENCE = os.getenv("SF_AUDIENCE")
+# --- Authentication ---
+def get_access_token():
+    logging.info("🔑 Authenticating with Salesforce using JWT Bearer Flow...")
+    load_dotenv()
+    
+    sf_client_id = os.getenv("SF_CLIENT_ID")
+    sf_username = os.getenv("SF_USERNAME")
+    sf_audience = os.getenv("SF_AUDIENCE")
+    sf_login_url = os.getenv("SF_LOGIN_URL")
 
-# --- Parâmetros da API e do Script ---
-SF_API_VERSION = "v60.0"
-OUTPUT_CSV_FILE = 'audit_objetos_para_exclusao.csv'
-
-# --- Regras de Auditoria (em dias) ---
-SEGMENT_INACTIVITY_DAYS = 30
-DMO_CREATION_DAYS = 90
-DATA_STREAM_UPDATE_DAYS = 30
-CI_PROCESSING_DAYS = 90
-
-# ==============================================================================
-# 2. AUTENTICAÇÃO E FUNÇÕES DE API
-# ==============================================================================
-
-def authenticate_jwt():
-    """Autentica com Salesforce usando JWT com chave privada e retorna o token."""
-    logging.info("🔑 Autenticando com o Salesforce via JWT (certificado)...")
-    if not all([SF_LOGIN_URL, SF_CLIENT_ID, SF_USERNAME, SF_AUDIENCE]):
-        raise ValueError("Variáveis de ambiente (LOGIN_URL, CLIENT_ID, USERNAME, AUDIENCE) não foram configuradas no .env")
+    if not all([sf_client_id, sf_username, sf_audience, sf_login_url]):
+        raise ValueError("One or more required environment variables are missing.")
 
     try:
-        with open('private.pem', 'r') as f: 
+        with open('private.pem', 'r') as f:
             private_key = f.read()
     except FileNotFoundError:
-        logging.error("❌ Erro: Arquivo de chave privada 'private.pem' não encontrado."); raise
-        
-    payload = {
-        "iss": SF_CLIENT_ID, "sub": SF_USERNAME, "aud": SF_AUDIENCE,
-        "exp": int(time.time()) + 180
-    }
-    
-    assertion = jwt.encode(payload, private_key, algorithm='RS256')
-    params = {'grant_type': 'urn:ietf:params:oauth:grant-type-jwt-bearer', 'assertion': assertion}
-    token_url = f"{SF_LOGIN_URL}/services/oauth2/token"
-    
-    try:
-        proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY else None
-        if proxies:
-            logging.info(f"   - Usando proxy para autenticação: {PROXY_URL}")
-
-        response = requests.post(token_url, data=params, proxies=proxies, verify=VERIFY_SSL)
-        response.raise_for_status()
-        
-        auth_data = response.json()
-        logging.info(f"✅ Autenticação bem-sucedida. Instância: {auth_data['instance_url']}")
-        return auth_data["access_token"], auth_data["instance_url"]
-
-    except requests.exceptions.RequestException as e:
-        logging.error(f"❌ Erro fatal durante a autenticação JWT: {e.response.text if e.response else e}")
+        logging.error("❌ 'private.pem' file not found.")
         raise
 
-# ==============================================================================
-# 3. FUNÇÕES HELPERS DA BULK API 2.0
-# ==============================================================================
+    payload = {
+        'iss': sf_client_id, 'sub': sf_username, 'aud': sf_audience,
+        'exp': int(time.time()) + 300
+    }
+    assertion = jwt.encode(payload, private_key, algorithm='RS256')
+    params = {'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': assertion}
+    token_url = f"{sf_login_url}/services/oauth2/token"
 
-async def create_bulk_job(session, instance_url, soql_query):
-    """Cria um novo job de query na Bulk API 2.0."""
-    job_url = f"{instance_url}/services/data/{SF_API_VERSION}/jobs/query"
-    payload = {"operation": "query", "query": soql_query, "contentType": "CSV"}
-    
-    request_kwargs = {'ssl': VERIFY_SSL, 'json': payload}
-    if USE_PROXY: request_kwargs['proxy'] = PROXY_URL
-
-    async with session.post(job_url, **request_kwargs) as response:
-        response.raise_for_status()
-        return (await response.json())["id"]
-
-async def wait_for_job_completion(session, instance_url, job_id):
-    """Monitora o status de um job da Bulk API até sua conclusão."""
-    job_status_url = f"{instance_url}/services/data/{SF_API_VERSION}/jobs/query/{job_id}"
-    request_kwargs = {'ssl': VERIFY_SSL}
-    if USE_PROXY: request_kwargs['proxy'] = PROXY_URL
-
-    while True:
-        async with session.get(job_status_url, **request_kwargs) as response:
-            response.raise_for_status()
-            status = await response.json()
-            state = status.get("state")
-            
-            if state in ["JobComplete", "UploadComplete"]: # Nomes podem variar
-                logging.info(f"   - Job {job_id} concluído.")
-                return "Completed"
-            if state in ["Aborted", "Failed"]:
-                logging.error(f"   - Job {job_id} falhou: {status.get('errorMessage')}")
-                return "Failed"
-        
-        await asyncio.sleep(10) # Aguarda 10 segundos entre as verificações
-
-async def download_bulk_results(session, instance_url, job_id):
-    """Baixa os resultados de um job da Bulk API e os converte para uma lista de dicts."""
-    results_url = f"{instance_url}/services/data/{SF_API_VERSION}/jobs/query/{job_id}/results"
-    headers = {"Accept-Encoding": "gzip"} # Pede compressão para eficiência
-    request_kwargs = {'ssl': VERIFY_SSL, 'headers': headers}
-    if USE_PROXY: request_kwargs['proxy'] = PROXY_URL
-
-    async with session.get(results_url, **request_kwargs) as response:
-        response.raise_for_status()
-        content = await response.read()
-        
-        # Descomprime se necessário
-        if response.headers.get('Content-Encoding') == 'gzip':
-            content = gzip.decompress(content)
-            
-        # Processa o CSV em memória
-        csv_text = content.decode('utf-8')
-        reader = csv.DictReader(io.StringIO(csv_text))
-        return [row for row in reader]
-
-async def run_bulk_query_job(session, instance_url, object_name, soql_query):
-    """Orquestra a execução completa de um job da Bulk API para uma query."""
-    logging.info(f"🚀 Iniciando job da Bulk API para '{object_name}'...")
     try:
-        job_id = await create_bulk_job(session, instance_url, soql_query)
-        logging.info(f"   - Job para '{object_name}' criado com ID: {job_id}")
-        
-        status = await wait_for_job_completion(session, instance_url, job_id)
-        
-        if status == "Completed":
-            results = await download_bulk_results(session, instance_url, job_id)
-            logging.info(f"✅ Dados de '{object_name}' baixados com sucesso ({len(results)} registros).")
-            return results
-        else:
-            return []
-    except aiohttp.ClientError as e:
-        logging.error(f"❌ Falha no job para '{object_name}': {e}")
-        return []
+        proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY else None
+        res = requests.post(token_url, data=params, proxies=proxies, verify=VERIFY_SSL)
+        res.raise_for_status()
+        logging.info("✅ Authentication successful.")
+        return res.json()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"❌ Salesforce authentication error: {e.response.text if e.response else e}")
+        raise
 
-# ==============================================================================
-# 4. LÓGICA DE AUDITORIA (ADAPTADA PARA CAMPOS DA BULK API)
-# ==============================================================================
+# --- API Fetching ---
+async def fetch_api_data(session, instance_url, relative_url, semaphore, key_name=None):
+    async with semaphore:
+        all_records = []
+        current_url = urljoin(instance_url, relative_url)
+        try:
+            while current_url:
+                kwargs = {'ssl': VERIFY_SSL}
+                if USE_PROXY:
+                    kwargs['proxy'] = PROXY_URL
 
-def parse_date(date_str):
+                async with session.get(current_url, **kwargs) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    if key_name:
+                        all_records.extend(data.get(key_name, []))
+                        next_page_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
+                        if next_page_url and not next_page_url.startswith('http'):
+                            current_url = urljoin(instance_url, next_page_url)
+                        else:
+                            current_url = next_page_url
+                    else: 
+                        return data
+            return all_records
+        except aiohttp.ClientError as e:
+            logging.error(f"❌ Error fetching {current_url}: {e}")
+            return [] if key_name else {}
+
+async def fetch_single_record(session, semaphore, url):
+    async with semaphore:
+        try:
+            async with session.get(url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
+                if response.status == 404:
+                    logging.warning(f"⚠️ Record not found (404): {url}")
+                    return None
+                response.raise_for_status()
+                return await response.json()
+        except aiohttp.ClientError as e:
+            logging.error(f"❌ Error fetching single record {url}: {e}")
+            return None
+
+# --- Helper Functions ---
+def parse_sf_date(date_str):
     if not date_str: return None
     try:
         return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-    except ValueError: return None
+    except (ValueError, TypeError): return None
 
-def audit_segments_and_activations(segments, activations):
-    logging.info("🔎 Analisando Segmentos e Ativações...")
-    results = []
-    today = datetime.now(timezone.utc)
-    
-    nested_segment_ids = set()
-    for seg in segments:
-        if 'MarketSegmentId' in str(seg.get('IncludeCriteria', '')) + str(seg.get('ExcludeCriteria', '')):
-            pass
+def days_since(date_obj):
+    if not date_obj: return None
+    return (datetime.now(timezone.utc) - date_obj).days
 
-    orphan_segment_ids = set()
-    for seg in segments:
-        last_published_date = parse_date(seg.get('PublishDate'))
-        days_inactive = (today - last_published_date).days if last_published_date else float('inf')
+def normalize_api_name(name):
+    if not isinstance(name, str): return ""
+    return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
 
-        if days_inactive > SEGMENT_INACTIVITY_DAYS and seg.get('Id') not in nested_segment_ids:
-            orphan_segment_ids.add(seg.get('Id'))
-            results.append({
-                'DELETAR': 'SIM', 'ID_OR_API_NAME': seg.get('Id'), 'DISPLAY_NAME': seg.get('Name'),
-                'OBJECT_TYPE': 'Segmento', 'REASON': f'Órfão: Não publicado há >{SEGMENT_INACTIVITY_DAYS} dias.',
-                'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': int(days_inactive) if last_published_date else 'Nunca',
-                'DELETION_IDENTIFIER': seg.get('Id')
-            })
+def find_dmos_recursively(obj, dmo_set):
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in ['objectName', 'entityName', 'developerName'] and isinstance(value, str) and value.endswith('__dlm'):
+                dmo_set.add(normalize_api_name(value))
+            elif isinstance(value, (dict, list)):
+                find_dmos_recursively(value, dmo_set)
+    elif isinstance(obj, list):
+        for item in obj:
+            find_dmos_recursively(item, dmo_set)
 
-    for act in activations:
-        if act.get('MarketSegmentId') in orphan_segment_ids:
-            results.append({
-                'DELETAR': 'SIM', 'ID_OR_API_NAME': act.get('Id'), 'DISPLAY_NAME': act.get('Name'),
-                'OBJECT_TYPE': 'Ativação', 'REASON': 'Órfã: Associada a um segmento órfão.',
-                'TIPO_ATIVIDADE': 'N/A', 'DIAS_ATIVIDADE': 'N/A', 'DELETION_IDENTIFIER': act.get('Id')
-            })
-    return results
-
-def audit_data_streams(data_streams):
-    logging.info("🔎 Analisando Data Streams...")
-    results = []
-    today = datetime.now(timezone.utc)
-    
-    for ds in data_streams:
-        last_updated_date = parse_date(ds.get('LastModifiedDate'))
-        days_inactive = (today - last_updated_date).days if last_updated_date else float('inf')
-        
-        if days_inactive > DATA_STREAM_UPDATE_DAYS and not ds.get('Mappings__c'):
-            results.append({
-                'DELETAR': 'SIM', 'ID_OR_API_NAME': ds.get('DeveloperName'), 'DISPLAY_NAME': ds.get('Label'),
-                'OBJECT_TYPE': 'Data Stream', 'REASON': f'Órfão: Última atualização >{DATA_STREAM_UPDATE_DAYS} dias e sem mapeamentos.',
-                'TIPO_ATIVIDADE': 'Última Atualização', 'DIAS_ATIVIDADE': int(days_inactive),
-                'DELETION_IDENTIFIER': ds.get('DeveloperName')
-            })
-    return results
-
-def audit_calculated_insights(cis):
-    logging.info("🔎 Analisando Calculated Insights...")
-    results = []
-    today = datetime.now(timezone.utc)
-
-    for ci in cis:
-        last_processed_date = parse_date(ci.get('LastSuccessfulRefreshDate'))
-        days_inactive = (today - last_processed_date).days if last_processed_date else float('inf')
-        
-        if days_inactive > CI_PROCESSING_DAYS:
-            results.append({
-                'DELETAR': 'SIM', 'ID_OR_API_NAME': ci.get('DeveloperName'), 'DISPLAY_NAME': ci.get('Label'),
-                'OBJECT_TYPE': 'Calculated Insight', 'REASON': f'Inativo: Último processamento >{CI_PROCESSING_DAYS} dias.',
-                'TIPO_ATIVIDADE': 'Último Processamento', 'DIAS_ATIVIDADE': int(days_inactive),
-                'DELETION_IDENTIFIER': ci.get('DeveloperName')
-            })
-    return results
-    
-def audit_dmos(dmos, all_other_objects):
-    logging.info("🔎 Analisando Data Model Objects (DMOs)...")
-    results = []
-    today = datetime.now(timezone.utc)
-    
-    usage_blob = json.dumps(all_other_objects)
-    
-    for dmo in dmos:
-        api_name = dmo.get('DeveloperName')
-        if not api_name or api_name in usage_blob: continue
-
-        created_date = parse_date(dmo.get('CreatedDate'))
-        days_since_creation = (today - created_date).days if created_date else float('inf')
-
-        if days_since_creation > DMO_CREATION_DAYS:
-            results.append({
-                'DELETAR': 'SIM', 'ID_OR_API_NAME': api_name, 'DISPLAY_NAME': dmo.get('Label'),
-                'OBJECT_TYPE': 'DMO', 'REASON': f'Órfão: Não utilizado e criado há >{DMO_CREATION_DAYS} dias.',
-                'TIPO_ATIVIDADE': 'Data de Criação', 'DIAS_ATIVIDADE': int(days_since_creation) if created_date else 'Desconhecida',
-                'DELETION_IDENTIFIER': api_name
-            })
-    return results
-
-# ==============================================================================
-# 5. ORQUESTRADOR PRINCIPAL
-# ==============================================================================
-
-async def main():
-    """Função principal que orquestra todo o processo de auditoria."""
-    start_time = time.time()
-    
+def find_dmos_in_criteria(criteria_str):
+    if not criteria_str: return set()
     try:
-        access_token, instance_url = authenticate_jwt()
-    except Exception:
-        logging.error("Finalizando o script devido a falha na autenticação.")
-        return
+        decoded_str = html.unescape(criteria_str)
+        criteria_json = json.loads(decoded_str)
+    except (json.JSONDecodeError, TypeError): return set()
+    dmos_found = set()
+    find_dmos_recursively(criteria_json, dmos_found)
+    return dmos_found
 
-    headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json; charset=UTF-8'}
-    
-    # --- Define todas as queries da Bulk API ---
-    soql_queries = {
-        'segments': "SELECT Id, Name, PublishDate, IncludeCriteria, ExcludeCriteria FROM MarketSegment",
-        'activations': "SELECT Id, Name, MarketSegmentId FROM MarketSegmentActivation",
-        'data_streams': "SELECT DeveloperName, Label, LastModifiedDate, Mappings__c FROM MktDataStream",
-        'cis': "SELECT DeveloperName, Label, LastSuccessfulRefreshDate FROM MktCalculatedInsight",
-        'dmos': "SELECT DeveloperName, Label, CreatedDate FROM MktDataModelObject WHERE IsCustom__c = TRUE"
-    }
+def get_segment_id(seg): return seg.get('marketSegmentId') or seg.get('Id')
+def get_segment_name(seg): return seg.get('displayName') or seg.get('Name') or '(Sem nome)'
+def get_dmo_name(dmo): return dmo.get('name')
+def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('name') or '(Sem nome)'
 
-    async with aiohttp.ClientSession(headers=headers) as session:
-        logging.info("\n🚀 Iniciando jobs concorrentes da Bulk API...")
+# --- Optimized /jobs/query ---
+async def execute_query_job(session, instance_url, query, semaphore, max_wait=60, poll_interval=2):
+    async with semaphore:
+        payload = {"query": query}
+        url = f"{instance_url}/services/data/v64.0/jobs/query"
+        async with session.post(url, json=payload, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
+            response.raise_for_status()
+            job_info = await response.json()
+            job_id = job_info.get('id')
+            if not job_id:
+                logging.error("❌ JobId não retornado ao criar job de query.")
+                return []
+
+        job_status_url = f"{instance_url}/services/data/v64.0/jobs/query/{job_id}"
+        elapsed = 0
+        while elapsed < max_wait:
+            async with session.get(job_status_url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as resp:
+                resp.raise_for_status()
+                status_info = await resp.json()
+                status = status_info.get('status')
+                if status == 'Completed':
+                    query_result_url = status_info.get('queryResultUrl')
+                    if query_result_url:
+                        async with session.get(urljoin(instance_url, query_result_url), proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as qr:
+                            qr.raise_for_status()
+                            result = await qr.json()
+                            return result.get('records', [])
+                    return []
+                elif status in ['Failed', 'Aborted']:
+                    logging.error(f"❌ Job de query {job_id} falhou ou foi abortado.")
+                    return []
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+        logging.warning(f"⚠️ Timeout atingido para job de query {job_id}.")
+        return []
+
+# --- Main Audit Logic ---
+async def main():
+    auth_data = get_access_token()
+    access_token, instance_url = auth_data['access_token'], auth_data['instance_url']
+    logging.info('🚀 Iniciando auditoria de exclusão de objetos...')
+
+    headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
+    semaphore = asyncio.Semaphore(50)
+    connector = aiohttp.TCPConnector(ssl=VERIFY_SSL)
+    async with aiohttp.ClientSession(headers=headers, connector=connector) as session:
+        logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
         
-        tasks = [run_bulk_query_job(session, instance_url, name, query) for name, query in soql_queries.items()]
-        results = await asyncio.gather(*tasks)
+        dmo_soql_query = "SELECT DeveloperName, CreatedDate FROM MktDataModelObject"
+        segment_soql_query = "SELECT Id FROM MarketSegment"
+        activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute"
         
-        data = dict(zip(soql_queries.keys(), results))
-        logging.info("✅ Todos os jobs da Bulk API foram processados.")
+        initial_tasks = [
+            fetch_api_data(session, instance_url, f"/services/data/v64.0/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
+            fetch_api_data(session, instance_url, f"/services/data/v64.0/query?{urlencode({'q': segment_soql_query})}", semaphore, 'records'),
+            fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
+            execute_query_job(session, instance_url, activation_attributes_query, semaphore),
+            fetch_api_data(session, instance_url, "/services/data/v64.0/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
+            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/data-streams", semaphore, 'dataStreams'),
+            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/data-graphs/metadata", semaphore, 'dataGraphMetadata'),
+            fetch_api_data(session, instance_url, f"/services/data/v64.0/ssot/data-actions", semaphore, 'dataActions'),
+        ]
+        results = await tqdm.gather(*initial_tasks, desc="Coletando metadados iniciais")
+        dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams_summary, data_graphs, data_actions = results
+        
+        dmo_creation_dates = {rec['DeveloperName']: rec['CreatedDate'] for rec in dmo_tooling_data}
+        segment_ids = [rec['Id'] for rec in segment_id_records]
+        activation_ids = list(set(rec['MarketSegmentActivationId'] for rec in activation_attributes if rec.get('MarketSegmentActivationId')))
+        logging.info(f"✅ Etapa 1.1: {len(dmo_creation_dates)} datas de criação de DMOs, {len(segment_ids)} IDs de Segmentos e {len(activation_attributes)} Ativações carregadas.")
 
-    # --- Análise e Auditoria ---
-    logging.info("\n⚙️  Iniciando análise e aplicação das regras de auditoria...")
-    
-    final_results = []
-    final_results.extend(audit_segments_and_activations(data['segments'], data['activations']))
-    final_results.extend(audit_data_streams(data['data_streams']))
-    final_results.extend(audit_calculated_insights(data['cis']))
-    
-    # Prepara o blob de texto para a verificação de uso dos DMOs
-    all_other_objects_for_dmo_check = {k: v for k, v in data.items() if k != 'dmos'}
-    final_results.extend(audit_dmos(data['dmos'], all_other_objects_for_dmo_check))
+        segment_detail_tasks = [fetch_api_data(session, instance_url, f"/services/data/v64.0/sobjects/MarketSegment/{seg_id}", semaphore) for seg_id in segment_ids]
+        segments = await tqdm.gather(*segment_detail_tasks, desc="Buscando detalhes dos Segmentos")
+        segments = [res for res in segments if res]
 
-    logging.info("✅ Análise concluída.")
+        # --- Processamento de Auditoria ---
+        now = datetime.now(timezone.utc)
+        thirty_days_ago = now - timedelta(days=30)
+        ninety_days_ago = now - timedelta(days=90)
 
-    # --- Geração do Relatório ---
-    if not final_results:
-        logging.info("\n🎉 Nenhum objeto correspondeu aos critérios para exclusão.")
-    else:
-        logging.info(f"\n📝 Gerando relatório CSV com {len(final_results)} itens...")
-        try:
-            with open(OUTPUT_CSV_FILE, 'w', newline='', encoding='utf-8') as f:
-                header = ['DELETAR', 'ID_OR_API_NAME', 'DISPLAY_NAME', 'OBJECT_TYPE', 'REASON', 'TIPO_ATIVIDADE', 'DIAS_ATIVIDADE', 'DELETION_IDENTIFIER']
-                writer = csv.DictWriter(f, fieldnames=header)
+        segment_publications = {str(act.get('segmentId') or '')[:15]: parse_sf_date(act.get('lastPublishDate')) for act in activation_attributes if act.get('segmentId') and act.get('lastPublishDate')}
+        nested_segment_parents = {}
+        for seg in segments:
+            parent_name = get_segment_name(seg)
+            filters = (seg.get('filterDefinition') or {}).get('filters', [])
+            for f in filters:
+                nested_seg_id = str(f.get('Segment_Id__c') or '')[:15]
+                if nested_seg_id:
+                    nested_segment_parents.setdefault(nested_seg_id, []).append(parent_name)
+
+        dmos_used_by_segments = {normalize_api_name(s.get('SegmentOnObjectApiName')) for s in segments if s.get('SegmentOnObjectApiName')}
+        dmos_used_by_data_graphs = {normalize_api_name(obj.get('developerName')) for dg in data_graphs for obj in [dg.get('dgObject', {})] + dg.get('dgObject', {}).get('relatedObjects', []) if obj.get('developerName')}
+        dmos_used_by_ci_relationships = {normalize_api_name(rel.get('fromEntity')) for ci in calculated_insights for rel in ci.get('relationships', []) if rel.get('fromEntity')}
+        dmos_used_by_data_actions = set()
+        for da in data_actions:
+            find_dmos_recursively(da, dmos_used_by_data_actions)
+
+        dmos_used_in_segment_criteria = set()
+        for seg in segments:
+            dmos_used_in_segment_criteria.update(find_dmos_in_criteria(seg.get('IncludeCriteria')))
+            dmos_used_in_segment_criteria.update(find_dmos_in_criteria(seg.get('ExcludeCriteria')))
+
+        dmos_used_by_activations = set()
+        for attr in activation_attributes:
+            if query_path_str := attr.get('QueryPath'):
+                dmos_used_by_activations.update(find_dmos_in_criteria(query_path_str))
+
+        # --- Auditoria e CSV ---
+        audit_results = []
+
+        # Segmentos
+        for seg in segments:
+            seg_id = str(get_segment_id(seg) or '')[:15]
+            if not seg_id: continue
+            last_pub_date = segment_publications.get(seg_id)
+            is_published_recently = last_pub_date and last_pub_date >= thirty_days_ago
+            if not is_published_recently:
+                is_used_as_filter = seg_id in nested_segment_parents
+                if not is_used_as_filter:
+                    reason = 'Órfão (sem ativação recente e não é filtro)'
+                    days_pub = days_since(last_pub_date)
+                    deletion_identifier = seg.get('Name')
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': get_segment_name(seg), 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_pub if days_pub is not None else 'N/A', 'DELETION_IDENTIFIER': deletion_identifier or 'N/A'})
+                else:
+                    reason = f"Inativo (usado como filtro em: {', '.join(nested_segment_parents.get(seg_id, []))})"
+                    days_pub = days_since(last_pub_date)
+                    deletion_identifier = seg.get('Name')
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': get_segment_name(seg), 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_pub if days_pub is not None else 'N/A', 'DELETION_IDENTIFIER': deletion_identifier or 'N/A'})
+
+        # DMOs
+        for dmo in dm_objects:
+            original_dmo_name = get_dmo_name(dmo)
+            if not original_dmo_name or not original_dmo_name.endswith('__dlm'): continue
+            normalized_dmo_name = normalize_api_name(original_dmo_name)
+            created_date = parse_sf_date(dmo_creation_dates.get(original_dmo_name))
+            used = (normalized_dmo_name in dmos_used_by_segments
+                    or normalized_dmo_name in dmos_used_by_data_graphs
+                    or normalized_dmo_name in dmos_used_by_ci_relationships
+                    or normalized_dmo_name in dmos_used_by_data_actions
+                    or normalized_dmo_name in dmos_used_in_segment_criteria
+                    or normalized_dmo_name in dmos_used_by_activations)
+            if not used:
+                reason = "DMO não utilizado"
+                audit_results.append({'DELETAR': 'SIM', 'ID_OR_API_NAME': normalized_dmo_name, 'DISPLAY_NAME': get_dmo_display_name(dmo), 'OBJECT_TYPE': 'DMO', 'REASON': reason, 'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_since(created_date), 'DELETION_IDENTIFIER': normalized_dmo_name})
+
+        # --- CSV ---
+        if audit_results:
+            csv_file = f"audit_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            with open(csv_file, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=list(audit_results[0].keys()))
                 writer.writeheader()
-                writer.writerows(final_results)
-            logging.info(f"   Arquivo gerado com sucesso: {OUTPUT_CSV_FILE}")
-        except IOError as e:
-            logging.error(f"❌ Erro ao gravar o arquivo CSV: {e}")
-
-    duration = time.time() - start_time
-    logging.info(f"\n--- Auditoria Finalizada em {duration:.2f} segundos ---")
-
+                writer.writerows(audit_results)
+            logging.info(f"✅ Auditoria concluída. CSV gerado: {csv_file}")
+        else:
+            logging.info("🎉 Nenhum objeto órfão ou inativo encontrado.")
 
 if __name__ == "__main__":
-    if os.name == 'nt' and os.sys.version_info >= (3, 8):
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    
-    asyncio.run(main())
+    start_time = time.time()
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logging.error(f"Um erro inesperado ocorreu durante a auditoria: {e}", exc_info=True)
+    finally:
+        duration = time.time() - start_time
+        logging.info(f"\nTempo total de execução: {duration:.2f} segundos")
