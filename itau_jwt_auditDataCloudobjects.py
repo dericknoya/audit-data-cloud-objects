@@ -189,7 +189,10 @@ def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('name') 
 # --- Optimized /jobs/query ---
 async def execute_query_job(session, instance_url, query, semaphore, max_wait=60, poll_interval=2):
     async with semaphore:
-        payload = {"query": query}
+        payload = {
+            "operation": "query",
+            "query": query
+        }
         url = f"{instance_url}/services/data/v64.0/jobs/query"
         async with session.post(url, json=payload, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
             response.raise_for_status()
