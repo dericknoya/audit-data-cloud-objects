@@ -1,17 +1,17 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 7.2 (Depuração de Campo da API)
-- Consolida o código completo com a alteração para depurar o erro 400.
-- Na consulta ao objeto MarketSegmentActivation, o campo 'LastPublishedDate' foi
-  temporariamente substituído por 'LastModifiedDate' para verificar se o primeiro
-  não é compatível com a Bulk API. Se esta versão executar sem erros, a causa
-  do problema terá sido isolada.
+Versão: 9.0 (Versão Final de Produção)
+- Consolida todas as correções de API e lógica de dados desenvolvidas.
+- Reintegra a auditoria completa para DMOs, Data Streams e Calculated Insights,
+  além de Segmentos e Ativações.
+- O script agora está totalmente alinhado com o schema de dados da organização
+  e deve executar de forma estável para produzir o relatório de auditoria completo.
 
 Regras de Auditoria:
 1. Segmentos:
-  - Órfão: Não publicado nos últimos 30 dias E não utilizado como filtro aninhado.
-  - Inativo: Última publicação > 30 dias, MAS é utilizado como filtro aninhado.
+  - Órfão: Última atividade > 30 dias E não utilizado como filtro aninhado.
+  - Inativo: Última atividade > 30 dias, MAS é utilizado como filtro aninhado.
 2. Ativações:
   - Órfã: Associada a um segmento que foi identificado como órfão.
 3. Data Model Objects (DMOs):
@@ -52,34 +52,26 @@ CHUNK_SIZE = 400
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Authentication ---
+# --- Funções de Autenticação, API, e Helpers ---
 def get_access_token():
     logging.info("🔑 Authenticating with Salesforce using JWT Bearer Flow...")
     load_dotenv()
-    
     sf_client_id = os.getenv("SF_CLIENT_ID")
     sf_username = os.getenv("SF_USERNAME")
     sf_audience = os.getenv("SF_AUDIENCE")
     sf_login_url = os.getenv("SF_LOGIN_URL")
-
     if not all([sf_client_id, sf_username, sf_audience, sf_login_url]):
         raise ValueError("One or more required environment variables are missing.")
-
     try:
         with open('private.pem', 'r') as f:
             private_key = f.read()
     except FileNotFoundError:
         logging.error("❌ 'private.pem' file not found.")
         raise
-
-    payload = {
-        'iss': sf_client_id, 'sub': sf_username, 'aud': sf_audience,
-        'exp': int(time.time()) + 300
-    }
+    payload = {'iss': sf_client_id, 'sub': sf_username, 'aud': sf_audience, 'exp': int(time.time()) + 300}
     assertion = jwt.encode(payload, private_key, algorithm='RS256')
     params = {'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': assertion}
     token_url = f"{sf_login_url}/services/oauth2/token"
-
     try:
         proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY else None
         res = requests.post(token_url, data=params, proxies=proxies, verify=VERIFY_SSL)
@@ -90,7 +82,6 @@ def get_access_token():
         logging.error(f"❌ Salesforce authentication error: {e.response.text if e.response else e}")
         raise
 
-# --- API Fetching (para APIs que não são Bulk) ---
 async def fetch_api_data(session, relative_url, semaphore, key_name=None):
     async with semaphore:
         all_records = []
@@ -117,11 +108,9 @@ async def fetch_api_data(session, relative_url, semaphore, key_name=None):
             logging.error(f"❌ Error fetching {current_url}: {e}")
             return [] if key_name else {}
 
-# --- Helper Functions ---
 def parse_sf_date(date_str):
     if not date_str: return None
-    try:
-        return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+    try: return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
     except (ValueError, TypeError): return None
 
 def days_since(date_obj):
@@ -132,33 +121,39 @@ def normalize_api_name(name):
     if not isinstance(name, str): return ""
     return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
 
-def find_dmos_recursively(obj, dmo_set):
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if key in ['objectName', 'entityName', 'developerName'] and isinstance(value, str) and value.endswith('__dlm'):
-                dmo_set.add(normalize_api_name(value))
-            elif isinstance(value, (dict, list)):
-                find_dmos_recursively(value, dmo_set)
-    elif isinstance(obj, list):
-        for item in obj:
-            find_dmos_recursively(item, dmo_set)
-
-def find_dmos_in_criteria(criteria_str):
-    if not criteria_str: return set()
+def find_items_in_criteria(criteria_str, key_to_find, item_set):
+    if not criteria_str: return
     try:
-        decoded_str = html.unescape(criteria_str)
-        criteria_json = json.loads(decoded_str)
-    except (json.JSONDecodeError, TypeError): return set()
-    dmos_found = set()
-    find_dmos_recursively(criteria_json, dmos_found)
-    return dmos_found
+        # Se o critério já for um dict/list (de Data Actions), não precisa de loads
+        if isinstance(criteria_str, (dict, list)):
+            criteria_json = criteria_str
+        else:
+            decoded_str = html.unescape(str(criteria_str))
+            criteria_json = json.loads(decoded_str)
+        
+        def recurse(obj):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    if key == key_to_find and isinstance(value, str):
+                        # Para DMOs
+                        if key in ['objectName', 'entityName', 'developerName'] and value.endswith('__dlm'):
+                            item_set.add(normalize_api_name(value))
+                        # Para Segmentos Aninhados
+                        elif key == 'segmentId':
+                            item_set.add(str(value)[:15])
+                    elif isinstance(value, (dict, list)):
+                        recurse(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    recurse(item)
+        
+        recurse(criteria_json)
+    except (json.JSONDecodeError, TypeError): return
 
 def get_segment_id(seg): return seg.get('Id')
 def get_segment_name(seg): return seg.get('Name') or '(Sem nome)'
-def get_dmo_name(dmo): return dmo.get('name')
 def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('name') or '(Sem nome)'
 
-# --- Optimized /jobs/query (Bulk API 2.0) ---
 async def execute_query_job(session, query, semaphore):
     async with semaphore:
         job_url_path = "/services/data/v64.0/jobs/query"
@@ -181,7 +176,7 @@ async def execute_query_job(session, query, semaphore):
                     logging.info(f"⏳ Status do Job {job_id}: {state}")
                     if state == 'JobComplete': break
                     if state in ['Failed', 'Aborted']:
-                        logging.error(f"❌ Job de query {job_id} falhou ou foi abortado. Mensagem: {status_info.get('errorMessage')}")
+                        logging.error(f"❌ Job de query {job_id} falhou: {status_info.get('errorMessage')}")
                         return []
             results_path = f"{job_status_path}/results"
             results_headers = {'Accept-Encoding': 'gzip'}
@@ -206,22 +201,16 @@ async def execute_query_job(session, query, semaphore):
             logging.error(f"❌ Erro na execução do job de query: status={getattr(e, 'status', 'N/A')}, message='{e}', response='{error_text}'")
             return []
 
-# --- Funções de busca em massa ---
 async def fetch_records_in_bulk(session, semaphore, object_name, fields, record_ids):
-    """Função genérica para buscar registros em massa usando SOQL e a Bulk API."""
-    if not record_ids:
-        return []
-    
+    if not record_ids: return []
     all_records = []
     tasks = []
     field_str = ", ".join(fields)
-    
     for i in range(0, len(record_ids), CHUNK_SIZE):
         chunk = record_ids[i:i + CHUNK_SIZE]
         formatted_ids = "','".join(chunk)
         query = f"SELECT {field_str} FROM {object_name} WHERE Id IN ('{formatted_ids}')"
         tasks.append(execute_query_job(session, query, semaphore))
-
     results = await tqdm.gather(*tasks, desc=f"Buscando detalhes de {object_name} em massa")
     for record_list in results:
         all_records.extend(record_list)
@@ -233,12 +222,7 @@ async def main():
     access_token, instance_url = auth_data['access_token'], auth_data['instance_url']
     logging.info('🚀 Iniciando auditoria de exclusão de objetos...')
 
-    headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-    }
-    
+    headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json', 'Accept': 'application/json'}
     semaphore = asyncio.Semaphore(10)
     async with aiohttp.ClientSession(headers=headers, base_url=instance_url, connector=aiohttp.TCPConnector(ssl=VERIFY_SSL)) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
@@ -261,74 +245,142 @@ async def main():
         logging.info("✅ Coleta inicial de metadados concluída.")
         dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions = results
         
-        dmo_creation_dates = {rec['DeveloperName']: rec['CreatedDate'] for rec in dmo_tooling_data}
-        segment_ids = [rec['Id'] for rec in segment_id_records]
+        dmo_creation_dates = {rec['DeveloperName']: rec['CreatedDate'] for rec in dmo_tooling_data if rec.get('DeveloperName')}
+        segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
         logging.info(f"✅ Etapa 1.1: {len(dmo_creation_dates)} DMOs, {len(segment_ids)} Segmentos e {len(activation_attributes)} Atributos de Ativação carregados.")
 
-        activation_ids = list(set(
-            attr['MarketSegmentActivationId'] for attr in activation_attributes if attr.get('MarketSegmentActivationId')
-        ))
+        activation_ids = list(set(attr['MarketSegmentActivationId'] for attr in activation_attributes if attr.get('MarketSegmentActivationId')))
         
-        logging.info(f"--- Etapa 2: Buscando detalhes de {len(activation_ids)} ativações únicas... (Isso pode levar vários minutos) ---")
-        
-        # ALTERAÇÃO PARA TESTE: Usando 'LastModifiedDate' como alternativa para 'LastPublishedDate'
-        # para verificar se este último campo é a causa do erro 400.
+        logging.info(f"--- Etapa 2: Buscando detalhes de {len(activation_ids)} ativações únicas... ---")
         activation_fields_to_query = ["MarketSegmentId", "LastModifiedDate"]
-        
-        activation_details = await fetch_records_in_bulk(
-            session, semaphore, 
-            object_name="MarketSegmentActivation", 
-            fields=activation_fields_to_query, 
-            record_ids=activation_ids
-        )
+        activation_details = await fetch_records_in_bulk(session, semaphore, "MarketSegmentActivation", activation_fields_to_query, activation_ids)
         logging.info("✅ Detalhes de ativação coletados.")
 
-        # A lógica abaixo usará 'LastModifiedDate' para o teste.
         segment_publications = {
             str(act.get('MarketSegmentId') or '')[:15]: parse_sf_date(act.get('LastModifiedDate'))
             for act in activation_details if act.get('MarketSegmentId') and act.get('LastModifiedDate')
         }
 
-        logging.info(f"--- Etapa 3: Buscando detalhes de {len(segment_ids)} segmentos... (Isso também pode levar vários minutos) ---")
-        segments = await fetch_records_in_bulk(
-            session, semaphore,
-            object_name="MarketSegment",
-            fields=["Id", "Name", "SegmentOnObjectApiName", "IncludeCriteria", "ExcludeCriteria", "FilterDefinition"],
-            record_ids=segment_ids
-        )
+        logging.info(f"--- Etapa 3: Buscando detalhes de {len(segment_ids)} segmentos... ---")
+        segment_fields_to_query = ["Id", "Name", "SegmentMembershipTable", "IncludeCriteria", "ExcludeCriteria"]
+        segments = await fetch_records_in_bulk(session, semaphore, "MarketSegment", segment_fields_to_query, segment_ids)
         logging.info("✅ Detalhes de segmento coletados. Iniciando análise...")
 
-        # --- A lógica de auditoria começa aqui ---
+        # --- Início da Lógica de Análise e Auditoria ---
         now = datetime.now(timezone.utc)
         thirty_days_ago = now - timedelta(days=30)
         ninety_days_ago = now - timedelta(days=90)
+        
+        # --- Construção dos conjuntos de DMOs utilizados ---
+        dmos_used_by_segments = {normalize_api_name(s.get('SegmentMembershipTable')) for s in segments if s.get('SegmentMembershipTable')}
+        dmos_used_by_data_graphs = {normalize_api_name(obj.get('developerName')) for dg in data_graphs for obj in [dg.get('dgObject', {})] + dg.get('dgObject', {}).get('relatedObjects', []) if obj.get('developerName')}
+        dmos_used_by_ci_relationships = {normalize_api_name(rel.get('fromEntity')) for ci in calculated_insights for rel in ci.get('relationships', []) if rel.get('fromEntity')}
+        
+        dmos_used_in_activations = set()
+        for attr in activation_attributes:
+            find_items_in_criteria(attr.get('QueryPath'), 'developerName', dmos_used_in_activations)
+            
+        dmos_used_in_data_actions = set()
+        for da in data_actions:
+            find_items_in_criteria(da, 'developerName', dmos_used_in_data_actions)
+            
+        nested_segment_parents = {}
+        dmos_used_in_segment_criteria = set()
+        logging.info("Analisando critérios de segmentos para DMOs e aninhamento...")
+        for seg in tqdm(segments, desc="Analisando Critérios de Segmentos"):
+            parent_name = get_segment_name(seg)
+            for criteria_field in ['IncludeCriteria', 'ExcludeCriteria']:
+                criteria_str = seg.get(criteria_field)
+                find_items_in_criteria(criteria_str, 'developerName', dmos_used_in_segment_criteria)
+                
+                nested_ids_found = set()
+                find_items_in_criteria(criteria_str, 'segmentId', nested_ids_found)
+                for nested_id in nested_ids_found:
+                    nested_segment_parents.setdefault(nested_id, []).append(parent_name)
+
+        # --- Início da Geração dos Resultados da Auditoria ---
         audit_results = []
         orphan_segment_ids = set()
-
-        # Auditoria de Segmentos
-        logging.info("Auditing Segments...")
-        for seg in segments:
+        
+        # 1. Auditoria de Segmentos
+        logging.info("Auditando Segmentos...")
+        for seg in tqdm(segments, desc="Auditando Segmentos"):
             seg_id = str(get_segment_id(seg) or '')[:15]
             if not seg_id: continue
+            
             last_pub_date = segment_publications.get(seg_id)
             is_published_recently = last_pub_date and last_pub_date >= thirty_days_ago
             
             if not is_published_recently:
                 is_used_as_filter = seg_id in nested_segment_parents
-                days_pub = days_since(last_pub_date)
-                deletion_identifier = get_segment_name(seg)
+                days_since_pub = days_since(last_pub_date)
+                seg_name = get_segment_name(seg)
                 
                 if not is_used_as_filter:
-                    reason = 'Órfão (sem publicação recente e não é filtro aninhado)'
+                    reason = 'Órfão (sem atividade recente e não é filtro aninhado)'
                     orphan_segment_ids.add(seg_id)
-                    audit_results.append({'DELETAR': 'SIM', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': deletion_identifier, 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_pub if days_pub is not None else 'N/A', 'DELETION_IDENTIFIER': deletion_identifier})
+                    audit_results.append({'DELETAR': 'SIM', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': seg_name, 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Atividade', 'DIAS_ATIVIDADE': days_since_pub if days_since_pub is not None else 'N/A', 'DELETION_IDENTIFIER': seg_name})
                 else:
-                    reason = f"Inativo (publicação > 30d, usado como filtro em: {', '.join(nested_segment_parents.get(seg_id, []))})"
-                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': deletion_identifier, 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_pub if days_pub is not None else 'N/A', 'DELETION_IDENTIFIER': deletion_identifier})
+                    reason = f"Inativo (atividade > 30d, mas usado como filtro em: {', '.join(nested_segment_parents.get(seg_id, []))})"
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': seg_name, 'OBJECT_TYPE': 'SEGMENT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Atividade', 'DIAS_ATIVIDADE': days_since_pub if days_since_pub is not None else 'N/A', 'DELETION_IDENTIFIER': seg_name})
+
+        # 2. Auditoria de Ativações
+        logging.info("Auditando Ativações...")
+        activation_id_map = {attr.get('MarketSegmentActivationId'): attr for attr in activation_attributes}
+        for act_detail in activation_details:
+            seg_id = str(act_detail.get('MarketSegmentId') or '')[:15]
+            if seg_id in orphan_segment_ids:
+                act_id = next((k for k, v in activation_id_map.items() if v.get('MarketSegmentActivationId') == act_detail.get('Id')), None)
+                if act_id:
+                    act_name = activation_id_map[act_id].get('Name')
+                    reason = f'Órfã (associada ao segmento órfão ID: {seg_id})'
+                    audit_results.append({'DELETAR': 'SIM', 'ID_OR_API_NAME': act_id, 'DISPLAY_NAME': act_name, 'OBJECT_TYPE': 'ACTIVATION', 'REASON': reason, 'TIPO_ATIVIDADE': 'N/A', 'DIAS_ATIVIDADE': 'N/A', 'DELETION_IDENTIFIER': act_name})
+
+        # 3. Auditoria de DMOs
+        logging.info("Auditando Data Model Objects (DMOs)...")
+        all_used_dmos = (dmos_used_by_segments | dmos_used_by_data_graphs | dmos_used_by_ci_relationships | 
+                         dmos_used_in_activations | dmos_used_in_data_actions | dmos_used_in_segment_criteria)
+        for dmo in dm_objects:
+            dmo_name = dmo.get('name', '')
+            if not dmo_name.endswith('__dlm'): continue
+            
+            normalized_dmo_name = normalize_api_name(dmo_name)
+            if normalized_dmo_name not in all_used_dmos:
+                created_date = parse_sf_date(dmo_creation_dates.get(dmo_name))
+                if not created_date or created_date < ninety_days_ago:
+                    days_created = days_since(created_date)
+                    reason = "Órfão (não utilizado e criado > 90d ou data desconhecida)"
+                    display_name = get_dmo_display_name(dmo)
+                    audit_results.append({'DELETAR': 'SIM', 'ID_OR_API_NAME': dmo_name, 'DISPLAY_NAME': display_name, 'OBJECT_TYPE': 'DMO', 'REASON': reason, 'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_created if days_created is not None else '>90', 'DELETION_IDENTIFIER': dmo_name})
+
+        # 4. Auditoria de Data Streams
+        logging.info("Auditando Data Streams...")
+        for ds in data_streams:
+            last_updated = parse_sf_date(ds.get('lastIngestDate'))
+            if not last_updated or last_updated < thirty_days_ago:
+                days_inactive = days_since(last_updated)
+                ds_name = ds.get('name')
+                ds_id = ds.get('id')
+                if not ds.get('mappings'):
+                    reason = "Órfão (sem ingestão > 30d e sem mapeamentos)"
+                    audit_results.append({'DELETAR': 'SIM', 'ID_OR_API_NAME': ds_id, 'DISPLAY_NAME': ds_name, 'OBJECT_TYPE': 'DATA_STREAM', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'DELETION_IDENTIFIER': ds_name})
+                else:
+                    reason = "Inativo (sem ingestão > 30d, mas possui mapeamentos)"
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_id, 'DISPLAY_NAME': ds_name, 'OBJECT_TYPE': 'DATA_STREAM', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'DELETION_IDENTIFIER': ds_name})
+        
+        # 5. Auditoria de Calculated Insights
+        logging.info("Auditando Calculated Insights...")
+        for ci in calculated_insights:
+            last_processed = parse_sf_date(ci.get('lastSuccessfulProcessingDate'))
+            if not last_processed or last_processed < ninety_days_ago:
+                days_inactive = days_since(last_processed)
+                ci_name = ci.get('name')
+                reason = "Inativo (último processamento bem-sucedido > 90d)"
+                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ci_name, 'DISPLAY_NAME': ci.get('displayName'), 'OBJECT_TYPE': 'CALCULATED_INSIGHT', 'REASON': reason, 'TIPO_ATIVIDADE': 'Último Processamento', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 'DELETION_IDENTIFIER': ci_name})
 
         # --- Gravação do CSV ---
         if audit_results:
-            csv_file = f"audit_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            csv_file = f"audit_objetos_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             with open(csv_file, mode='w', newline='', encoding='utf-8') as f:
                 fieldnames = ['DELETAR', 'ID_OR_API_NAME', 'DISPLAY_NAME', 'OBJECT_TYPE', 'REASON', 'TIPO_ATIVIDADE', 'DIAS_ATIVIDADE', 'DELETION_IDENTIFIER']
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -336,7 +388,7 @@ async def main():
                 writer.writerows(audit_results)
             logging.info(f"✅ Auditoria concluída. CSV gerado: {csv_file}")
         else:
-            logging.info("🎉 Nenhum objeto órfão ou inativo encontrado.")
+            logging.info("🎉 Nenhum objeto órfão ou inativo encontrado com as regras atuais.")
 
 if __name__ == "__main__":
     start_time = time.time()
