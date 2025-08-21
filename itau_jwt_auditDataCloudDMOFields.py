@@ -1,9 +1,8 @@
-# -*- coding: utf-8 -*-
 """
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 18.1 (Correção de Bug Crítico)
+Versão: 18.2 (Escopo de Auditoria Ampliado)
 
 ================================================================================
 REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
@@ -22,7 +21,8 @@ das seguintes condições for verdadeira:
 1.  É encontrado nos critérios de pelo menos um **Segmento**.
 2.  É encontrado em qualquer parte da configuração de pelo menos uma **Ativação**.
 3.  É encontrado em qualquer parte da definição de pelo menos um **Calculated Insight**.
-4.  Seu DMO pai foi criado **nos últimos 90 dias** (regra de carência para novos 
+4.  É encontrado na definição de um **Ponto de Contato de Ativação** (MktSgmntActvtnContactPoint).
+5.  Seu DMO pai foi criado **nos últimos 90 dias** (regra de carência para novos 
     objetos que ainda não foram implementados em outras áreas).
 
 --------------------------------------------------------------------------------
@@ -31,11 +31,11 @@ REGRAS PARA UM CAMPO SER CONSIDERADO "NÃO UTILIZADO"
 Um campo é listado no relatório 'audit_campos_dmo_nao_utilizados.csv' SOMENTE 
 SE TODAS as seguintes condições forem verdadeiras:
 
-1.  **NÃO é encontrado** em nenhum Segmento, Ativação ou Calculated Insight.
+1.  **NÃO é encontrado** em nenhum Segmento, Ativação, Calculated Insight ou 
+    Ponto de Contato de Ativação.
 2.  Seu DMO pai foi criado **há mais de 90 dias**.
 3.  O campo e seu DMO **não são** objetos de sistema do Salesforce (o script 
-    ignora nomes com prefixos como 'ssot__', 'unified__' ou nomes específicos 
-    como 'DataSource__c').
+    ignora nomes com prefixos como 'ssot__', 'unified__', 'aa_', 'aal_', etc.).
 
 ================================================================================
 """
@@ -215,6 +215,8 @@ async def audit_dmo_fields():
         dmo_soql_query = "SELECT DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
         activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute"
+        # NOVO: Query para buscar os Pontos de Contato de Ativação
+        contact_point_query = "SELECT Id, Name, MarketSegmentActivationId, ContactPointFilterExpression, ContactPointPath FROM MktSgmntActvtnContactPoint"
         
         initial_tasks = [
             fetch_api_data(session, f"/services/data/v60.0/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
@@ -222,17 +224,18 @@ async def audit_dmo_fields():
             fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
             execute_query_job(session, activation_attributes_query, semaphore),
             fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
+            execute_query_job(session, contact_point_query, semaphore), # NOVO: Executando a nova query
         ]
         results = await tqdm.gather(*initial_tasks, desc="Coletando metadados iniciais")
-        dmo_tooling_data, segment_id_records, dmo_metadata_list, activation_attributes, calculated_insights = results
+        # NOVO: Desempacotando o novo resultado
+        dmo_tooling_data, segment_id_records, dmo_metadata_list, activation_attributes, calculated_insights, contact_point_usages = results
         
         dmo_creation_info = {rec['DeveloperName']: {'CreatedDate': rec['CreatedDate'], 'CreatedById': rec.get('CreatedById')} for rec in dmo_tooling_data}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
-        logging.info(f"✅ Etapa 1.1: {len(dmo_tooling_data)} DMOs, {len(segment_ids)} Segmentos e {len(activation_attributes)} Ativações carregadas.")
+        logging.info(f"✅ Etapa 1.1: {len(dmo_tooling_data)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
         
         logging.info(f"--- Etapa 2: Buscando detalhes de {len(segment_ids)} segmentos... ---")
         segment_fields_to_query = ["Id", "Name", "IncludeCriteria", "ExcludeCriteria"]
-        # CORREÇÃO: Argumentos passados na ordem correta.
         segments_list = await fetch_records_in_bulk(session, semaphore, "MarketSegment", segment_fields_to_query, segment_ids)
         logging.info("✅ Detalhes de segmentos coletados.")
 
@@ -247,6 +250,7 @@ async def audit_dmo_fields():
     logging.info("\n📊 Dados coletados. Analisando o uso dos campos...")
     
     all_dmo_fields = defaultdict(lambda: {'fields': {}, 'displayName': '', 'creatorName': 'Desconhecido'})
+    # NOVO: Adicionados os novos prefixos à lista de exclusão
     dmo_prefixes_to_exclude = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
 
     for dmo in dmo_metadata_list:
@@ -270,6 +274,12 @@ async def audit_dmo_fields():
 
     for ci in tqdm(calculated_insights, desc="Analisando CIs"):
         find_fields_in_structure(ci, used_fields_details, "Calculated Insight", ci.get('displayName'), ci.get('name'))
+
+    # NOVO: Analisando o uso de campos nos Pontos de Contato
+    for cp in tqdm(contact_point_usages, desc="Analisando Pontos de Contato"):
+        find_fields_in_structure(cp.get('ContactPointPath'), used_fields_details, "Ponto de Contato de Ativação", cp.get('Name'), cp.get('Id'))
+        find_fields_in_structure(cp.get('ContactPointFilterExpression'), used_fields_details, "Ponto de Contato de Ativação", cp.get('Name'), cp.get('Id'))
+
 
     ninety_days_ago = datetime.now(timezone.utc) - timedelta(days=90)
     field_prefixes_to_exclude = ('ssot__', 'KQ_')
