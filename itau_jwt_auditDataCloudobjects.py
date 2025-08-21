@@ -167,57 +167,64 @@ def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('name') 
 # --- Optimized /jobs/query ---
 async def execute_query_job(session, query, semaphore, max_wait=120, poll_interval=3):
     """Executa uma query assíncrona e aguarda os resultados."""
-    # NOVO: instance_url foi removido dos argumentos, pois já está no objeto session.
-    # A função agora pode ser mais genérica.
-    async with semaphore:
-        instance_url = str(session._base_url)
-        url = f"{instance_url}/services/data/v64.0/jobs/query"
-        payload = {"operation": "query", "query": query}
-        
-        try:
-            # Inicia o job
-            async with session.post(url, json=payload, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
-                response.raise_for_status()
-                job_info = await response.json()
-                job_id = job_info.get('id')
-                if not job_id:
-                    logging.error(f"❌ JobId não retornado para query: {query[:100]}...")
-                    return []
+    job_url_path = "/services/data/v64.0/jobs/query"
+    
+    # ALTERADO: Payload agora inclui 'contentType' explicitamente, conforme o exemplo funcional.
+    payload = {
+        "operation": "query",
+        "query": query,
+        "contentType": "CSV"
+    }
+    
+    try:
+        # Inicia o job
+        async with session.post(job_url_path, json=payload, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
+            response.raise_for_status()
+            job_info = await response.json()
+            job_id = job_info.get('id')
+            if not job_id:
+                logging.error(f"❌ JobId não retornado para query: {query[:100]}...")
+                return []
 
-            # Polling para o status do job
-            job_status_url = f"{url}/{job_id}"
-            elapsed = 0
-            while elapsed < max_wait:
-                async with session.get(job_status_url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as resp:
-                    resp.raise_for_status()
-                    status_info = await resp.json()
-                    status = status_info.get('state') # Corrigido de 'status' para 'state'
+        # Polling para o status do job
+        job_status_path = f"{job_url_path}/{job_id}"
+        elapsed = 0
+        while elapsed < max_wait:
+            async with session.get(job_status_path, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as resp:
+                resp.raise_for_status()
+                status_info = await resp.json()
+                status = status_info.get('state')
+                
+                if status == 'JobComplete':
+                    results_path = f"{job_status_path}/results"
+                    all_records = []
+                    # A API Bulk 2.0 retorna os resultados em CSV.
+                    # Esta parte lê o corpo da resposta como texto e processa o CSV.
+                    async with session.get(results_path, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as qr:
+                        qr.raise_for_status()
+                        csv_text = await qr.text()
+                        lines = csv_text.strip().split('\n')
+                        if len(lines) > 1:
+                            # Usa DictReader para converter o CSV para uma lista de dicionários
+                            reader = csv.DictReader(lines)
+                            # Remove as aspas duplas dos nomes dos campos que a API retorna
+                            reader.fieldnames = [field.strip('"') for field in reader.fieldnames]
+                            all_records.extend(list(reader))
+                    return all_records
                     
-                    if status == 'JobComplete':
-                        results_url = f"{job_status_url}/results"
-                        all_records = []
-                        # Paginação dos resultados
-                        while results_url:
-                            async with session.get(results_url, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as qr:
-                                qr.raise_for_status()
-                                result_data = await qr.json()
-                                all_records.extend(result_data.get('records', []))
-                                next_locator = qr.headers.get("Sforce-Locator")
-                                results_url = f"{job_status_url}/results?locator={next_locator}" if next_locator and next_locator != "null" else None
-                        return all_records
-                        
-                    elif status in ['Failed', 'Aborted']:
-                        logging.error(f"❌ Job de query {job_id} falhou ou foi abortado. Query: {query[:100]}...")
-                        return []
-                        
-                await asyncio.sleep(poll_interval)
-                elapsed += poll_interval
+                elif status in ['Failed', 'Aborted']:
+                    logging.error(f"❌ Job de query {job_id} falhou ou foi abortado. Query: {query[:100]}...")
+                    return []
+                    
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
 
-            logging.warning(f"⚠️ Timeout atingido para job de query {job_id}.")
-            return []
-        except aiohttp.ClientError as e:
-            logging.error(f"❌ Erro na execução do job de query: {e}")
-            return []
+        logging.warning(f"⚠️ Timeout atingido para job de query {job_id}.")
+        return []
+    except aiohttp.ClientError as e:
+        error_text = await e.response.text() if hasattr(e, 'response') and e.response else str(e)
+        logging.error(f"❌ Erro na execução do job de query: status={e.status}, message='{e.message}', response='{error_text}'")
+        return []
 
 # NOVO: Função para buscar detalhes de segmentos em massa
 async def fetch_all_segments_in_bulk(session, semaphore, segment_ids):
