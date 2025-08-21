@@ -3,7 +3,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 18.0 (Otimização Completa)
+Versão: 18.1 (Correção de Bug Crítico)
 
 ================================================================================
 REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
@@ -181,8 +181,8 @@ async def fetch_users_by_id(session, semaphore, user_ids):
     for record_list in results: all_users.extend(record_list)
     return all_users
 
-def find_fields_in_structure(obj, field_set):
-    """Percorre recursivamente uma estrutura JSON/dict em busca de campos."""
+def find_fields_in_structure(obj, used_fields_details, usage_type, object_name, object_api_name):
+    """Percorre recursivamente uma estrutura em busca de campos e registra seu uso."""
     api_name_keys = ["fieldApiName", "fieldName", "attributeName", "developerName"]
     try:
         if isinstance(obj, str) and ('{' in obj or '[' in obj):
@@ -191,11 +191,13 @@ def find_fields_in_structure(obj, field_set):
         if isinstance(obj, dict):
             for key, value in obj.items():
                 if key in api_name_keys and isinstance(value, str):
-                    field_set.add(value)
-                find_fields_in_structure(value, field_set)
+                    usage_context = {"usage_type": usage_type, "object_name": object_name, "object_api_name": object_api_name}
+                    if usage_context not in used_fields_details[value]:
+                        used_fields_details[value].append(usage_context)
+                find_fields_in_structure(value, used_fields_details, usage_type, object_name, object_api_name)
         elif isinstance(obj, list):
             for item in obj:
-                find_fields_in_structure(item, field_set)
+                find_fields_in_structure(item, used_fields_details, usage_type, object_name, object_api_name)
     except (json.JSONDecodeError, TypeError):
         return
 
@@ -230,7 +232,8 @@ async def audit_dmo_fields():
         
         logging.info(f"--- Etapa 2: Buscando detalhes de {len(segment_ids)} segmentos... ---")
         segment_fields_to_query = ["Id", "Name", "IncludeCriteria", "ExcludeCriteria"]
-        segments_list = await fetch_records_in_bulk(session, "/services/data/v60.0/sobjects/MarketSegment/", semaphore, segment_fields_to_query, segment_ids)
+        # CORREÇÃO: Argumentos passados na ordem correta.
+        segments_list = await fetch_records_in_bulk(session, semaphore, "MarketSegment", segment_fields_to_query, segment_ids)
         logging.info("✅ Detalhes de segmentos coletados.")
 
         creator_ids = {info['CreatedById'] for info in dmo_creation_info.values() if info.get('CreatedById')}
@@ -260,35 +263,18 @@ async def audit_dmo_fields():
     used_fields_details = defaultdict(list)
     
     for seg in tqdm(segments_list, desc="Analisando Segmentos"):
-        fields_found_in_seg = set()
-        find_fields_in_structure(seg.get('IncludeCriteria', ''), fields_found_in_seg)
-        find_fields_in_structure(seg.get('ExcludeCriteria', ''), fields_found_in_seg)
-        for field_name in fields_found_in_seg:
-            usage_context = {"usage_type": "Segmento", "object_name": seg.get('Name'), "object_api_name": seg.get('Id')}
-            if usage_context not in used_fields_details[field_name]:
-                used_fields_details[field_name].append(usage_context)
+        find_fields_in_structure(seg, used_fields_details, "Segmento", seg.get('Name'), seg.get('Id'))
 
     for attr in tqdm(activation_attributes, desc="Analisando Ativações"):
-        fields_found_in_attr = set()
-        find_fields_in_structure(attr.get('QueryPath'), fields_found_in_attr)
-        for field_name in fields_found_in_attr:
-            usage_context = {"usage_type": "Ativação", "object_name": attr.get('Name'), "object_api_name": attr.get('MarketSegmentActivationId')}
-            if usage_context not in used_fields_details[field_name]:
-                used_fields_details[field_name].append(usage_context)
+        find_fields_in_structure(attr.get('QueryPath'), used_fields_details, "Ativação", attr.get('Name'), attr.get('MarketSegmentActivationId'))
 
     for ci in tqdm(calculated_insights, desc="Analisando CIs"):
-        fields_found_in_ci = set()
-        find_fields_in_structure(ci, fields_found_in_ci)
-        for field_name in fields_found_in_ci:
-            usage_context = {"usage_type": "Calculated Insight", "object_name": ci.get('displayName'), "object_api_name": ci.get('name')}
-            if usage_context not in used_fields_details[field_name]:
-                used_fields_details[field_name].append(usage_context)
+        find_fields_in_structure(ci, used_fields_details, "Calculated Insight", ci.get('displayName'), ci.get('name'))
 
     ninety_days_ago = datetime.now(timezone.utc) - timedelta(days=90)
     field_prefixes_to_exclude = ('ssot__', 'KQ_')
     specific_fields_to_exclude = {'DataSource__c', 'DataSourceObject__c', 'InternalOrganization__c'}
 
-    # Adiciona campos de DMOs recém-criados à lista de usados
     for dmo_name in all_dmo_fields:
         if created_date_str := dmo_creation_info.get(dmo_name, {}).get('CreatedDate'):
             try:
@@ -301,7 +287,6 @@ async def audit_dmo_fields():
             except (ValueError, TypeError):
                 logging.warning(f"Não foi possível parsear a data para {dmo_name}: {created_date_str}")
     
-    # Prepara os resultados para os CSVs
     used_field_results, unused_field_results = [], []
     
     for dmo_name, data in all_dmo_fields.items():
@@ -312,21 +297,20 @@ async def audit_dmo_fields():
             if field_api_name in used_fields_details:
                 for usage in used_fields_details[field_api_name]:
                     used_field_results.append({
-                        'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name, 'CREATED_BY_NAME': data['creatorName'],
-                        'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name,
-                        'USAGE_TYPE': usage['usage_type'], 'USED_IN_OBJECT_NAME': usage['object_name'],
-                        'USED_IN_OBJECT_API_NAME': usage['object_api_name']
+                        'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name, 'FIELD_DISPLAY_NAME': field_display_name, 
+                        'FIELD_API_NAME': field_api_name, 'USAGE_TYPE': usage['usage_type'], 
+                        'USED_IN_OBJECT_NAME': usage['object_name'], 'USED_IN_OBJECT_API_NAME': usage['object_api_name'],
+                        'CREATED_BY_NAME': data['creatorName']
                     })
             else:
                  unused_field_results.append({
-                    'DELETAR': 'NAO', 'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name, 'CREATED_BY_NAME': data['creatorName'],
+                    'DELETAR': 'NAO', 'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name,
                     'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 
-                    'REASON': 'Não utilizado em Segmentos, Ativações ou CIs'
+                    'REASON': 'Não utilizado em Segmentos, Ativações ou CIs', 'CREATED_BY_NAME': data['creatorName']
                 })
 
     logging.info(f"📊 Total de {len(used_fields_details)} campos únicos em uso.")
     
-    # Grava CSV de campos NÃO utilizados
     if unused_field_results:
         csv_file_path_unused = 'audit_campos_dmo_nao_utilizados.csv'
         header_unused = ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME']
@@ -336,7 +320,6 @@ async def audit_dmo_fields():
     else:
         logging.info("🎉 Nenhum campo não utilizado foi encontrado!")
         
-    # Grava CSV de campos UTILIZADOS
     if used_field_results:
         csv_file_path_used = 'audit_campos_dmo_utilizados.csv'
         header_used = ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_TYPE', 'USED_IN_OBJECT_NAME', 'USED_IN_OBJECT_API_NAME', 'CREATED_BY_NAME']
