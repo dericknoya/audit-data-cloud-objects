@@ -2,7 +2,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 18.2 (Escopo de Auditoria Ampliado)
+Versão: 19.2 (Correção Definitiva da Lógica de Análise)
 
 ================================================================================
 REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
@@ -236,7 +236,9 @@ async def audit_dmo_fields():
             used_fields_details[field_name].append(usage_context)
 
     for seg in tqdm(segments_list, desc="Analisando Segmentos"):
-        find_fields_with_regex(json.dumps(seg), "Segmento", seg.get('Name'), seg.get('Id'))
+        # CORREÇÃO: Analisar os campos de critério diretamente, não o objeto inteiro.
+        find_fields_with_regex(seg.get('IncludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'))
+        find_fields_with_regex(seg.get('ExcludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'))
 
     for attr in tqdm(activation_attributes, desc="Analisando Ativações"):
         find_fields_with_regex(attr.get('QueryPath'), "Ativação", attr.get('Name'), attr.get('MarketSegmentActivationId'))
