@@ -43,9 +43,13 @@ import aiohttp
 from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
 
+# Carrega as variáveis de ambiente do arquivo .env no início do script
+load_dotenv()
+
 # --- Configuration ---
 USE_PROXY = True
-PROXY_URL = "https://felirub:080796@proxynew.itau:8080"
+# ALTERAÇÃO: Lê a URL do proxy do arquivo .env
+PROXY_URL = os.getenv("PROXY_URL")
 VERIFY_SSL = False
 CHUNK_SIZE = 400
 
@@ -55,13 +59,18 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- Funções de Autenticação, API, e Helpers ---
 def get_access_token():
     logging.info("🔑 Authenticating with Salesforce using JWT Bearer Flow...")
-    load_dotenv()
+    
     sf_client_id = os.getenv("SF_CLIENT_ID")
     sf_username = os.getenv("SF_USERNAME")
     sf_audience = os.getenv("SF_AUDIENCE")
     sf_login_url = os.getenv("SF_LOGIN_URL")
+
     if not all([sf_client_id, sf_username, sf_audience, sf_login_url]):
-        raise ValueError("One or more required environment variables are missing.")
+        raise ValueError("Uma ou mais variáveis de ambiente de autenticação (SF_CLIENT_ID, SF_USERNAME, etc.) estão faltando no arquivo .env.")
+    
+    if USE_PROXY and not PROXY_URL:
+        logging.warning("⚠️ USE_PROXY está como True, mas a variável PROXY_URL não foi encontrada no arquivo .env. O script continuará sem proxy.")
+
     try:
         with open('private.pem', 'r') as f:
             private_key = f.read()
@@ -73,7 +82,7 @@ def get_access_token():
     params = {'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': assertion}
     token_url = f"{sf_login_url}/services/oauth2/token"
     try:
-        proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY else None
+        proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY and PROXY_URL else None
         res = requests.post(token_url, data=params, proxies=proxies, verify=VERIFY_SSL)
         res.raise_for_status()
         logging.info("✅ Authentication successful.")
@@ -89,18 +98,14 @@ async def fetch_api_data(session, relative_url, semaphore, key_name=None):
         try:
             while current_url:
                 kwargs = {'ssl': VERIFY_SSL}
-                if USE_PROXY: kwargs['proxy'] = PROXY_URL
+                if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
                 async with session.get(current_url, **kwargs) as response:
                     response.raise_for_status()
                     data = await response.json()
                     if key_name:
                         all_records.extend(data.get(key_name, []))
-                        next_page_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
-                        if next_page_url and next_page_url.startswith('http'):
-                            base_host = str(session._base_url)
-                            current_url = urljoin(base_host, next_page_url)
-                        else:
-                            current_url = next_page_url
+                        next_page_url = data.get('nextRecordsUrl')
+                        current_url = urljoin(str(session._base_url), next_page_url) if next_page_url else None
                     else: 
                         return data
             return all_records
@@ -124,26 +129,17 @@ def normalize_api_name(name):
 def find_items_in_criteria(criteria_str, key_to_find, item_set):
     if not criteria_str: return
     try:
-        if isinstance(criteria_str, (dict, list)):
-            criteria_json = criteria_str
-        else:
-            decoded_str = html.unescape(str(criteria_str))
-            criteria_json = json.loads(decoded_str)
-        
+        if isinstance(criteria_str, (dict, list)): criteria_json = criteria_str
+        else: criteria_json = json.loads(html.unescape(str(criteria_str)))
         def recurse(obj):
             if isinstance(obj, dict):
                 for key, value in obj.items():
                     if key == key_to_find and isinstance(value, str):
-                        if key in ['objectName', 'entityName', 'developerName'] and value.endswith('__dlm'):
-                            item_set.add(normalize_api_name(value))
-                        elif key == 'segmentId':
-                            item_set.add(str(value)[:15])
-                    elif isinstance(value, (dict, list)):
-                        recurse(value)
+                        if key in ['objectName', 'entityName', 'developerName'] and value.endswith('__dlm'): item_set.add(normalize_api_name(value))
+                        elif key == 'segmentId': item_set.add(str(value)[:15])
+                    elif isinstance(value, (dict, list)): recurse(value)
             elif isinstance(obj, list):
-                for item in obj:
-                    recurse(item)
-        
+                for item in obj: recurse(item)
         recurse(criteria_json)
     except (json.JSONDecodeError, TypeError): return
 
@@ -155,35 +151,27 @@ async def execute_query_job(session, query, semaphore):
     async with semaphore:
         job_url_path = "/services/data/v64.0/jobs/query"
         payload = {"operation": "query", "query": query, "contentType": "CSV"}
+        proxy = PROXY_URL if USE_PROXY and PROXY_URL else None
         try:
-            async with session.post(job_url_path, data=json.dumps(payload), proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as response:
+            async with session.post(job_url_path, data=json.dumps(payload), proxy=proxy, ssl=VERIFY_SSL) as response:
                 response.raise_for_status()
-                job_info = await response.json()
-                job_id = job_info.get('id')
-                if not job_id:
-                    logging.error(f"❌ JobId não retornado para query: {query[:100]}...")
-                    return []
+                job_info = await response.json(); job_id = job_info.get('id')
+                if not job_id: logging.error(f"❌ JobId não retornado para query: {query[:100]}..."); return []
             job_status_path = f"{job_url_path}/{job_id}"
             while True:
                 await asyncio.sleep(5)
-                async with session.get(job_status_path, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as resp:
+                async with session.get(job_status_path, proxy=proxy, ssl=VERIFY_SSL) as resp:
                     resp.raise_for_status()
-                    status_info = await resp.json()
-                    state = status_info.get('state')
+                    status_info = await resp.json(); state = status_info.get('state')
                     logging.info(f"⏳ Status do Job {job_id}: {state}")
                     if state == 'JobComplete': break
-                    if state in ['Failed', 'Aborted']:
-                        logging.error(f"❌ Job de query {job_id} falhou: {status_info.get('errorMessage')}")
-                        return []
+                    if state in ['Failed', 'Aborted']: logging.error(f"❌ Job de query {job_id} falhou: {status_info.get('errorMessage')}"); return []
             results_path = f"{job_status_path}/results"
             results_headers = {'Accept-Encoding': 'gzip'}
-            async with session.get(results_path, headers=results_headers, proxy=PROXY_URL if USE_PROXY else None, ssl=VERIFY_SSL) as qr:
+            async with session.get(results_path, headers=results_headers, proxy=proxy, ssl=VERIFY_SSL) as qr:
                 qr.raise_for_status()
                 content_bytes = await qr.read()
-                if qr.headers.get('Content-Encoding') == 'gzip':
-                    csv_text = gzip.decompress(content_bytes).decode('utf-8')
-                else:
-                    csv_text = content_bytes.decode('utf-8')
+                csv_text = gzip.decompress(content_bytes).decode('utf-8') if qr.headers.get('Content-Encoding') == 'gzip' else content_bytes.decode('utf-8')
                 lines = csv_text.strip().splitlines()
                 if len(lines) > 1:
                     reader = csv.DictReader(lines)
@@ -200,18 +188,29 @@ async def execute_query_job(session, query, semaphore):
 
 async def fetch_records_in_bulk(session, semaphore, object_name, fields, record_ids):
     if not record_ids: return []
-    all_records = []
-    tasks = []
-    field_str = ", ".join(fields)
+    all_records, tasks, field_str = [], [], ", ".join(fields)
     for i in range(0, len(record_ids), CHUNK_SIZE):
-        chunk = record_ids[i:i + CHUNK_SIZE]
-        formatted_ids = "','".join(chunk)
+        chunk = record_ids[i:i + CHUNK_SIZE]; formatted_ids = "','".join(chunk)
         query = f"SELECT {field_str} FROM {object_name} WHERE Id IN ('{formatted_ids}')"
         tasks.append(execute_query_job(session, query, semaphore))
-    results = await tqdm.gather(*tasks, desc=f"Buscando detalhes de {object_name} em massa")
-    for record_list in results:
-        all_records.extend(record_list)
+    results = await tqdm.gather(*tasks, desc=f"Buscando detalhes de {object_name} (Bulk API)")
+    for record_list in results: all_records.extend(record_list)
     return all_records
+
+async def fetch_users_by_id(session, semaphore, user_ids):
+    if not user_ids: return []
+    all_users, tasks = [], []
+    field_str = "Id, Name"
+    for i in range(0, len(user_ids), CHUNK_SIZE):
+        chunk = user_ids[i:i + CHUNK_SIZE]; formatted_ids = "','".join(chunk)
+        query = f"SELECT {field_str} FROM User WHERE Id IN ('{formatted_ids}')"
+        url = f"/services/data/v64.0/query?{urlencode({'q': query})}"
+        tasks.append(fetch_api_data(session, url, semaphore, 'records'))
+    
+    results = await tqdm.gather(*tasks, desc="Buscando nomes de criadores (REST API)")
+    for record_list in results: all_users.extend(record_list)
+    return all_users
+
 
 # --- Main Audit Logic ---
 async def main():
@@ -272,8 +271,8 @@ async def main():
         user_id_to_name_map = {}
         if all_creator_ids:
             logging.info(f"--- Etapa 4: Buscando nomes de {len(all_creator_ids)} criadores... ---")
-            user_records = await fetch_records_in_bulk(session, semaphore, "User", ["Id", "Username"], list(all_creator_ids))
-            user_id_to_name_map = {user['Id']: user['Username'] for user in user_records}
+            user_records = await fetch_users_by_id(session, semaphore, list(all_creator_ids))
+            user_id_to_name_map = {user['Id']: user['Name'] for user in user_records}
             logging.info("✅ Nomes de criadores coletados.")
 
         now = datetime.now(timezone.utc)
@@ -321,14 +320,15 @@ async def main():
                 days_since_pub = days_since(last_pub_date)
                 seg_name = get_segment_name(seg)
                 creator_name = user_id_to_name_map.get(seg.get('CreatedById'), 'Desconhecido')
+                status = seg.get('SegmentStatus', 'N/A')
                 
                 if not is_used_as_filter:
                     deletable_segment_ids.add(seg_id)
                     reason = 'Inativo (sem atividade recente e não é filtro aninhado)'
-                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': seg_name, 'OBJECT_TYPE': 'SEGMENT', 'STATUS': seg.get('SegmentStatus', 'N/A'), 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Atividade', 'DIAS_ATIVIDADE': days_since_pub if days_since_pub is not None else 'N/A', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': seg_name})
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': seg_name, 'OBJECT_TYPE': 'SEGMENT', 'STATUS': status, 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Atividade', 'DIAS_ATIVIDADE': days_since_pub if days_since_pub is not None else 'N/A', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': seg_name})
                 else:
                     reason = f"Inativo (sem atividade recente, mas usado como filtro em: {', '.join(nested_segment_parents.get(seg_id, []))})"
-                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': seg_name, 'OBJECT_TYPE': 'SEGMENT', 'STATUS': seg.get('SegmentStatus', 'N/A'), 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Atividade', 'DIAS_ATIVIDADE': days_since_pub if days_since_pub is not None else 'N/A', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': seg_name})
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': seg_name, 'OBJECT_TYPE': 'SEGMENT', 'STATUS': status, 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Atividade', 'DIAS_ATIVIDADE': days_since_pub if days_since_pub is not None else 'N/A', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': seg_name})
 
         logging.info("Auditando Ativações...")
         for act_detail in activation_details:
