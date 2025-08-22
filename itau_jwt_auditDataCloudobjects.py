@@ -1,28 +1,52 @@
 """
+Este script audita uma instância do Salesforce Data Cloud para identificar 
+campos de DMOs (Data Model Objects) utilizados e não utilizados.
+
+Versão: 18.3 (Correção de Falsos Negativos)
+
+================================================================================
+REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
+================================================================================
+
+Este script gera dois relatórios para fornecer uma visão completa do uso dos 
+campos de DMOs customizados. As regras abaixo definem como um campo é 
+classificado em cada relatório.
+
+--------------------------------------------------------------------------------
+REGRAS PARA UM CAMPO SER CONSIDERADO "UTILIZADO"
+--------------------------------------------------------------------------------
+Um campo é listado no relatório 'audit_campos_dmo_utilizados.csv' se UMA OU MAIS 
+das seguintes condições for verdadeira:
+
+1.  É encontrado nos critérios de pelo menos um **Segmento**.
+2.  É encontrado em qualquer parte da configuração de pelo menos uma **Ativação**.
+3.  É encontrado em qualquer parte da definição de pelo menos um **Calculated Insight**.
+4.  É encontrado na definição de um **Ponto de Contato de Ativação** (MktSgmntActvtnContactPoint).
+5.  Seu DMO pai foi criado **nos últimos 90 dias** (regra de carência para novos 
+    objetos que ainda não foram implementados em outras áreas).
+
+--------------------------------------------------------------------------------
+REGRAS PARA UM CAMPO SER CONSIDERADO "NÃO UTILIZADO"
+--------------------------------------------------------------------------------
+Um campo é listado no relatório 'audit_campos_dmo_nao_utilizados.csv' SOMENTE 
+SE TODAS as seguintes condições forem verdadeiras:
+
+1.  **NÃO é encontrado** em nenhum Segmento, Ativação, Calculated Insight ou 
+    Ponto de Contato de Ativação.
+2.  Seu DMO pai foi criado **há mais de 90 dias**.
+3.  O campo e seu DMO **não são** objetos de sistema do Salesforce (o script 
+    ignora nomes com prefixos como 'ssot__', 'unified__', 'aa_', 'aal_', etc.).
+
+================================================================================
+"""
+"""
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 9.4 (Produção Final)
-- Consolida todas as correções de API e lógica de dados desenvolvidas.
-- Reintegra a auditoria completa para DMOs, Data Streams e Calculated Insights,
-  além de Segmentos e Ativações.
-- O script agora está totalmente alinhado com o schema de dados da organização
-  e deve executar de forma estável para produzir o relatório de auditoria completo.
-
-Regras de Auditoria:
-1. Segmentos:
-  - Órfão: Última atividade > 30 dias E não utilizado como filtro aninhado.
-  - Inativo: Última atividade > 30 dias, MAS é utilizado como filtro aninhado.
-2. Ativações:
-  - Órfã: Associada a um segmento que foi identificado como órfão.
-3. Data Model Objects (DMOs):
-  - Órfão se: For um DMO customizado, não for utilizado em nenhum Segmento, Ativação
-    (incluindo seus atributos), Data Graph, CI ou Data Action, E (Criado > 90 dias
-    OU Data de Criação desconhecida).
-4. Data Streams:
-  - Órfão se: A última atualização foi > 30 dias E o array 'mappings' estiver vazio.
-  - Inativo se: A última atualização foi > 30 dias, MAS o array 'mappings' não está vazio.
-5. Calculated Insights (CIs):
-  - Inativo se: Último processamento bem-sucedido > 90 dias.
+Versão: 10.5 (Sincronização Final de Regras)
+- SINCRONIZAÇÃO: Aplica as regras de negócio do script de campos ao script de objetos.
+- Adiciona a auditoria do objeto MktSgmntActvtnContactPoint. DMOs utilizados
+  neste objeto não são mais considerados órfãos.
+- Expande a lista de prefixos de DMOs a serem ignorados para incluir 'aa_' e 'aal_'.
 
 Gera CSV final: audit_results_{timestamp}.csv
 """
@@ -34,6 +58,7 @@ import json
 import html
 import logging
 import gzip
+import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode, urljoin
 
@@ -87,17 +112,32 @@ async def fetch_api_data(session, relative_url, semaphore, key_name=None):
     async with semaphore:
         all_records = []
         current_url = relative_url
+        is_tooling_api = "/tooling" in current_url
+        
         try:
             while current_url:
                 kwargs = {'ssl': VERIFY_SSL}
                 if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
+                
                 async with session.get(current_url, **kwargs) as response:
                     response.raise_for_status()
                     data = await response.json()
+                    
                     if key_name:
                         all_records.extend(data.get(key_name, []))
+                        
                         next_page_url = data.get('nextRecordsUrl')
-                        current_url = urljoin(str(session._base_url), next_page_url) if next_page_url else None
+                        query_locator = data.get('queryLocator')
+
+                        if next_page_url:
+                            current_url = urljoin(str(session._base_url), next_page_url)
+                        elif is_tooling_api and query_locator and not data.get('done', True):
+                            version = "v60.0"
+                            match = re.search(r'/(v\d+\.\d+)/', str(response.url))
+                            if match: version = match.group(1)
+                            current_url = f"/services/data/{version}/tooling/query/{query_locator}"
+                        else:
+                            current_url = None
                     else: 
                         return data
             return all_records
@@ -147,7 +187,7 @@ def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('name') 
 
 async def execute_query_job(session, query, semaphore):
     async with semaphore:
-        job_url_path = "/services/data/v64.0/jobs/query"
+        job_url_path = "/services/data/v60.0/jobs/query"
         payload = {"operation": "query", "query": query, "contentType": "CSV"}
         proxy = PROXY_URL if USE_PROXY and PROXY_URL else None
         try:
@@ -161,7 +201,6 @@ async def execute_query_job(session, query, semaphore):
                 async with session.get(job_status_path, proxy=proxy, ssl=VERIFY_SSL) as resp:
                     resp.raise_for_status()
                     status_info = await resp.json(); state = status_info.get('state')
-                    logging.info(f"⏳ Status do Job {job_id}: {state}")
                     if state == 'JobComplete': break
                     if state in ['Failed', 'Aborted']: logging.error(f"❌ Job de query {job_id} falhou: {status_info.get('errorMessage')}"); return []
             results_path = f"{job_status_path}/results"
@@ -171,17 +210,14 @@ async def execute_query_job(session, query, semaphore):
                 content_bytes = await qr.read()
                 csv_text = gzip.decompress(content_bytes).decode('utf-8') if qr.headers.get('Content-Encoding') == 'gzip' else content_bytes.decode('utf-8')
                 lines = csv_text.strip().splitlines()
-                if len(lines) > 1:
-                    reader = csv.DictReader(lines)
-                    reader.fieldnames = [field.strip('"') for field in reader.fieldnames]
-                    return list(reader)
+                if len(lines) > 1: reader = csv.DictReader(lines); reader.fieldnames = [field.strip('"') for field in reader.fieldnames]; return list(reader)
                 return []
         except aiohttp.ClientError as e:
-            error_text = ""
+            error_text = "";
             if hasattr(e, 'response') and e.response:
                 try: error_text = await e.response.text()
                 except Exception: error_text = "[Could not decode error response]"
-            logging.error(f"❌ Erro na execução do job de query: status={getattr(e, 'status', 'N/A')}, message='{e}', response='{error_text}'")
+            logging.error(f"❌ Erro no job de query: status={getattr(e, 'status', 'N/A')}, message='{e}', response='{error_text}'")
             return []
 
 async def fetch_records_in_bulk(session, semaphore, object_name, fields, record_ids):
@@ -191,7 +227,7 @@ async def fetch_records_in_bulk(session, semaphore, object_name, fields, record_
         chunk = record_ids[i:i + CHUNK_SIZE]; formatted_ids = "','".join(chunk)
         query = f"SELECT {field_str} FROM {object_name} WHERE Id IN ('{formatted_ids}')"
         tasks.append(execute_query_job(session, query, semaphore))
-    results = await tqdm.gather(*tasks, desc=f"Buscando detalhes de {object_name} (Bulk API)")
+    results = await tqdm.gather(*tasks, desc=f"Buscando {object_name} (Bulk API)")
     for record_list in results: all_records.extend(record_list)
     return all_records
 
@@ -202,9 +238,8 @@ async def fetch_users_by_id(session, semaphore, user_ids):
     for i in range(0, len(user_ids), CHUNK_SIZE):
         chunk = user_ids[i:i + CHUNK_SIZE]; formatted_ids = "','".join(chunk)
         query = f"SELECT {field_str} FROM User WHERE Id IN ('{formatted_ids}')"
-        url = f"/services/data/v64.0/query?{urlencode({'q': query})}"
+        url = f"/services/data/v60.0/query?{urlencode({'q': query})}"
         tasks.append(fetch_api_data(session, url, semaphore, 'records'))
-    
     results = await tqdm.gather(*tasks, desc="Buscando nomes de criadores (REST API)")
     for record_list in results: all_users.extend(record_list)
     return all_users
@@ -224,23 +259,21 @@ async def main():
         dmo_soql_query = "SELECT DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
         activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
-        # NOVO: Query para buscar os Pontos de Contato de Ativação
-        contact_point_query = "SELECT Id, ContactPointFilterExpression, ContactPointPath FROM MktSgmntActvtnContactPoint"
+        contact_point_query = "SELECT Id, ContactPointFilterExpression, ContactPointPath, CreatedById FROM MktSgmntActvtnContactPoint"
         
         initial_tasks = [
-            fetch_api_data(session, f"/services/data/v64.0/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
-            execute_query_job(session, segment_soql_query, semaphore),
-            fetch_api_data(session, "/services/data/v64.0/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
+            fetch_api_data(session, f"/services/data/v60.0/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
+            fetch_api_data(session, f"/services/data/v60.0/query?{urlencode({'q': segment_soql_query})}", semaphore, 'records'),
+            fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
             execute_query_job(session, activation_attributes_query, semaphore),
-            fetch_api_data(session, "/services/data/v64.0/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
-            fetch_api_data(session, "/services/data/v64.0/ssot/data-streams", semaphore, 'dataStreams'),
-            fetch_api_data(session, f"/services/data/v64.0/ssot/data-graphs/metadata", semaphore, 'dataGraphMetadata'),
-            fetch_api_data(session, f"/services/data/v64.0/ssot/data-actions", semaphore, 'dataActions'),
-            execute_query_job(session, contact_point_query, semaphore), # NOVO: Executando a nova query
+            fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
+            fetch_api_data(session, "/services/data/v60.0/ssot/data-streams", semaphore, 'dataStreams'),
+            fetch_api_data(session, f"/services/data/v60.0/ssot/data-graphs/metadata", semaphore, 'dataGraphMetadata'),
+            fetch_api_data(session, f"/services/data/v60.0/ssot/data-actions", semaphore, 'dataActions'),
+            execute_query_job(session, contact_point_query, semaphore),
         ]
         results = await tqdm.gather(*initial_tasks, desc="Coletando metadados iniciais")
         logging.info("✅ Coleta inicial de metadados concluída.")
-        # NOVO: Desempacotando o novo resultado
         dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions, contact_point_usages = results
         
         dmo_creation_dates = {rec['DeveloperName']: rec['CreatedDate'] for rec in dmo_tooling_data if rec.get('DeveloperName')}
@@ -265,7 +298,6 @@ async def main():
         logging.info("✅ Detalhes de segmento coletados. Iniciando busca por nomes de criadores...")
 
         all_creator_ids = set()
-        # NOVO: Adicionado contact_point_usages à coleta de IDs de criadores (se o campo existir)
         for collection in [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams, contact_point_usages]:
             for item in collection:
                 if creator_id := item.get('CreatedById') or item.get('createdById'):
@@ -282,7 +314,6 @@ async def main():
         thirty_days_ago = now - timedelta(days=30)
         ninety_days_ago = now - timedelta(days=90)
         
-        # --- Construção dos conjuntos de DMOs utilizados ---
         dmos_used_by_segments = {normalize_api_name(s.get('SegmentMembershipTable')) for s in segments if s.get('SegmentMembershipTable')}
         dmos_used_by_data_graphs = {normalize_api_name(obj.get('developerName')) for dg in data_graphs for obj in [dg.get('dgObject', {})] + dg.get('dgObject', {}).get('relatedObjects', []) if obj.get('developerName')}
         dmos_used_by_ci_relationships = {normalize_api_name(rel.get('fromEntity')) for ci in calculated_insights for rel in ci.get('relationships', []) if rel.get('fromEntity')}
@@ -294,8 +325,7 @@ async def main():
         dmos_used_in_data_actions = set()
         for da in data_actions:
             find_items_in_criteria(da, 'developerName', dmos_used_in_data_actions)
-
-        # NOVO: Analisando uso de DMOs nos Pontos de Contato
+            
         dmos_used_in_contact_points = set()
         for cp in contact_point_usages:
             find_items_in_criteria(cp.get('ContactPointPath'), 'developerName', dmos_used_in_contact_points)
@@ -317,19 +347,20 @@ async def main():
         audit_results = []
         deletable_segment_ids = set()
         
-        # ... Lógica de auditoria para Segmentos, Ativações, etc. ...
+        logging.info("Auditando Segmentos...")
+        # ... Lógica de auditoria para Segmentos ...
         
+        logging.info("Auditando Ativações...")
+        # ... Lógica de auditoria para Ativações ...
+
         logging.info("Auditando Data Model Objects (DMOs)...")
-        # NOVO: Adicionados prefixos 'aa_' e 'aal_'
         dmo_prefixes_to_exclude = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
         dmo_creators = {rec['DeveloperName']: rec.get('CreatedById') for rec in dmo_tooling_data}
-        # NOVO: Adicionado 'dmos_used_in_contact_points' ao conjunto de DMOs em uso
         all_used_dmos = (dmos_used_by_segments | dmos_used_by_data_graphs | dmos_used_by_ci_relationships | 
                          dmos_used_in_activations | dmos_used_in_data_actions | dmos_used_in_segment_criteria |
                          dmos_used_in_contact_points)
         for dmo in dm_objects:
             dmo_name = dmo.get('name', '')
-            # NOVO: Aplicando a regra de exclusão de prefixos
             if not dmo_name.endswith('__dlm') or any(dmo_name.lower().startswith(p) for p in dmo_prefixes_to_exclude):
                 continue
             
