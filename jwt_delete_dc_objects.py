@@ -17,6 +17,7 @@ import time
 from urllib.parse import urlencode, urljoin
 import sys
 import logging
+from collections import defaultdict
 
 import jwt
 import requests
@@ -31,7 +32,7 @@ API_VERSION = "v60.0"
 CONCURRENCY_LIMIT = 10
 CSV_FILE_PATH = 'audit_objetos_para_exclusao.csv'
 
-# NOVO: Configuração de Proxy lida do .env
+# Configuração de Proxy lida do .env
 USE_PROXY = True
 PROXY_URL = os.getenv("PROXY_URL")
 VERIFY_SSL = False
@@ -71,7 +72,7 @@ def get_access_token():
     token_url = f"{sf_login_url}/services/oauth2/token"
 
     try:
-        # ALTERADO: Adicionado suporte a proxy e verificação de SSL
+        # Adicionado suporte a proxy e verificação de SSL
         proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY and PROXY_URL else None
         res = requests.post(token_url, data=params, proxies=proxies, verify=VERIFY_SSL)
         res.raise_for_status()
@@ -83,7 +84,7 @@ def get_access_token():
 
 # --- Helper Functions ---
 def read_and_prepare_csv(file_path='audit_objetos_para_exclusao.csv'):
-    # ... (função inalterada) ...
+    """Reads the audit CSV and filters for objects marked for deletion."""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
@@ -102,13 +103,15 @@ def read_and_prepare_csv(file_path='audit_objetos_para_exclusao.csv'):
         return None
 
 def confirm_deletion(objects_to_delete):
-    # ... (função inalterada) ...
+    """Displays a detailed summary table and asks for final user confirmation."""
     print("\n--- RESUMO DA EXCLUSÃO ---")
     print("O script irá deletar permanentemente os seguintes objetos:")
     if not objects_to_delete: return False
+
     # Simple table print for brevity
     for item in objects_to_delete:
         print(f"  - TIPO: {item.get('OBJECT_TYPE', 'N/A')}, NOME: {item.get('DISPLAY_NAME', 'N/A')}, ID/API_NAME: {item.get('ID_OR_API_NAME', 'N/A')}")
+
     print("\n---------------------------------")
     print(f"Total de objetos a serem deletados: {len(objects_to_delete)}")
     print("\n⚠️  ATENÇÃO: ESTA AÇÃO É IRREVERSÍVEL! ⚠️")
@@ -130,7 +133,6 @@ async def get_tooling_ids(session, semaphore, base_url, object_api_name, develop
     
     try:
         async with semaphore:
-            # ALTERADO: Adicionado suporte a proxy e verificação de SSL
             kwargs = {'ssl': VERIFY_SSL}
             if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
             async with session.get(url, **kwargs) as response:
@@ -146,7 +148,6 @@ async def delete_record(session, semaphore, url, item, results_list):
     api_name = item.get('ID_OR_API_NAME')
     try:
         async with semaphore:
-            # ALTERADO: Adicionado suporte a proxy e verificação de SSL
             kwargs = {'ssl': VERIFY_SSL}
             if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
             async with session.delete(url, **kwargs) as response:
@@ -176,13 +177,12 @@ async def main():
 
     async with aiohttp.ClientSession(headers=headers) as session:
         logging.info("\n🔥 Iniciando processo de exclusão...")
-        # ... (lógica de exclusão inalterada, pois as funções internas já usam o proxy) ...
-        # ... (O restante do código main permanece o mesmo)
+
         grouped_objects = defaultdict(list)
         for item in objects_to_delete:
             grouped_objects[item.get('OBJECT_TYPE')].append(item)
         
-        delete_order = ['ACTIVATION', 'SEGMENT', 'DATA STREAM', 'DATA MODEL', 'CALCULATED INSIGHT']
+        delete_order = ['ACTIVATION', 'SEGMENT', 'DATA_STREAM', 'DMO', 'CALCULATED_INSIGHT']
         
         for object_type in delete_order:
             if object_type not in grouped_objects: continue
@@ -194,8 +194,36 @@ async def main():
                 for item in items_to_process:
                     url = f"{instance_url}/services/data/{API_VERSION}/ssot/activations/{item['DELETION_IDENTIFIER']}"
                     deletion_tasks.append(delete_record(session, semaphore, url, item, results))
-            # ... (demais lógicas de exclusão para outros tipos de objeto) ...
-        
+
+            elif object_type == 'SEGMENT':
+                for item in items_to_process:
+                    url = f"{instance_url}/services/data/{API_VERSION}/ssot/segments/{item['DELETION_IDENTIFIER']}"
+                    deletion_tasks.append(delete_record(session, semaphore, url, item, results))
+
+            elif object_type == 'DATA_STREAM':
+                for item in items_to_process:
+                    url = f"{instance_url}/services/data/{API_VERSION}/ssot/data-streams/{item['DELETION_IDENTIFIER']}?shouldDeleteDataLakeObject=true"
+                    deletion_tasks.append(delete_record(session, semaphore, url, item, results))
+
+            elif object_type == 'CALCULATED_INSIGHT':
+                for item in items_to_process:
+                    url = f"{instance_url}/services/data/{API_VERSION}/ssot/calculated-insights/{item['DELETION_IDENTIFIER']}"
+                    deletion_tasks.append(delete_record(session, semaphore, url, item, results))
+            
+            elif object_type == 'DMO':
+                dmo_names_to_delete = [item['DELETION_IDENTIFIER'] for item in items_to_process]
+                
+                dmo_ids = await get_tooling_ids(session, semaphore, instance_url, 'MktDataModelObject', dmo_names_to_delete)
+                
+                for item in items_to_process:
+                    original_name = item['DELETION_IDENTIFIER']
+                    if original_name in dmo_ids:
+                        dmo_id = dmo_ids[original_name]
+                        url = f"{instance_url}/services/data/{API_VERSION}/tooling/sobjects/MktDataModelObject/{dmo_id}"
+                        deletion_tasks.append(delete_record(session, semaphore, url, item, results))
+                    else:
+                        results.append({'status': '❌ Falha', 'name': item['DISPLAY_NAME'], 'message': f"Não foi possível encontrar o ID para o DMO '{original_name}'."})
+            
         await asyncio.gather(*deletion_tasks)
 
     # --- Relatório Final ---
