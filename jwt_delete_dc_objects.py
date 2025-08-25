@@ -2,10 +2,14 @@
 Este script realiza uma exclusão em massa de objetos do Data Cloud com base em um
 arquivo CSV aprovado manualmente.
 
-Version: 2.4 (Proxy Support)
-- Adicionado suporte completo a proxy para todas as chamadas de rede (autenticação
-  e requisições de exclusão), alinhando o comportamento com os scripts de auditoria.
-- A variável PROXY_URL agora é lida do arquivo .env para centralizar a configuração.
+Version: 2.8 (Depuração de Resposta e Correção de Leitura de CSV)
+- CORREÇÃO: Ajusta a leitura do arquivo CSV para usar a codificação 'utf-8-sig',
+  resolvendo o erro 'KeyError: DELETION_IDENTIFIER' que ocorre com arquivos
+  salvos no Excel.
+- MELHORIA DE DEPURAÇÃO: O script agora imprime no log a resposta completa (RAW)
+  da API para cada tentativa de exclusão, permitindo uma análise detalhada do retorno.
+- LÓGICA RESTAURADA: Mantém o uso consistente da coluna 'DELETION_IDENTIFIER'
+  para todos os tipos de objetos, conforme a lógica original.
 
 AVISO: ESTE SCRIPT REALIZA AÇÕES DE EXCLUSÃO IRREVERSÍVEIS.
 USE COM CUIDADO E APENAS APÓS REVISAR CUIDADOSAMENTE O ARQUIVO CSV.
@@ -72,7 +76,6 @@ def get_access_token():
     token_url = f"{sf_login_url}/services/oauth2/token"
 
     try:
-        # Adicionado suporte a proxy e verificação de SSL
         proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY and PROXY_URL else None
         res = requests.post(token_url, data=params, proxies=proxies, verify=VERIFY_SSL)
         res.raise_for_status()
@@ -84,10 +87,13 @@ def get_access_token():
 
 # --- Helper Functions ---
 def read_and_prepare_csv(file_path='audit_objetos_para_exclusao.csv'):
-    """Reads the audit CSV and filters for objects marked for deletion."""
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        # ALTERAÇÃO CRÍTICA: Usando 'utf-8-sig' para ignorar o BOM do Excel.
+        with open(file_path, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
+            # Remove espaços em branco dos nomes das colunas para maior robustez
+            reader.fieldnames = [header.strip() for header in reader.fieldnames]
+
             if 'DELETAR' not in reader.fieldnames:
                 logging.error(f"❌ A coluna 'DELETAR' não foi encontrada no arquivo '{file_path}'.")
                 return None
@@ -103,24 +109,16 @@ def read_and_prepare_csv(file_path='audit_objetos_para_exclusao.csv'):
         return None
 
 def confirm_deletion(objects_to_delete):
-    """Displays a detailed summary table and asks for final user confirmation."""
     print("\n--- RESUMO DA EXCLUSÃO ---")
     print("O script irá deletar permanentemente os seguintes objetos:")
     if not objects_to_delete: return False
-
-    # Simple table print for brevity
     for item in objects_to_delete:
         print(f"  - TIPO: {item.get('OBJECT_TYPE', 'N/A')}, NOME: {item.get('DISPLAY_NAME', 'N/A')}, ID/API_NAME: {item.get('ID_OR_API_NAME', 'N/A')}")
-
     print("\n---------------------------------")
     print(f"Total de objetos a serem deletados: {len(objects_to_delete)}")
     print("\n⚠️  ATENÇÃO: ESTA AÇÃO É IRREVERSÍVEL! ⚠️")
     confirmation = input("Para confirmar a exclusão, digite 'CONFIRMAR' e pressione Enter: ")
     return confirmation.strip().upper() == 'CONFIRMAR'
-
-def normalize_api_name(name):
-    if not isinstance(name, str): return ""
-    return name.removesuffix('__dlm').removesuffix('__cio')
 
 async def get_tooling_ids(session, semaphore, base_url, object_api_name, developer_names):
     if not developer_names: return {}
@@ -152,6 +150,9 @@ async def delete_record(session, semaphore, url, item, results_list):
             if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
             async with session.delete(url, **kwargs) as response:
                 response_text = await response.text()
+                # ALTERAÇÃO: Logando a resposta completa da API para depuração
+                logging.info(f"Resposta da API para '{api_name}': Status={response.status}, Corpo={response_text}")
+                
                 if response.status in [200, 204]:
                     results_list.append({'status': '✅ Sucesso', 'name': display_name, 'message': f"Objeto '{api_name}' deletado."})
                 else:
@@ -185,44 +186,50 @@ async def main():
         delete_order = ['ACTIVATION', 'SEGMENT', 'DATA_STREAM', 'DMO', 'CALCULATED_INSIGHT']
         
         for object_type in delete_order:
-            if object_type not in grouped_objects: continue
+            # Normaliza o tipo de objeto lido do CSV para corresponder à chave
+            items_to_process = grouped_objects.get(object_type) or grouped_objects.get(object_type.replace('_', ' '))
+            if not items_to_process:
+                continue
 
-            items_to_process = grouped_objects[object_type]
             logging.info(f"Processando {len(items_to_process)} objetos do tipo: {object_type}")
-
+            
+            # LÓGICA RESTAURADA: Usando DELETION_IDENTIFIER consistentemente.
             if object_type == 'ACTIVATION':
                 for item in items_to_process:
-                    url = f"{instance_url}/services/data/{API_VERSION}/ssot/activations/{item['DELETION_IDENTIFIER']}"
+                    identifier = item['DELETION_IDENTIFIER']
+                    url = f"{instance_url}/services/data/{API_VERSION}/ssot/activations/{identifier}"
                     deletion_tasks.append(delete_record(session, semaphore, url, item, results))
 
             elif object_type == 'SEGMENT':
                 for item in items_to_process:
-                    url = f"{instance_url}/services/data/{API_VERSION}/ssot/segments/{item['DELETION_IDENTIFIER']}"
+                    identifier = item['DELETION_IDENTIFIER']
+                    url = f"{instance_url}/services/data/{API_VERSION}/ssot/segments/{identifier}"
                     deletion_tasks.append(delete_record(session, semaphore, url, item, results))
 
             elif object_type == 'DATA_STREAM':
                 for item in items_to_process:
-                    url = f"{instance_url}/services/data/{API_VERSION}/ssot/data-streams/{item['DELETION_IDENTIFIER']}?shouldDeleteDataLakeObject=true"
+                    identifier = item['DELETION_IDENTIFIER']
+                    url = f"{instance_url}/services/data/{API_VERSION}/ssot/data-streams/{identifier}?shouldDeleteDataLakeObject=true"
                     deletion_tasks.append(delete_record(session, semaphore, url, item, results))
 
             elif object_type == 'CALCULATED_INSIGHT':
                 for item in items_to_process:
-                    url = f"{instance_url}/services/data/{API_VERSION}/ssot/calculated-insights/{item['DELETION_IDENTIFIER']}"
+                    identifier = item['DELETION_IDENTIFIER']
+                    url = f"{instance_url}/services/data/{API_VERSION}/ssot/calculated-insights/{identifier}"
                     deletion_tasks.append(delete_record(session, semaphore, url, item, results))
             
             elif object_type == 'DMO':
-                dmo_names_to_delete = [item['DELETION_IDENTIFIER'] for item in items_to_process]
-                
-                dmo_ids = await get_tooling_ids(session, semaphore, instance_url, 'MktDataModelObject', dmo_names_to_delete)
+                dmo_api_names = [item['DELETION_IDENTIFIER'] for item in items_to_process]
+                dmo_ids = await get_tooling_ids(session, semaphore, instance_url, 'MktDataModelObject', dmo_api_names)
                 
                 for item in items_to_process:
-                    original_name = item['DELETION_IDENTIFIER']
-                    if original_name in dmo_ids:
-                        dmo_id = dmo_ids[original_name]
+                    api_name = item['DELETION_IDENTIFIER']
+                    if api_name in dmo_ids:
+                        dmo_id = dmo_ids[api_name]
                         url = f"{instance_url}/services/data/{API_VERSION}/tooling/sobjects/MktDataModelObject/{dmo_id}"
                         deletion_tasks.append(delete_record(session, semaphore, url, item, results))
                     else:
-                        results.append({'status': '❌ Falha', 'name': item['DISPLAY_NAME'], 'message': f"Não foi possível encontrar o ID para o DMO '{original_name}'."})
+                        results.append({'status': '❌ Falha', 'name': item['DISPLAY_NAME'], 'message': f"Não foi possível encontrar o ID para o DMO '{api_name}'."})
             
         await asyncio.gather(*deletion_tasks)
 
