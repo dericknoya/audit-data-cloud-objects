@@ -1,45 +1,4 @@
 """
-Este script audita uma instância do Salesforce Data Cloud para identificar 
-campos de DMOs (Data Model Objects) utilizados e não utilizados.
-
-Versão: 18.3 (Correção de Falsos Negativos)
-
-================================================================================
-REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
-================================================================================
-
-Este script gera dois relatórios para fornecer uma visão completa do uso dos 
-campos de DMOs customizados. As regras abaixo definem como um campo é 
-classificado em cada relatório.
-
---------------------------------------------------------------------------------
-REGRAS PARA UM CAMPO SER CONSIDERADO "UTILIZADO"
---------------------------------------------------------------------------------
-Um campo é listado no relatório 'audit_campos_dmo_utilizados.csv' se UMA OU MAIS 
-das seguintes condições for verdadeira:
-
-1.  É encontrado nos critérios de pelo menos um **Segmento**.
-2.  É encontrado em qualquer parte da configuração de pelo menos uma **Ativação**.
-3.  É encontrado em qualquer parte da definição de pelo menos um **Calculated Insight**.
-4.  É encontrado na definição de um **Ponto de Contato de Ativação** (MktSgmntActvtnContactPoint).
-5.  Seu DMO pai foi criado **nos últimos 90 dias** (regra de carência para novos 
-    objetos que ainda não foram implementados em outras áreas).
-
---------------------------------------------------------------------------------
-REGRAS PARA UM CAMPO SER CONSIDERADO "NÃO UTILIZADO"
---------------------------------------------------------------------------------
-Um campo é listado no relatório 'audit_campos_dmo_nao_utilizados.csv' SOMENTE 
-SE TODAS as seguintes condições forem verdadeiras:
-
-1.  **NÃO é encontrado** em nenhum Segmento, Ativação, Calculated Insight ou 
-    Ponto de Contato de Ativação.
-2.  Seu DMO pai foi criado **há mais de 90 dias**.
-3.  O campo e seu DMO **não são** objetos de sistema do Salesforce (o script 
-    ignora nomes com prefixos como 'ssot__', 'unified__', 'aa_', 'aal_', etc.).
-
-================================================================================
-"""
-"""
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
 Versão: 10.2 (Sincronização Final de Regras)
@@ -235,7 +194,6 @@ async def fetch_users_by_id(session, semaphore, user_ids):
     for record_list in results: all_users.extend(record_list)
     return all_users
 
-
 # --- Main Audit Logic ---
 async def main():
     auth_data = get_access_token()
@@ -266,6 +224,7 @@ async def main():
         ]
         results = await tqdm.gather(*initial_tasks, desc="Coletando metadados iniciais")
         logging.info("✅ Coleta inicial de metadados concluída.")
+        # NOVO: Desempacotando o novo resultado
         dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions, contact_point_usages = results
         
         dmo_creation_dates = {rec['DeveloperName']: rec['CreatedDate'] for rec in dmo_tooling_data if rec.get('DeveloperName')}
@@ -303,6 +262,7 @@ async def main():
         thirty_days_ago = now - timedelta(days=30)
         ninety_days_ago = now - timedelta(days=90)
         
+        # ALTERADO: Adicionados prefixos 'aa_' e 'aal_'
         dmo_prefixes_to_exclude = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
         
         dmos_used_by_segments = {normalize_api_name(s.get('SegmentMembershipTable')) for s in segments if s.get('SegmentMembershipTable')}
@@ -317,6 +277,7 @@ async def main():
         for da in data_actions:
             find_items_in_criteria(da, 'developerName', dmos_used_in_data_actions)
             
+        # NOVO: Analisando uso de DMOs nos Pontos de Contato
         dmos_used_in_contact_points = set()
         for cp in contact_point_usages:
             find_items_in_criteria(cp.get('ContactPointPath'), 'developerName', dmos_used_in_contact_points)
@@ -396,13 +357,25 @@ async def main():
         for ds in data_streams:
             last_updated = parse_sf_date(ds.get('lastIngestDate'))
             if not last_updated or last_updated < thirty_days_ago:
-                # ... Lógica de append para Data Streams ...
+                days_inactive = days_since(last_updated)
+                ds_name = ds.get('name'); ds_id = ds.get('id')
+                creator_name = user_id_to_name_map.get(ds.get('createdById'), 'Desconhecido')
+                if not ds.get('mappings'):
+                    reason = "Inativo (sem ingestão > 30d e sem mapeamentos)"
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_id, 'DISPLAY_NAME': ds_name, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_name})
+                else:
+                    reason = "Inativo (sem ingestão > 30d, mas possui mapeamentos)"
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_id, 'DISPLAY_NAME': ds_name, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_name})
         
         logging.info("Auditando Calculated Insights...")
         for ci in calculated_insights:
             last_processed = parse_sf_date(ci.get('lastSuccessfulProcessingDate'))
             if not last_processed or last_processed < ninety_days_ago:
-                # ... Lógica de append para Calculated Insights ...
+                days_inactive = days_since(last_processed)
+                ci_name = ci.get('name')
+                reason = "Inativo (último processamento bem-sucedido > 90d)"
+                creator_name = user_id_to_name_map.get(ci.get('createdById'), 'Desconhecido')
+                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ci_name, 'DISPLAY_NAME': ci.get('displayName'), 'OBJECT_TYPE': 'CALCULATED_INSIGHT', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Último Processamento', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ci_name})
 
         if audit_results:
             csv_file = f"audit_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
