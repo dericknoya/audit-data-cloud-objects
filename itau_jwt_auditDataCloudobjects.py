@@ -1,14 +1,51 @@
 """
+Este script audita uma instância do Salesforce Data Cloud para identificar 
+campos de DMOs (Data Model Objects) utilizados e não utilizados.
+
+================================================================================
+REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
+================================================================================
+
+Este script gera dois relatórios para fornecer uma visão completa do uso dos 
+campos de DMOs customizados. As regras abaixo definem como um campo é 
+classificado em cada relatório.
+
+--------------------------------------------------------------------------------
+REGRAS PARA UM CAMPO SER CONSIDERADO "UTILIZADO"
+--------------------------------------------------------------------------------
+Um campo é listado no relatório 'audit_campos_dmo_utilizados.csv' se UMA OU MAIS 
+das seguintes condições for verdadeira:
+
+1.  É encontrado nos critérios de pelo menos um **Segmento**.
+2.  É encontrado em qualquer parte da configuração de pelo menos uma **Ativação**.
+3.  É encontrado em qualquer parte da definição de pelo menos um **Calculated Insight**.
+4.  É encontrado na definição de um **Ponto de Contato de Ativação** (MktSgmntActvtnContactPoint).
+5.  Seu DMO pai foi criado **nos últimos 90 dias** (regra de carência para novos 
+    objetos que ainda não foram implementados em outras áreas).
+
+--------------------------------------------------------------------------------
+REGRAS PARA UM CAMPO SER CONSIDERADO "NÃO UTILIZADO"
+--------------------------------------------------------------------------------
+Um campo é listado no relatório 'audit_campos_dmo_nao_utilizados.csv' SOMENTE 
+SE TODAS as seguintes condições forem verdadeiras:
+
+1.  **NÃO é encontrado** em nenhum Segmento, Ativação, Calculated Insight ou 
+    Ponto de Contato de Ativação.
+2.  Seu DMO pai foi criado **há mais de 90 dias**.
+3.  O campo e seu DMO **não são** objetos de sistema do Salesforce (o script 
+    ignora nomes com prefixos como 'ssot__', 'unified__', 'aa_', 'aal_', etc.).
+
+================================================================================
+"""
+"""
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.2 (Sincronização Final de Regras)
-- SINCRONIZAÇÃO: Aplica as regras de negócio do script de campos ao script de objetos.
-- Adiciona a auditoria do objeto MktSgmntActvtnContactPoint. DMOs utilizados
-  neste objeto não são mais considerados órfãos.
-- Expande a lista de prefixos de DMOs a serem ignorados para incluir 'aa_' e 'aal_'.
-- Mantém a busca por 'Name' no objeto User, conforme a versão 10.1.
+Versão: 10.3 (Nome de Arquivo Fixo)
+- ALTERAÇÃO: O nome do arquivo CSV de saída foi fixado para 'audit_objetos_para_exclusao.csv'
+  para facilitar a integração com o script de exclusão.
+- Mantém todas as funcionalidades e correções anteriores.
 
-Gera CSV final: audit_results_{timestamp}.csv
+Gera CSV final: audit_objetos_para_exclusao.csv
 """
 import os
 import time
@@ -184,7 +221,7 @@ async def fetch_records_in_bulk(session, semaphore, object_name, fields, record_
 async def fetch_users_by_id(session, semaphore, user_ids):
     if not user_ids: return []
     all_users, tasks = [], []
-    field_str = "Id, Name" # Mantendo 'Name' conforme v10.1
+    field_str = "Id, Name" 
     for i in range(0, len(user_ids), CHUNK_SIZE):
         chunk = user_ids[i:i + CHUNK_SIZE]; formatted_ids = "','".join(chunk)
         query = f"SELECT {field_str} FROM User WHERE Id IN ('{formatted_ids}')"
@@ -208,7 +245,6 @@ async def main():
         dmo_soql_query = "SELECT DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
         activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
-        # NOVO: Query para buscar os Pontos de Contato de Ativação
         contact_point_query = "SELECT Id, ContactPointFilterExpression, ContactPointPath, CreatedById FROM MktSgmntActvtnContactPoint"
         
         initial_tasks = [
@@ -224,7 +260,6 @@ async def main():
         ]
         results = await tqdm.gather(*initial_tasks, desc="Coletando metadados iniciais")
         logging.info("✅ Coleta inicial de metadados concluída.")
-        # NOVO: Desempacotando o novo resultado
         dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions, contact_point_usages = results
         
         dmo_creation_dates = {rec['DeveloperName']: rec['CreatedDate'] for rec in dmo_tooling_data if rec.get('DeveloperName')}
@@ -262,7 +297,6 @@ async def main():
         thirty_days_ago = now - timedelta(days=30)
         ninety_days_ago = now - timedelta(days=90)
         
-        # ALTERADO: Adicionados prefixos 'aa_' e 'aal_'
         dmo_prefixes_to_exclude = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
         
         dmos_used_by_segments = {normalize_api_name(s.get('SegmentMembershipTable')) for s in segments if s.get('SegmentMembershipTable')}
@@ -277,7 +311,6 @@ async def main():
         for da in data_actions:
             find_items_in_criteria(da, 'developerName', dmos_used_in_data_actions)
             
-        # NOVO: Analisando uso de DMOs nos Pontos de Contato
         dmos_used_in_contact_points = set()
         for cp in contact_point_usages:
             find_items_in_criteria(cp.get('ContactPointPath'), 'developerName', dmos_used_in_contact_points)
@@ -301,19 +334,15 @@ async def main():
         
         logging.info("Auditando Segmentos...")
         for seg in tqdm(segments, desc="Auditando Segmentos"):
-            seg_id = str(get_segment_id(seg) or '')[:15]
+            seg_id = str(get_segment_id(seg) or '')[:15];
             if not seg_id: continue
-            
             last_pub_date = segment_publications.get(seg_id)
-            is_published_recently = last_pub_date and last_pub_date >= thirty_days_ago
-            
-            if not is_published_recently:
+            if not (last_pub_date and last_pub_date >= thirty_days_ago):
                 is_used_as_filter = seg_id in nested_segment_parents
                 days_since_pub = days_since(last_pub_date)
                 seg_name = get_segment_name(seg)
                 creator_name = user_id_to_name_map.get(seg.get('CreatedById'), 'Desconhecido')
                 status = seg.get('SegmentStatus', 'N/A')
-                
                 if not is_used_as_filter:
                     deletable_segment_ids.add(seg_id)
                     reason = 'Inativo (sem atividade recente e não é filtro aninhado)'
@@ -334,14 +363,11 @@ async def main():
 
         logging.info("Auditando Data Model Objects (DMOs)...")
         dmo_creators = {rec['DeveloperName']: rec.get('CreatedById') for rec in dmo_tooling_data}
-        all_used_dmos = (dmos_used_by_segments | dmos_used_by_data_graphs | dmos_used_by_ci_relationships | 
-                         dmos_used_in_activations | dmos_used_in_data_actions | dmos_used_in_segment_criteria |
-                         dmos_used_in_contact_points)
+        all_used_dmos = (dmos_used_by_segments | dmos_used_by_data_graphs | dmos_used_by_ci_relationships | dmos_used_in_activations | dmos_used_in_data_actions | dmos_used_in_segment_criteria | dmos_used_in_contact_points)
         for dmo in dm_objects:
             dmo_name = dmo.get('name', '')
             if not dmo_name.endswith('__dlm') or any(dmo_name.lower().startswith(p) for p in dmo_prefixes_to_exclude):
                 continue
-            
             normalized_dmo_name = normalize_api_name(dmo_name)
             if normalized_dmo_name not in all_used_dmos:
                 created_date = parse_sf_date(dmo_creation_dates.get(dmo_name))
@@ -378,7 +404,8 @@ async def main():
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ci_name, 'DISPLAY_NAME': ci.get('displayName'), 'OBJECT_TYPE': 'CALCULATED_INSIGHT', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Último Processamento', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ci_name})
 
         if audit_results:
-            csv_file = f"audit_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            # ALTERAÇÃO: Nome do arquivo de saída fixado
+            csv_file = "audit_objetos_para_exclusao.csv"
             with open(csv_file, mode='w', newline='', encoding='utf-8') as f:
                 fieldnames = ['DELETAR', 'ID_OR_API_NAME', 'DISPLAY_NAME', 'OBJECT_TYPE', 'STATUS', 'REASON', 'TIPO_ATIVIDADE', 'DIAS_ATIVIDADE', 'CREATED_BY_NAME', 'DELETION_IDENTIFIER']
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
