@@ -40,12 +40,12 @@ SE TODAS as seguintes condições forem verdadeiras:
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.5 (Correção Final de Identificador de DMO)
-- CORREÇÃO DEFINITIVA: Garante que a coluna 'DELETION_IDENTIFIER' para DMOs seja
-  preenchida com o Id do objeto obtido via Tooling API, que é o valor correto
-  esperado pelo script de exclusão.
-- OTIMIZAÇÃO: Mantém a consulta otimizada na Tooling API para buscar todos os
-  dados do DMO em uma única chamada.
+Versão: 10.4 (Otimização de Coleta e Correção de Identificador de DMO)
+- OTIMIZAÇÃO: Ajusta a consulta na Tooling API para buscar o Id e o DeveloperName
+  dos DMOs em uma única chamada, eliminando a necessidade de múltiplas requisições.
+- CORREÇÃO: Popula a coluna 'DELETION_IDENTIFIER' para DMOs com o Id do objeto,
+  que é o valor correto esperado pelo script de exclusão.
+- Mantém todas as funcionalidades e correções anteriores da base v10.3.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -95,7 +95,7 @@ def get_access_token():
     except FileNotFoundError:
         logging.error("❌ 'private.pem' file not found."); raise
     payload = {'iss': sf_client_id, 'sub': sf_username, 'aud': sf_audience, 'exp': int(time.time()) + 300}
-    assertion = jwt.encode(payload, private_key, algorithm='RS265')
+    assertion = jwt.encode(payload, private_key, algorithm='RS256')
     params = {'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': assertion}
     token_url = f"{sf_login_url}/services/oauth2/token"
     try:
@@ -244,7 +244,6 @@ async def main():
     async with aiohttp.ClientSession(headers=headers, base_url=instance_url, connector=aiohttp.TCPConnector(ssl=VERIFY_SSL)) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
         
-        # ALTERAÇÃO: Adicionado 'Id' à consulta para otimização
         dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
         activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
@@ -263,7 +262,6 @@ async def main():
         logging.info("✅ Coleta inicial de metadados concluída.")
         dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions = results
         
-        # NOVO: Criando um mapa para fácil acesso aos dados dos DMOs, incluindo o ID.
         dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
         logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos e {len(activation_attributes)} Atributos de Ativação carregados.")
