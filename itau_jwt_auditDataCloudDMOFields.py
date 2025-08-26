@@ -2,7 +2,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 19.3 (Correção de Lógica e Adição de Relatório de Depuração)
+Versão: 19.4 (Correção no Campo de Usuário)
 
 ================================================================================
 REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
@@ -169,7 +169,8 @@ async def fetch_records_in_bulk(session, semaphore, object_name, fields, record_
 async def fetch_users_by_id(session, semaphore, user_ids):
     if not user_ids: return []
     all_users, tasks = [], []
-    field_str = "Id, Name"
+    # ALTERAÇÃO: Trocando o campo 'Name' por 'Username'
+    field_str = "Id, Username"
     for i in range(0, len(user_ids), CHUNK_SIZE):
         chunk = user_ids[i:i + CHUNK_SIZE]; formatted_ids = "','".join(chunk)
         query = f"SELECT {field_str} FROM User WHERE Id IN ('{formatted_ids}')"
@@ -220,7 +221,8 @@ async def audit_dmo_fields():
         if creator_ids:
              logging.info(f"--- Etapa 3: Buscando nomes de {len(creator_ids)} criadores de DMOs... ---")
              user_records = await fetch_users_by_id(session, semaphore, list(creator_ids))
-             user_id_to_name_map = {user['Id']: user['Name'] for user in user_records}
+             # ALTERAÇÃO: Mapeando do campo 'Username'
+             user_id_to_name_map = {user['Id']: user.get('Username', 'Nome não encontrado') for user in user_records}
              logging.info("✅ Nomes de criadores coletados.")
     
     logging.info("\n📊 Dados coletados. Analisando o uso dos campos...")
@@ -228,24 +230,16 @@ async def audit_dmo_fields():
     used_fields_details = defaultdict(list)
     field_name_pattern = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
     
-    # NOVO: Lista para armazenar dados de depuração
     debug_data = []
 
     def find_fields_with_regex(content_string, usage_type, object_name, object_api_name):
         if not content_string: return
-        # Adiciona o conteúdo bruto ao CSV de depuração
-        debug_data.append({
-            'SOURCE_OBJECT_TYPE': usage_type,
-            'SOURCE_OBJECT_ID': object_api_name,
-            'SOURCE_OBJECT_NAME': object_name,
-            'RAW_CONTENT': content_string
-        })
+        debug_data.append({'SOURCE_OBJECT_TYPE': usage_type, 'SOURCE_OBJECT_ID': object_api_name, 'SOURCE_OBJECT_NAME': object_name, 'RAW_CONTENT': content_string})
         for match in field_name_pattern.finditer(html.unescape(str(content_string))):
             field_name = match.group(1)
             usage_context = {"usage_type": usage_type, "object_name": object_name, "object_api_name": object_api_name}
             used_fields_details[field_name].append(usage_context)
 
-    # CORREÇÃO: Analisar os campos de critério DIRETAMENTE
     for seg in tqdm(segments_list, desc="Analisando Segmentos"):
         find_fields_with_regex(seg.get('IncludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'))
         find_fields_with_regex(seg.get('ExcludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'))
@@ -330,7 +324,6 @@ async def audit_dmo_fields():
     else:
         logging.info("ℹ️ Nenhum uso de campo de DMO customizado foi detectado.")
 
-    # NOVO: Gerando o arquivo de depuração
     if debug_data:
         debug_file_path = 'debug_dados_de_uso.csv'
         debug_header = ['SOURCE_OBJECT_TYPE', 'SOURCE_OBJECT_ID', 'SOURCE_OBJECT_NAME', 'RAW_CONTENT']
