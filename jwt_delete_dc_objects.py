@@ -2,14 +2,14 @@
 Este script realiza uma exclusão em massa de objetos do Data Cloud com base em um
 arquivo CSV aprovado manualmente.
 
-Version: 2.8 (Depuração de Resposta e Correção de Leitura de CSV)
-- CORREÇÃO: Ajusta a leitura do arquivo CSV para usar a codificação 'utf-8-sig',
-  resolvendo o erro 'KeyError: DELETION_IDENTIFIER' que ocorre com arquivos
-  salvos no Excel.
-- MELHORIA DE DEPURAÇÃO: O script agora imprime no log a resposta completa (RAW)
-  da API para cada tentativa de exclusão, permitindo uma análise detalhada do retorno.
-- LÓGICA RESTAURADA: Mantém o uso consistente da coluna 'DELETION_IDENTIFIER'
-  para todos os tipos de objetos, conforme a lógica original.
+Version: 3.0 (Correção na Deleção de DMOs)
+- CORREÇÃO CRÍTICA: Altera o endpoint de exclusão de DMOs para usar a API SSOT
+  ('/ssot/data-model-objects/{DeveloperName}') em vez da Tooling API, com base
+  em testes e descobertas. Isso simplifica o script, remove a necessidade de
+  buscar o ID do objeto e corrige a falha de exclusão original.
+- LIMPEZA DE CÓDIGO: A função 'get_tooling_ids' e importações relacionadas foram
+  removidas por não serem mais necessárias.
+- MANTÉM: Ajuste de leitura do CSV com 'utf-8-sig' e log detalhado da API.
 
 AVISO: ESTE SCRIPT REALIZA AÇÕES DE EXCLUSÃO IRREVERSÍVEIS.
 USE COM CUIDADO E APENAS APÓS REVISAR CUIDADOSAMENTE O ARQUIVO CSV.
@@ -18,7 +18,6 @@ import os
 import csv
 import asyncio
 import time
-from urllib.parse import urlencode, urljoin
 import sys
 import logging
 from collections import defaultdict
@@ -48,7 +47,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 def get_access_token():
     """Authenticates with Salesforce using the JWT Bearer Flow."""
     logging.info("🔑 Authenticating with Salesforce using JWT Bearer Flow...")
-    
+
     sf_client_id = os.getenv("SF_CLIENT_ID")
     sf_username = os.getenv("SF_USERNAME")
     sf_audience = os.getenv("SF_AUDIENCE")
@@ -88,7 +87,7 @@ def get_access_token():
 # --- Helper Functions ---
 def read_and_prepare_csv(file_path='audit_objetos_para_exclusao.csv'):
     try:
-        # ALTERAÇÃO CRÍTICA: Usando 'utf-8-sig' para ignorar o BOM do Excel.
+        # Usando 'utf-8-sig' para ignorar o BOM (Byte Order Mark) do Excel.
         with open(file_path, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             # Remove espaços em branco dos nomes das colunas para maior robustez
@@ -113,44 +112,23 @@ def confirm_deletion(objects_to_delete):
     print("O script irá deletar permanentemente os seguintes objetos:")
     if not objects_to_delete: return False
     for item in objects_to_delete:
-        print(f"  - TIPO: {item.get('OBJECT_TYPE', 'N/A')}, NOME: {item.get('DISPLAY_NAME', 'N/A')}, ID/API_NAME: {item.get('ID_OR_API_NAME', 'N/A')}")
+        print(f"  - TIPO: {item.get('OBJECT_TYPE', 'N/A')}, NOME: {item.get('DISPLAY_NAME', 'N/A')}, ID/API_NAME: {item.get('DELETION_IDENTIFIER', 'N/A')}")
     print("\n---------------------------------")
     print(f"Total de objetos a serem deletados: {len(objects_to_delete)}")
     print("\n⚠️  ATENÇÃO: ESTA AÇÃO É IRREVERSÍVEL! ⚠️")
     confirmation = input("Para confirmar a exclusão, digite 'CONFIRMAR' e pressione Enter: ")
     return confirmation.strip().upper() == 'CONFIRMAR'
 
-async def get_tooling_ids(session, semaphore, base_url, object_api_name, developer_names):
-    if not developer_names: return {}
-    
-    formatted_names = ",".join([f"'{name}'" for name in developer_names])
-    soql_query = f"SELECT Id, DeveloperName FROM {object_api_name} WHERE DeveloperName IN ({formatted_names})"
-    
-    params = {'q': soql_query}
-    url = f"{base_url}/services/data/{API_VERSION}/tooling/query?{urlencode(params)}"
-    
-    try:
-        async with semaphore:
-            kwargs = {'ssl': VERIFY_SSL}
-            if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
-            async with session.get(url, **kwargs) as response:
-                response.raise_for_status()
-                data = await response.json()
-                return {record['DeveloperName']: record['Id'] for record in data.get('records', [])}
-    except aiohttp.ClientError as e:
-        logging.error(f"❌ Erro ao buscar IDs para {object_api_name}: {e}")
-        return {}
-
 async def delete_record(session, semaphore, url, item, results_list):
     display_name = item.get('DISPLAY_NAME')
-    api_name = item.get('ID_OR_API_NAME')
+    api_name = item.get('DELETION_IDENTIFIER')
     try:
         async with semaphore:
             kwargs = {'ssl': VERIFY_SSL}
             if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
             async with session.delete(url, **kwargs) as response:
                 response_text = await response.text()
-                # ALTERAÇÃO: Logando a resposta completa da API para depuração
+                # Logando a resposta completa da API para depuração
                 logging.info(f"Resposta da API para '{api_name}': Status={response.status}, Corpo={response_text}")
                 
                 if response.status in [200, 204]:
@@ -193,43 +171,39 @@ async def main():
 
             logging.info(f"Processando {len(items_to_process)} objetos do tipo: {object_type}")
             
-            # LÓGICA RESTAURADA: Usando DELETION_IDENTIFIER consistentemente.
+            base_ssot_url = f"{instance_url}/services/data/{API_VERSION}/ssot"
+
             if object_type == 'ACTIVATION':
                 for item in items_to_process:
                     identifier = item['DELETION_IDENTIFIER']
-                    url = f"{instance_url}/services/data/{API_VERSION}/ssot/activations/{identifier}"
+                    url = f"{base_ssot_url}/activations/{identifier}"
                     deletion_tasks.append(delete_record(session, semaphore, url, item, results))
 
             elif object_type == 'SEGMENT':
                 for item in items_to_process:
                     identifier = item['DELETION_IDENTIFIER']
-                    url = f"{instance_url}/services/data/{API_VERSION}/ssot/segments/{identifier}"
+                    url = f"{base_ssot_url}/segments/{identifier}"
                     deletion_tasks.append(delete_record(session, semaphore, url, item, results))
 
             elif object_type == 'DATA_STREAM':
                 for item in items_to_process:
                     identifier = item['DELETION_IDENTIFIER']
-                    url = f"{instance_url}/services/data/{API_VERSION}/ssot/data-streams/{identifier}?shouldDeleteDataLakeObject=true"
+                    url = f"{base_ssot_url}/data-streams/{identifier}?shouldDeleteDataLakeObject=true"
                     deletion_tasks.append(delete_record(session, semaphore, url, item, results))
 
             elif object_type == 'CALCULATED_INSIGHT':
                 for item in items_to_process:
                     identifier = item['DELETION_IDENTIFIER']
-                    url = f"{instance_url}/services/data/{API_VERSION}/ssot/calculated-insights/{identifier}"
+                    url = f"{base_ssot_url}/calculated-insights/{identifier}"
                     deletion_tasks.append(delete_record(session, semaphore, url, item, results))
             
+            # --- AJUSTE CRÍTICO AQUI ---
             elif object_type == 'DMO':
-                dmo_api_names = [item['DELETION_IDENTIFIER'] for item in items_to_process]
-                dmo_ids = await get_tooling_ids(session, semaphore, instance_url, 'MktDataModelObject', dmo_api_names)
-                
                 for item in items_to_process:
-                    api_name = item['DELETION_IDENTIFIER']
-                    if api_name in dmo_ids:
-                        dmo_id = dmo_ids[api_name]
-                        url = f"{instance_url}/services/data/{API_VERSION}/tooling/sobjects/MktDataModelObject/{dmo_id}"
-                        deletion_tasks.append(delete_record(session, semaphore, url, item, results))
-                    else:
-                        results.append({'status': '❌ Falha', 'name': item['DISPLAY_NAME'], 'message': f"Não foi possível encontrar o ID para o DMO '{api_name}'."})
+                    # Usa o DeveloperName diretamente no endpoint correto da API SSOT
+                    identifier = item['DELETION_IDENTIFIER']
+                    url = f"{base_ssot_url}/data-model-objects/{identifier}"
+                    deletion_tasks.append(delete_record(session, semaphore, url, item, results))
             
         await asyncio.gather(*deletion_tasks)
 
@@ -237,7 +211,10 @@ async def main():
     print("\n--- RELATÓRIO FINAL DA EXCLUSÃO ---")
     success_count = sum(1 for r in results if r['status'] == '✅ Sucesso')
     failure_count = len(results) - success_count
-    for result in results: print(f"{result['status']} - {result['name']}: {result['message']}")
+    # Ordena os resultados para mostrar falhas primeiro
+    results.sort(key=lambda x: x['status'], reverse=True) 
+    for result in results: 
+        print(f"{result['status']} - {result['name']}: {result['message']}")
     print("\n--- RESUMO ---")
     print(f"Total de objetos deletados com sucesso: {success_count}")
     print(f"Total de falhas na exclusão: {failure_count}")

@@ -40,12 +40,12 @@ SE TODAS as seguintes condições forem verdadeiras:
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.4 (Otimização de Coleta e Correção de Identificador de DMO)
-- OTIMIZAÇÃO: Ajusta a consulta na Tooling API para buscar o Id e o DeveloperName
-  dos DMOs em uma única chamada, eliminando a necessidade de múltiplas requisições.
-- CORREÇÃO: Popula a coluna 'DELETION_IDENTIFIER' para DMOs com o Id do objeto,
-  que é o valor correto esperado pelo script de exclusão.
-- Mantém todas as funcionalidades e correções anteriores da base v10.3.
+Versão: 10.7 (Versão Final Consolidada)
+- Consolida todas as correções de API e lógica de dados desenvolvidas.
+- Garante que a coluna 'DELETION_IDENTIFIER' para DMOs seja preenchida com o
+  DeveloperName, que é o valor correto para o endpoint de exclusão /ssot/.
+- Inclui a auditoria de MktSgmntActvtnContactPoint e a exclusão de prefixos de DMO.
+- Mantém a busca por 'Name' no objeto User e a resiliência a erros de rede.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -75,6 +75,8 @@ USE_PROXY = True
 PROXY_URL = os.getenv("PROXY_URL")
 VERIFY_SSL = False
 CHUNK_SIZE = 400
+MAX_RETRIES = 3
+RETRY_DELAY = 5 # segundos
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -109,34 +111,43 @@ def get_access_token():
 
 async def fetch_api_data(session, relative_url, semaphore, key_name=None):
     async with semaphore:
-        all_records = []
-        current_url = relative_url
-        is_tooling_api = "/tooling" in current_url
-        try:
-            while current_url:
-                kwargs = {'ssl': VERIFY_SSL}
-                if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
-                async with session.get(current_url, **kwargs) as response:
-                    response.raise_for_status()
-                    data = await response.json()
-                    if key_name:
-                        all_records.extend(data.get(key_name, []))
-                        next_page_url = data.get('nextRecordsUrl')
-                        query_locator = data.get('queryLocator')
-                        if next_page_url:
-                            current_url = urljoin(str(session._base_url), next_page_url)
-                        elif is_tooling_api and query_locator and not data.get('done', True):
-                            version = "v60.0"; match = re.search(r'/(v\d+\.\d+)/', str(response.url))
-                            if match: version = match.group(1)
-                            current_url = f"/services/data/{version}/tooling/query/{query_locator}"
-                        else:
-                            current_url = None
-                    else: 
-                        return data
-            return all_records
-        except aiohttp.ClientError as e:
-            logging.error(f"❌ Error fetching {current_url}: {e}")
-            return [] if key_name else {}
+        for attempt in range(MAX_RETRIES):
+            try:
+                all_records = []
+                current_url = relative_url
+                is_tooling_api = "/tooling" in current_url
+                
+                while current_url:
+                    kwargs = {'ssl': VERIFY_SSL}
+                    if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
+                    
+                    async with session.get(current_url, **kwargs) as response:
+                        response.raise_for_status()
+                        data = await response.json()
+                        
+                        if key_name:
+                            all_records.extend(data.get(key_name, []))
+                            next_page_url = data.get('nextRecordsUrl')
+                            query_locator = data.get('queryLocator')
+
+                            if next_page_url:
+                                current_url = urljoin(str(session._base_url), next_page_url)
+                            elif is_tooling_api and query_locator and not data.get('done', True):
+                                version = "v60.0"; match = re.search(r'/(v\d+\.\d+)/', str(response.url))
+                                if match: version = match.group(1)
+                                current_url = f"/services/data/{version}/tooling/query/{query_locator}"
+                            else:
+                                current_url = None
+                        else: 
+                            return data
+                return all_records
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt < MAX_RETRIES - 1:
+                    logging.warning(f" Tentativa {attempt + 1} de buscar {relative_url[:50]}... falhou: {e}. Tentando novamente em {RETRY_DELAY}s...")
+                    await asyncio.sleep(RETRY_DELAY)
+                else:
+                    logging.error(f"❌ Todas as {MAX_RETRIES} tentativas falharam para {relative_url[:50]}...: {e}")
+                    raise e
 
 def parse_sf_date(date_str):
     if not date_str: return None
@@ -176,38 +187,40 @@ def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('name') 
 
 async def execute_query_job(session, query, semaphore):
     async with semaphore:
-        job_url_path = "/services/data/v60.0/jobs/query"
-        payload = {"operation": "query", "query": query, "contentType": "CSV"}
-        proxy = PROXY_URL if USE_PROXY and PROXY_URL else None
-        try:
-            async with session.post(job_url_path, data=json.dumps(payload), proxy=proxy, ssl=VERIFY_SSL) as response:
-                response.raise_for_status()
-                job_info = await response.json(); job_id = job_info.get('id')
-                if not job_id: logging.error(f"❌ JobId não retornado para query: {query[:100]}..."); return []
-            job_status_path = f"{job_url_path}/{job_id}"
-            while True:
-                await asyncio.sleep(5)
-                async with session.get(job_status_path, proxy=proxy, ssl=VERIFY_SSL) as resp:
-                    resp.raise_for_status()
-                    status_info = await resp.json(); state = status_info.get('state')
-                    if state == 'JobComplete': break
-                    if state in ['Failed', 'Aborted']: logging.error(f"❌ Job de query {job_id} falhou: {status_info.get('errorMessage')}"); return []
-            results_path = f"{job_status_path}/results"
-            results_headers = {'Accept-Encoding': 'gzip'}
-            async with session.get(results_path, headers=results_headers, proxy=proxy, ssl=VERIFY_SSL) as qr:
-                qr.raise_for_status()
-                content_bytes = await qr.read()
-                csv_text = gzip.decompress(content_bytes).decode('utf-8') if qr.headers.get('Content-Encoding') == 'gzip' else content_bytes.decode('utf-8')
-                lines = csv_text.strip().splitlines()
-                if len(lines) > 1: reader = csv.DictReader(lines); reader.fieldnames = [field.strip('"') for field in reader.fieldnames]; return list(reader)
-                return []
-        except aiohttp.ClientError as e:
-            error_text = "";
-            if hasattr(e, 'response') and e.response:
-                try: error_text = await e.response.text()
-                except Exception: error_text = "[Could not decode error response]"
-            logging.error(f"❌ Erro no job de query: status={getattr(e, 'status', 'N/A')}, message='{e}', response='{error_text}'")
-            return []
+        for attempt in range(MAX_RETRIES):
+            try:
+                job_url_path = "/services/data/v60.0/jobs/query"
+                payload = {"operation": "query", "query": query, "contentType": "CSV"}
+                proxy = PROXY_URL if USE_PROXY and PROXY_URL else None
+                
+                async with session.post(job_url_path, data=json.dumps(payload), proxy=proxy, ssl=VERIFY_SSL) as response:
+                    response.raise_for_status()
+                    job_info = await response.json(); job_id = job_info.get('id')
+                    if not job_id: logging.error(f"❌ JobId não retornado para query: {query[:100]}..."); return []
+                job_status_path = f"{job_url_path}/{job_id}"
+                while True:
+                    await asyncio.sleep(5)
+                    async with session.get(job_status_path, proxy=proxy, ssl=VERIFY_SSL) as resp:
+                        resp.raise_for_status()
+                        status_info = await resp.json(); state = status_info.get('state')
+                        if state == 'JobComplete': break
+                        if state in ['Failed', 'Aborted']: logging.error(f"❌ Job de query {job_id} falhou: {status_info.get('errorMessage')}"); return []
+                results_path = f"{job_status_path}/results"
+                results_headers = {'Accept-Encoding': 'gzip'}
+                async with session.get(results_path, headers=results_headers, proxy=proxy, ssl=VERIFY_SSL) as qr:
+                    qr.raise_for_status()
+                    content_bytes = await qr.read()
+                    csv_text = gzip.decompress(content_bytes).decode('utf-8') if qr.headers.get('Content-Encoding') == 'gzip' else content_bytes.decode('utf-8')
+                    lines = csv_text.strip().splitlines()
+                    if len(lines) > 1: reader = csv.DictReader(lines); reader.fieldnames = [field.strip('"') for field in reader.fieldnames]; return list(reader)
+                    return []
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt < MAX_RETRIES - 1:
+                    logging.warning(f" Tentativa {attempt + 1} do job de query '{query[:50]}...' falhou: {e}. Tentando novamente em {RETRY_DELAY}s...")
+                    await asyncio.sleep(RETRY_DELAY)
+                else:
+                    logging.error(f"❌ Todas as {MAX_RETRIES} tentativas falharam para o job de query '{query[:50]}...': {e}")
+                    raise e
 
 async def fetch_records_in_bulk(session, semaphore, object_name, fields, record_ids):
     if not record_ids: return []
@@ -247,24 +260,38 @@ async def main():
         dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
         activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
+        contact_point_query = "SELECT Id, ContactPointFilterExpression, ContactPointPath, CreatedById FROM MktSgmntActvtnContactPoint"
         
         initial_tasks = [
             fetch_api_data(session, f"/services/data/v60.0/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
-            execute_query_job(session, segment_soql_query, semaphore),
+            fetch_api_data(session, f"/services/data/v60.0/query?{urlencode({'q': segment_soql_query})}", semaphore, 'records'),
             fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
             execute_query_job(session, activation_attributes_query, semaphore),
             fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
             fetch_api_data(session, "/services/data/v60.0/ssot/data-streams", semaphore, 'dataStreams'),
             fetch_api_data(session, f"/services/data/v60.0/ssot/data-graphs/metadata", semaphore, 'dataGraphMetadata'),
             fetch_api_data(session, f"/services/data/v60.0/ssot/data-actions", semaphore, 'dataActions'),
+            execute_query_job(session, contact_point_query, semaphore),
         ]
-        results = await tqdm.gather(*initial_tasks, desc="Coletando metadados iniciais")
-        logging.info("✅ Coleta inicial de metadados concluída.")
-        dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions = results
+        
+        results = await asyncio.gather(*initial_tasks, return_exceptions=True)
+        
+        task_names = ["DMO Tooling", "Segment IDs", "DMO Metadata", "Activation Attributes", "Calculated Insights", "Data Streams", "Data Graphs", "Data Actions", "Contact Points"]
+        final_results = []
+        for i, result in enumerate(results):
+            task_name = task_names[i] if i < len(task_names) else f"Tarefa {i}"
+            if isinstance(result, Exception):
+                logging.error(f"❌ A coleta de '{task_name}' falhou definitivamente: {result}")
+                final_results.append([])
+            else:
+                final_results.append(result)
+
+        logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
+        dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions, contact_point_usages = final_results
         
         dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
-        logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos e {len(activation_attributes)} Atributos de Ativação carregados.")
+        logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
 
         activation_ids = list(set(attr['MarketSegmentActivationId'] for attr in activation_attributes if attr.get('MarketSegmentActivationId')))
         
@@ -281,7 +308,7 @@ async def main():
         logging.info("✅ Detalhes de segmento coletados. Iniciando busca por nomes de criadores...")
 
         all_creator_ids = set()
-        for collection in [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams]:
+        for collection in [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams, contact_point_usages]:
             for item in collection:
                 if creator_id := item.get('CreatedById') or item.get('createdById'):
                     all_creator_ids.add(creator_id)
@@ -297,6 +324,8 @@ async def main():
         thirty_days_ago = now - timedelta(days=30)
         ninety_days_ago = now - timedelta(days=90)
         
+        dmo_prefixes_to_exclude = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
+        
         dmos_used_by_segments = {normalize_api_name(s.get('SegmentMembershipTable')) for s in segments if s.get('SegmentMembershipTable')}
         dmos_used_by_data_graphs = {normalize_api_name(obj.get('developerName')) for dg in data_graphs for obj in [dg.get('dgObject', {})] + dg.get('dgObject', {}).get('relatedObjects', []) if obj.get('developerName')}
         dmos_used_by_ci_relationships = {normalize_api_name(rel.get('fromEntity')) for ci in calculated_insights for rel in ci.get('relationships', []) if rel.get('fromEntity')}
@@ -308,6 +337,11 @@ async def main():
         dmos_used_in_data_actions = set()
         for da in data_actions:
             find_items_in_criteria(da, 'developerName', dmos_used_in_data_actions)
+            
+        dmos_used_in_contact_points = set()
+        for cp in contact_point_usages:
+            find_items_in_criteria(cp.get('ContactPointPath'), 'developerName', dmos_used_in_contact_points)
+            find_items_in_criteria(cp.get('ContactPointFilterExpression'), 'developerName', dmos_used_in_contact_points)
             
         nested_segment_parents = {}
         dmos_used_in_segment_criteria = set()
@@ -355,11 +389,11 @@ async def main():
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': act_id, 'DISPLAY_NAME': act_name, 'OBJECT_TYPE': 'ACTIVATION', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'N/A', 'DIAS_ATIVIDADE': 'N/A', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': act_name})
 
         logging.info("Auditando Data Model Objects (DMOs)...")
-        all_used_dmos = (dmos_used_by_segments | dmos_used_by_data_graphs | dmos_used_by_ci_relationships | dmos_used_in_activations | dmos_used_in_data_actions | dmos_used_in_segment_criteria)
+        all_used_dmos = (dmos_used_by_segments | dmos_used_by_data_graphs | dmos_used_by_ci_relationships | dmos_used_in_activations | dmos_used_in_data_actions | dmos_used_in_segment_criteria | dmos_used_in_contact_points)
         for dmo in dm_objects:
             dmo_name = dmo.get('name', '')
-            if not dmo_name.endswith('__dlm'): continue
-            
+            if not dmo_name.endswith('__dlm') or any(dmo_name.lower().startswith(p) for p in dmo_prefixes_to_exclude):
+                continue
             normalized_dmo_name = normalize_api_name(dmo_name)
             if normalized_dmo_name not in all_used_dmos:
                 dmo_details = dmo_info_map.get(dmo_name, {})
@@ -370,8 +404,8 @@ async def main():
                     display_name = get_dmo_display_name(dmo)
                     creator_id = dmo_details.get('CreatedById')
                     creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
-                    deletion_id = dmo_details.get('Id', dmo_name) 
-                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': dmo_name, 'DISPLAY_NAME': display_name, 'OBJECT_TYPE': 'DMO', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_created if days_created is not None else '>90', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': deletion_id})
+                    deletion_id = dmo_name # Usa o DeveloperName como identificador para deleção
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': dmo_details.get('Id', 'ID não encontrado'), 'DISPLAY_NAME': display_name, 'OBJECT_TYPE': 'DMO', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_created if days_created is not None else '>90', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': deletion_id})
         
         logging.info("Auditando Data Streams...")
         for ds in data_streams:
