@@ -1,88 +1,46 @@
 """
 Este script audita uma instância do Salesforce Data Cloud para identificar 
-campos de DMOs (Data Model Objects) utilizados e não utilizados.
+objetos e campos não utilizados.
 
 ================================================================================
-REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
+REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE OBJETOS
 ================================================================================
 
-Este script gera dois relatórios para fornecer uma visão completa do uso dos 
-campos de DMOs customizados. As regras abaixo definem como um campo é 
-classificado em cada relatório.
+Este script gera um relatório CSV (`audit_objetos_para_exclusao.csv`) para 
+fornecer uma visão completa de objetos que podem ser removidos com segurança.
 
 --------------------------------------------------------------------------------
-REGRAS PARA UM CAMPO SER CONSIDERADO "UTILIZADO"
+REGRAS PARA UM OBJETO SER CONSIDERADO CANDIDATO À EXCLUSÃO
 --------------------------------------------------------------------------------
-Um campo é listado no relatório 'audit_campos_dmo_utilizados.csv' se UMA OU MAIS 
-das seguintes condições for verdadeira:
 
-1.  É encontrado nos critérios de pelo menos um **Segmento**.
-2.  É encontrado em qualquer parte da configuração de pelo menos uma **Ativação**.
-3.  É encontrado em qualquer parte da definição de pelo menos um **Calculated Insight**.
-4.  É encontrado na definição de um **Ponto de Contato de Ativação** (MktSgmntActvtnContactPoint).
-5.  Seu DMO pai foi criado **nos últimos 90 dias** (regra de carência para novos 
-    objetos que ainda não foram implementados em outras áreas).
+Um objeto é listado no relatório se atender a critérios específicos de 
+inatividade ou se for considerado "órfão" (sem uso por outros componentes).
 
---------------------------------------------------------------------------------
-REGRAS PARA UM CAMPO SER CONSIDERADO "NÃO UTILIZADO"
---------------------------------------------------------------------------------
-Um campo é listado no relatório 'audit_campos_dmo_nao_utilizados.csv' SOMENTE 
-SE TODAS as seguintes condições forem verdadeiras:
+1.  **Segmentos:** Inativos se não forem publicados há mais de 30 dias E não 
+    forem usados como filtro em outros segmentos.
 
-1.  **NÃO é encontrado** em nenhum Segmento, Ativação, Calculated Insight ou 
-    Ponto de Contato de Ativação.
-2.  Seu DMO pai foi criado **há mais de 90 dias**.
-3.  O campo e seu DMO **não são** objetos de sistema do Salesforce (o script 
-    ignora nomes com prefixos como 'ssot__', 'unified__', 'aa_', 'aal_', etc.).
+2.  **Ativações:** Órfãs se o seu segmento pai for considerado inativo.
 
-================================================================================
-"""
-"""
-Este script audita uma instância do Salesforce Data Cloud para identificar 
-campos de DMOs (Data Model Objects) utilizados e não utilizados.
+3.  **Data Model Objects (DMOs):** Órfãos se não forem referenciados por nenhum 
+    Segmento, Ativação, Calculated Insight, Data Action, etc., E tiverem sido 
+    criados há mais de 90 dias.
 
-================================================================================
-REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
-================================================================================
+4.  **Data Streams:** Inativos se não houver ingestão de dados há mais de 30 dias.
+    Uma distinção é feita se possuem ou não mapeamentos.
 
-Este script gera dois relatórios para fornecer uma visão completa do uso dos 
-campos de DMOs customizados. As regras abaixo definem como um campo é 
-classificado em cada relatório.
-
---------------------------------------------------------------------------------
-REGRAS PARA UM CAMPO SER CONSIDERADO "UTILIZADO"
---------------------------------------------------------------------------------
-Um campo é listado no relatório 'audit_campos_dmo_utilizados.csv' se UMA OU MAIS 
-das seguintes condições for verdadeira:
-
-1.  É encontrado nos critérios de pelo menos um **Segmento**.
-2.  É encontrado em qualquer parte da configuração de pelo menos uma **Ativação**.
-3.  É encontrado em qualquer parte da definição de pelo menos um **Calculated Insight**.
-4.  É encontrado na definição de um **Ponto de Contato de Ativação** (MktSgmntActvtnContactPoint).
-5.  Seu DMO pai foi criado **nos últimos 90 dias** (regra de carência para novos 
-    objetos que ainda não foram implementados em outras áreas).
-
---------------------------------------------------------------------------------
-REGRAS PARA UM CAMPO SER CONSIDERADO "NÃO UTILIZADO"
---------------------------------------------------------------------------------
-Um campo é listado no relatório 'audit_campos_dmo_nao_utilizados.csv' SOMENTE 
-SE TODAS as seguintes condições forem verdadeiras:
-
-1.  **NÃO é encontrado** em nenhum Segmento, Ativação, Calculated Insight ou 
-    Ponto de Contato de Ativação.
-2.  Seu DMO pai foi criado **há mais de 90 dias**.
-3.  O campo e seu DMO **não são** objetos de sistema do Salesforce (o script 
-    ignora nomes com prefixos como 'ssot__', 'unified__', 'aa_', 'aal_', etc.).
+5.  **Calculated Insights:** Inativos se o último processamento bem-sucedido 
+    ocorreu há mais de 90 dias.
 
 ================================================================================
 """
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.14 (Ajuste Final de Coluna para DMO)
-- CORREÇÃO: A coluna 'ID_OR_API_NAME' para DMOs agora é preenchida
-  corretamente com o 'name' do objeto (ex: 'Cliente_Telco__dlm'),
-  conforme retornado pela API de metadados SSOT, em vez do Id interno.
+Versão: 10.15 (Diagnóstico Aprimorado para Criadores de DMO)
+- MELHORIA: Adicionados logs detalhados para rastrear a busca de nomes de
+  usuários (CreatedById).
+- MELHORIA: O script agora emite um aviso se o ID do criador de um DMO não for
+  encontrado, facilitando a depuração de problemas de permissão ou dados.
 - Mantém todas as funcionalidades e correções das versões anteriores.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
@@ -118,7 +76,9 @@ MAX_RETRIES = 3
 RETRY_DELAY = 5 # segundos
 
 # --- Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Alterado para DEBUG para capturar as novas mensagens de diagnóstico
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 # --- Funções de Autenticação, API, e Helpers ---
 def get_access_token():
@@ -318,6 +278,7 @@ async def main():
     async with aiohttp.ClientSession(headers=headers, base_url=instance_url, connector=aiohttp.TCPConnector(ssl=VERIFY_SSL)) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
         
+        # Query para DMOs na Tooling API, que contém o CreatedById
         dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
         activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
@@ -368,18 +329,24 @@ async def main():
         segments = await fetch_records_in_bulk(session, semaphore, "MarketSegment", segment_fields_to_query, segment_ids)
         logging.info("✅ Detalhes de segmento coletados. Iniciando busca por nomes de criadores...")
 
+        # <<< INÍCIO DA MELHORIA DE DIAGNÓSTICO >>>
         all_creator_ids = set()
-        for collection in [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams, contact_point_usages]:
+        # A coleção `dmo_tooling_data` contém os `CreatedById` dos DMOs
+        collections_with_creators = [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams, contact_point_usages]
+        for collection in collections_with_creators:
             for item in collection:
                 if creator_id := item.get('CreatedById') or item.get('createdById'):
                     all_creator_ids.add(creator_id)
         
+        logging.info(f"🔎 [DIAGNÓSTICO] Coletados {len(all_creator_ids)} IDs de criadores únicos para buscar nomes.")
+
         user_id_to_name_map = {}
         if all_creator_ids:
             logging.info(f"--- Etapa 4: Buscando nomes de {len(all_creator_ids)} criadores... ---")
             user_records = await fetch_users_by_id(session, semaphore, list(all_creator_ids))
             user_id_to_name_map = {user['Id']: user['Name'] for user in user_records}
-            logging.info("✅ Nomes de criadores coletados.")
+            logging.info(f"✅ [DIAGNÓSTICO] {len(user_id_to_name_map)} nomes de usuários foram encontrados com sucesso.")
+        # <<< FIM DA MELHORIA DE DIAGNÓSTICO >>>
 
         now = datetime.now(timezone.utc)
         thirty_days_ago = now - timedelta(days=30)
@@ -468,9 +435,11 @@ async def main():
                     creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
                     deletion_id = dmo_name
                     
-                    
-                    # O campo 'ID_OR_API_NAME' agora usa 'dmo_name', que contém o nome da API
-                    # (ex: 'Cliente_Telco__dlm') vindo diretamente dos metadados.
+                    # <<< INÍCIO DA MELHORIA DE DIAGNÓSTICO >>>
+                    if creator_name == 'Desconhecido' and creator_id:
+                        logging.warning(f"⚠️ [DIAGNÓSTICO] Não foi possível encontrar o nome para o criador do DMO '{dmo_name}'. ID do criador: '{creator_id}'. Verifique permissões ou se o ID existe na tabela User.")
+                    # <<< FIM DA MELHORIA DE DIAGNÓSTICO >>>
+
                     audit_results.append({
                         'DELETAR': 'NAO', 
                         'ID_OR_API_NAME': dmo_name, 
@@ -483,9 +452,9 @@ async def main():
                         'CREATED_BY_NAME': creator_name, 
                         'DELETION_IDENTIFIER': deletion_id
                     })
-                    
         
         logging.info("Auditando Data Streams...")
+        # (O restante do código permanece o mesmo)
         for ds in data_streams:
             last_updated = parse_sf_date(ds.get('lastIngestDate'))
             if not last_updated or last_updated < thirty_days_ago:
