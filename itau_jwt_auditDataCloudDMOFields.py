@@ -2,7 +2,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 19.4 (Correção no Campo de Usuário)
+Versão: 21.1 (Correção na busca de Criador e Esclarecimentos)
 
 ================================================================================
 REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
@@ -47,298 +47,321 @@ import json
 import html
 import logging
 import re
+import gzip
 from collections import defaultdict
 from urllib.parse import urljoin, urlencode
 from datetime import datetime, timedelta, timezone
 
 import jwt
-import requests
 import aiohttp
 from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
 
-# Carrega as variáveis de ambiente do arquivo .env
+# ==============================================================================
+# --- ⚙️ CONFIGURAÇÃO ---
+# ==============================================================================
 load_dotenv()
 
-# --- Configuração ---
-USE_PROXY = True
-PROXY_URL = os.getenv("PROXY_URL")
-VERIFY_SSL = False
-CHUNK_SIZE = 400
+class Config:
+    # ... (Configurações inalteradas) ...
+    USE_PROXY = os.getenv("USE_PROXY", "False").lower() == "true"
+    PROXY_URL = os.getenv("PROXY_URL")
+    VERIFY_SSL = os.getenv("VERIFY_SSL", "False").lower() == "true"
+    API_VERSION = "v60.0"
+    SF_CLIENT_ID = os.getenv("SF_CLIENT_ID")
+    SF_USERNAME = os.getenv("SF_USERNAME")
+    SF_AUDIENCE = os.getenv("SF_AUDIENCE")
+    SF_LOGIN_URL = os.getenv("SF_LOGIN_URL")
+    SEMAPHORE_LIMIT = 50
+    BULK_CHUNK_SIZE = 400
+    MAX_RETRIES = 3
+    RETRY_DELAY_SECONDS = 5
+    GRACE_PERIOD_DAYS = 90
+    DMO_PREFIXES_TO_EXCLUDE = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
+    FIELD_PREFIXES_TO_EXCLUDE = ('ssot__', 'KQ_')
+    SPECIFIC_FIELDS_TO_EXCLUDE = {'DataSource__c', 'DataSourceObject__c', 'InternalOrganization__c'}
+    USED_FIELDS_CSV = 'audit_campos_dmo_utilizados.csv'
+    UNUSED_FIELDS_CSV = 'audit_campos_dmo_nao_utilizados.csv'
+    DEBUG_CSV = 'debug_dados_de_uso.csv'
+    FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
 
-# --- Configuração do Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Funções Reutilizáveis ---
+# ==============================================================================
+# --- 헬 Helpers & Funções Auxiliares ---
+# ==============================================================================
+def parse_sf_date(date_str):
+    if not date_str: return None
+    try: return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+    except (ValueError, TypeError): return None
 
-def get_access_token():
-    logging.info("🔑 Autenticando com o Salesforce via JWT...")
-    sf_client_id = os.getenv("SF_CLIENT_ID")
-    sf_username = os.getenv("SF_USERNAME")
-    sf_audience = os.getenv("SF_AUDIENCE")
-    sf_login_url = os.getenv("SF_LOGIN_URL")
-    if not all([sf_client_id, sf_username, sf_audience, sf_login_url]):
-        raise ValueError("Variáveis de ambiente de autenticação faltando no .env.")
-    if USE_PROXY and not PROXY_URL:
-        logging.warning("⚠️ USE_PROXY=True, mas a variável PROXY_URL não foi encontrada. Continuando sem proxy.")
-    try:
-        with open('private.pem', 'r') as f: private_key = f.read()
-    except FileNotFoundError:
-        logging.error("❌ Arquivo 'private.pem' não encontrado."); raise
-    payload = {'iss': sf_client_id, 'sub': sf_username, 'aud': sf_audience, 'exp': int(time.time()) + 300}
-    assertion = jwt.encode(payload, private_key, algorithm='RS256')
-    params = {'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': assertion}
-    token_url = f"{sf_login_url}/services/oauth2/token"
-    try:
-        proxies = {'http': PROXY_URL, 'https': PROXY_URL} if USE_PROXY and PROXY_URL else None
-        res = requests.post(token_url, data=params, proxies=proxies, verify=VERIFY_SSL)
-        res.raise_for_status()
-        logging.info("✅ Autenticação bem-sucedida.")
-        return res.json()
-    except requests.exceptions.RequestException as e:
-        logging.error(f"❌ Erro na autenticação: {e.response.text if e.response else e}"); raise
+def days_since(date_obj):
+    if not date_obj: return None
+    return (datetime.now(timezone.utc) - date_obj).days
 
-async def fetch_api_data(session, relative_url, semaphore, key_name=None):
-    async with semaphore:
-        all_records = []
-        current_url = relative_url
+# ==============================================================================
+# ---  ক্লা Salesforce API Client ---
+# ==============================================================================
+class SalesforceClient:
+    # ... (Classe SalesforceClient inalterada) ...
+    def __init__(self, config):
+        self.config = config
+        self.access_token = None
+        self.instance_url = None
+        self.session = None
+        self.semaphore = asyncio.Semaphore(config.SEMAPHORE_LIMIT)
+
+    async def __aenter__(self):
+        await self._authenticate()
+        headers = {
+            'Authorization': f'Bearer {self.access_token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        }
+        self.session = aiohttp.ClientSession(
+            base_url=self.instance_url,
+            headers=headers,
+            connector=aiohttp.TCPConnector(ssl=self.config.VERIFY_SSL)
+        )
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    async def _authenticate(self):
+        logging.info("🔑 Autenticando com o Salesforce via JWT...")
+        if not all([self.config.SF_CLIENT_ID, self.config.SF_USERNAME, self.config.SF_AUDIENCE, self.config.SF_LOGIN_URL]):
+            raise ValueError("Variáveis de ambiente de autenticação faltando no .env.")
+        
         try:
-            while current_url:
-                kwargs = {'ssl': VERIFY_SSL}
-                if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
-                async with session.get(current_url, **kwargs) as response:
-                    response.raise_for_status()
-                    data = await response.json()
-                    if key_name:
-                        all_records.extend(data.get(key_name, []))
-                        next_page_url = data.get('nextRecordsUrl')
-                        current_url = urljoin(str(session._base_url), next_page_url) if next_page_url else None
-                    else: 
-                        return data
-            return all_records
-        except aiohttp.ClientError as e:
-            logging.error(f"❌ Erro ao buscar dados da API REST: {e}")
-            return [] if key_name else {}
+            with open('private.pem', 'r') as f: private_key = f.read()
+        except FileNotFoundError:
+            logging.error("❌ Arquivo 'private.pem' não encontrado."); raise
 
-async def execute_query_job(session, query, semaphore):
-    async with semaphore:
-        job_url_path = "/services/data/v60.0/jobs/query"
-        payload = {"operation": "query", "query": query, "contentType": "CSV"}
-        proxy = PROXY_URL if USE_PROXY and PROXY_URL else None
-        try:
-            async with session.post(job_url_path, data=json.dumps(payload), proxy=proxy, ssl=VERIFY_SSL) as response:
-                response.raise_for_status()
-                job_info = await response.json(); job_id = job_info.get('id')
-                if not job_id: logging.error(f"❌ JobId não retornado para query: {query[:100]}..."); return []
-            job_status_path = f"{job_url_path}/{job_id}"
-            while True:
-                await asyncio.sleep(5)
-                async with session.get(job_status_path, proxy=proxy, ssl=VERIFY_SSL) as resp:
-                    resp.raise_for_status()
-                    status_info = await resp.json(); state = status_info.get('state')
-                    if state == 'JobComplete': break
-                    if state in ['Failed', 'Aborted']: logging.error(f"❌ Job de query {job_id} falhou: {status_info.get('errorMessage')}"); return []
-            results_path = f"{job_status_path}/results"
-            results_headers = {'Accept-Encoding': 'gzip'}
-            async with session.get(results_path, headers=results_headers, proxy=proxy, ssl=VERIFY_SSL) as qr:
-                qr.raise_for_status()
-                content_bytes = await qr.read()
-                csv_text = gzip.decompress(content_bytes).decode('utf-8') if qr.headers.get('Content-Encoding') == 'gzip' else content_bytes.decode('utf-8')
-                lines = csv_text.strip().splitlines()
-                if len(lines) > 1: reader = csv.DictReader(lines); reader.fieldnames = [field.strip('"') for field in reader.fieldnames]; return list(reader)
-                return []
-        except aiohttp.ClientError as e:
-            error_text = "";
-            if hasattr(e, 'response') and e.response:
-                try: error_text = await e.response.text()
-                except Exception: error_text = "[Could not decode error response]"
-            logging.error(f"❌ Erro no job de query: status={getattr(e, 'status', 'N/A')}, message='{e}', response='{error_text}'")
-            return []
-
-async def fetch_records_in_bulk(session, semaphore, object_name, fields, record_ids):
-    if not record_ids: return []
-    all_records, tasks, field_str = [], [], ", ".join(fields)
-    for i in range(0, len(record_ids), CHUNK_SIZE):
-        chunk = record_ids[i:i + CHUNK_SIZE]; formatted_ids = "','".join(chunk)
-        query = f"SELECT {field_str} FROM {object_name} WHERE Id IN ('{formatted_ids}')"
-        tasks.append(execute_query_job(session, query, semaphore))
-    results = await tqdm.gather(*tasks, desc=f"Buscando {object_name} (Bulk API)")
-    for record_list in results: all_records.extend(record_list)
-    return all_records
-
-async def fetch_users_by_id(session, semaphore, user_ids):
-    if not user_ids: return []
-    all_users, tasks = [], []
-    # ALTERAÇÃO: Trocando o campo 'Name' por 'Username'
-    field_str = "Id, Username"
-    for i in range(0, len(user_ids), CHUNK_SIZE):
-        chunk = user_ids[i:i + CHUNK_SIZE]; formatted_ids = "','".join(chunk)
-        query = f"SELECT {field_str} FROM User WHERE Id IN ('{formatted_ids}')"
-        url = f"/services/data/v60.0/query?{urlencode({'q': query})}"
-        tasks.append(fetch_api_data(session, url, semaphore, 'records'))
-    results = await tqdm.gather(*tasks, desc="Buscando nomes de criadores (REST API)")
-    for record_list in results: all_users.extend(record_list)
-    return all_users
-
-# --- Lógica Principal da Auditoria ---
-async def audit_dmo_fields():
-    auth_data = get_access_token()
-    access_token, instance_url = auth_data['access_token'], auth_data['instance_url']
-    logging.info('🚀 Iniciando auditoria de campos de DMO...')
-    headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json', 'Accept': 'application/json'}
-    
-    semaphore = asyncio.Semaphore(50)
-    async with aiohttp.ClientSession(headers=headers, base_url=instance_url, connector=aiohttp.TCPConnector(ssl=VERIFY_SSL)) as session:
-        logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
-
-        dmo_soql_query = "SELECT DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
-        segment_soql_query = "SELECT Id FROM MarketSegment"
-        activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute"
-        contact_point_query = "SELECT Id, Name, MarketSegmentActivationId, ContactPointFilterExpression, ContactPointPath FROM MktSgmntActvtnContactPoint"
+        payload = {
+            'iss': self.config.SF_CLIENT_ID, 'sub': self.config.SF_USERNAME, 
+            'aud': self.config.SF_AUDIENCE, 'exp': int(time.time()) + 300
+        }
+        assertion = jwt.encode(payload, private_key, algorithm='RS256')
+        params = {'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': assertion}
+        token_url = urljoin(self.config.SF_LOGIN_URL, "/services/oauth2/token")
         
-        initial_tasks = [
-            fetch_api_data(session, f"/services/data/v60.0/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
-            execute_query_job(session, segment_soql_query, semaphore),
-            fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
-            execute_query_job(session, activation_attributes_query, semaphore),
-            fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
-            execute_query_job(session, contact_point_query, semaphore),
-        ]
-        results = await tqdm.gather(*initial_tasks, desc="Coletando metadados iniciais")
-        dmo_tooling_data, segment_id_records, dmo_metadata_list, activation_attributes, calculated_insights, contact_point_usages = results
-        
-        dmo_creation_info = {rec['DeveloperName']: {'CreatedDate': rec['CreatedDate'], 'CreatedById': rec.get('CreatedById')} for rec in dmo_tooling_data}
-        segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
-        logging.info(f"✅ Etapa 1.1: {len(dmo_tooling_data)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
-        
-        logging.info(f"--- Etapa 2: Buscando detalhes dos segmentos (Bulk API)... ---")
-        segment_fields_to_query = ["Id", "Name", "IncludeCriteria", "ExcludeCriteria"]
-        segments_list = await fetch_records_in_bulk(session, semaphore, "MarketSegment", segment_fields_to_query, segment_ids)
-        logging.info("✅ Detalhes de segmentos coletados.")
-
-        creator_ids = {info['CreatedById'] for info in dmo_creation_info.values() if info.get('CreatedById')}
-        user_id_to_name_map = {}
-        if creator_ids:
-             logging.info(f"--- Etapa 3: Buscando nomes de {len(creator_ids)} criadores de DMOs... ---")
-             user_records = await fetch_users_by_id(session, semaphore, list(creator_ids))
-             # ALTERAÇÃO: Mapeando do campo 'Username'
-             user_id_to_name_map = {user['Id']: user.get('Username', 'Nome não encontrado') for user in user_records}
-             logging.info("✅ Nomes de criadores coletados.")
-    
-    logging.info("\n📊 Dados coletados. Analisando o uso dos campos...")
-    
-    used_fields_details = defaultdict(list)
-    field_name_pattern = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
-    
-    debug_data = []
-
-    def find_fields_with_regex(content_string, usage_type, object_name, object_api_name):
-        if not content_string: return
-        debug_data.append({'SOURCE_OBJECT_TYPE': usage_type, 'SOURCE_OBJECT_ID': object_api_name, 'SOURCE_OBJECT_NAME': object_name, 'RAW_CONTENT': content_string})
-        for match in field_name_pattern.finditer(html.unescape(str(content_string))):
-            field_name = match.group(1)
-            usage_context = {"usage_type": usage_type, "object_name": object_name, "object_api_name": object_api_name}
-            used_fields_details[field_name].append(usage_context)
-
-    for seg in tqdm(segments_list, desc="Analisando Segmentos"):
-        find_fields_with_regex(seg.get('IncludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'))
-        find_fields_with_regex(seg.get('ExcludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'))
-
-    for attr in tqdm(activation_attributes, desc="Analisando Ativações"):
-        find_fields_with_regex(attr.get('QueryPath'), "Ativação", attr.get('Name'), attr.get('MarketSegmentActivationId'))
-
-    for ci in tqdm(calculated_insights, desc="Analisando CIs"):
-        find_fields_with_regex(json.dumps(ci), "Calculated Insight", ci.get('displayName'), ci.get('name'))
-
-    for cp in tqdm(contact_point_usages, desc="Analisando Pontos de Contato"):
-        find_fields_with_regex(cp.get('ContactPointPath'), "Ponto de Contato", cp.get('Name'), cp.get('Id'))
-        find_fields_with_regex(cp.get('ContactPointFilterExpression'), "Ponto de Contato", cp.get('Name'), cp.get('Id'))
-        
-    all_dmo_fields = defaultdict(lambda: {'fields': {}, 'displayName': '', 'creatorName': 'Desconhecido'})
-    dmo_prefixes_to_exclude = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
-
-    for dmo in dmo_metadata_list:
-        if (dmo_name := dmo.get('name')) and dmo_name.endswith('__dlm'):
-            if any(dmo_name.lower().startswith(prefix) for prefix in dmo_prefixes_to_exclude): continue
-            all_dmo_fields[dmo_name]['displayName'] = dmo.get('displayName', dmo_name)
-            if dmo_info := dmo_creation_info.get(dmo_name):
-                all_dmo_fields[dmo_name]['creatorName'] = user_id_to_name_map.get(dmo_info.get('CreatedById'), 'Desconhecido')
-            for field in dmo.get('fields', []):
-                if field_name := field.get('name'):
-                    all_dmo_fields[dmo_name]['fields'][field_name] = field.get('displayName', field_name)
-
-    ninety_days_ago = datetime.now(timezone.utc) - timedelta(days=90)
-    for dmo_name, dmo_info in dmo_creation_info.items():
-        if created_date_str := dmo_info.get('CreatedDate'):
+        async with aiohttp.ClientSession() as session:
             try:
-                if datetime.fromisoformat(created_date_str.replace('Z', '+00:00')) > ninety_days_ago:
-                    if dmo_name in all_dmo_fields:
-                        for field_api_name in all_dmo_fields[dmo_name]['fields']:
-                            usage_context = {"usage_type": "N/A (DMO Recém-criado)", "object_name": "DMO criado < 90 dias", "object_api_name": dmo_name}
-                            if usage_context not in used_fields_details[field_api_name]:
-                                used_fields_details[field_api_name].append(usage_context)
-            except (ValueError, TypeError): continue
+                async with session.post(token_url, data=params, proxy=self.config.PROXY_URL if self.config.USE_PROXY else None, ssl=self.config.VERIFY_SSL) as res:
+                    res.raise_for_status()
+                    data = await res.json()
+                    self.access_token = data['access_token']
+                    self.instance_url = data['instance_url']
+                    logging.info("✅ Autenticação bem-sucedida.")
+            except aiohttp.ClientError as e:
+                logging.error(f"❌ Erro na autenticação: {e}"); raise
+
+    async def fetch_api_data(self, relative_url, key_name=None):
+        async with self.semaphore:
+            for attempt in range(self.config.MAX_RETRIES):
+                try:
+                    all_records, current_url = [], relative_url
+                    is_tooling_api = "/tooling" in current_url
+                    while current_url:
+                        kwargs = {'ssl': self.config.VERIFY_SSL}
+                        if self.config.USE_PROXY: kwargs['proxy'] = self.config.PROXY_URL
+                        async with self.session.get(current_url, **kwargs) as response:
+                            response.raise_for_status()
+                            data = await response.json()
+                            if key_name:
+                                all_records.extend(data.get(key_name, []))
+                                next_page, query_locator = data.get('nextRecordsUrl'), data.get('queryLocator')
+                                if next_page: current_url = urljoin(str(self.session._base_url), next_page)
+                                elif is_tooling_api and query_locator and not data.get('done', True): current_url = f"/services/data/{self.config.API_VERSION}/tooling/query/{query_locator}"
+                                else: current_url = None
+                            else: return data
+                    return all_records
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    if attempt < self.config.MAX_RETRIES - 1:
+                        logging.warning(f" Tentativa {attempt + 1} para {relative_url[:60]} falhou: {e}. Tentando novamente em {self.config.RETRY_DELAY_SECONDS}s...")
+                        await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
+                    else:
+                        logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para {relative_url[:60]} falharam."); raise e
+
+    async def execute_query_job(self, query):
+        async with self.semaphore:
+            for attempt in range(self.config.MAX_RETRIES):
+                try:
+                    job_url_path = f"/services/data/{self.config.API_VERSION}/jobs/query"
+                    payload = {"operation": "query", "query": query, "contentType": "CSV"}
+                    proxy = self.config.PROXY_URL if self.config.USE_PROXY else None
+                    async with self.session.post(job_url_path, json=payload, proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
+                        res.raise_for_status(); job_info = await res.json(); job_id = job_info['id']
+                    job_status_path = f"{job_url_path}/{job_id}"
+                    while True:
+                        await asyncio.sleep(5)
+                        async with self.session.get(job_status_path, proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
+                            res.raise_for_status(); status_info = await res.json()
+                            if status_info['state'] == 'JobComplete': break
+                            if status_info['state'] in ['Failed', 'Aborted']:
+                                logging.error(f"❌ Job {job_id} falhou: {status_info.get('errorMessage')}"); return []
+                    results_path = f"{job_status_path}/results"
+                    async with self.session.get(results_path, headers={'Accept-Encoding': 'gzip'}, proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
+                        res.raise_for_status()
+                        content = await res.read()
+                        csv_text = (gzip.decompress(content) if res.headers.get('Content-Encoding') == 'gzip' else content).decode('utf-8')
+                        lines = csv_text.strip().splitlines()
+                        return list(csv.DictReader(lines)) if len(lines) > 1 else []
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    if attempt < self.config.MAX_RETRIES - 1:
+                        logging.warning(f" Tentativa {attempt + 1} do job de query '{query[:50]}...' falhou: {e}. Tentando novamente em {self.config.RETRY_DELAY_SECONDS}s...")
+                        await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
+                    else:
+                        logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para o job de query '{query[:50]}...' falharam."); raise e
+
+    async def fetch_records_in_bulk(self, object_name, fields, record_ids):
+        if not record_ids: return []
+        tasks, field_str = [], ", ".join(fields)
+        for i in range(0, len(record_ids), self.config.BULK_CHUNK_SIZE):
+            chunk = record_ids[i:i + self.config.BULK_CHUNK_SIZE]
+            formatted_ids = "','".join(chunk)
+            query = f"SELECT {field_str} FROM {object_name} WHERE Id IN ('{formatted_ids}')"
+            tasks.append(self.execute_query_job(query))
+        results = await tqdm.gather(*tasks, desc=f"Buscando {object_name} (Bulk API)")
+        return [record for record_list in results if record_list for record in record_list]
+
+    async def fetch_users_by_id(self, user_ids):
+        if not user_ids: return {}
+        users = await self.fetch_records_in_bulk('User', ['Id', 'Username'], list(user_ids))
+        return {user['Id']: user.get('Username', 'Nome não encontrado') for user in users}
+
+# ==============================================================================
+# --- 📊 FUNÇÕES DE ANÁLISE E PROCESSAMENTO ---
+# ==============================================================================
+def find_fields_in_content(content_string, usage_type, object_name, object_api_name, used_fields_details, debug_data):
+    if not content_string: return
+    debug_data.append({'SOURCE_OBJECT_TYPE': usage_type, 'SOURCE_OBJECT_ID': object_api_name, 'SOURCE_OBJECT_NAME': object_name, 'RAW_CONTENT': content_string})
+    for match in Config.FIELD_NAME_PATTERN.finditer(html.unescape(str(content_string))):
+        field_name = match.group(1)
+        usage_context = {"usage_type": usage_type, "object_name": object_name, "object_api_name": object_api_name}
+        used_fields_details[field_name].append(usage_context)
+
+def write_csv_report(filename, data, headers):
+    if not data:
+        logging.info(f"ℹ️ Nenhum dado para gerar o relatório '{filename}'.")
+        return
+    try:
+        with open(filename, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(data)
+        logging.info(f"✅ Relatório gerado com sucesso: {filename} ({len(data)} linhas)")
+    except IOError as e:
+        logging.error(f"❌ Erro ao escrever o arquivo {filename}: {e}")
+        
+def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_map):
+    logging.info("--- FASE 3/4: Classificando campos... ---")
+    used_results, unused_results = [], []
     
-    used_field_results, unused_field_results = [], []
-    field_prefixes_to_exclude = ('ssot__', 'KQ_')
-    specific_fields_to_exclude = {'DataSource__c', 'DataSourceObject__c', 'InternalOrganization__c'}
+    for dmo_name, dmo_info in dmo_creation_info.items():
+        created_date = parse_sf_date(dmo_info.get('CreatedDate'))
+        if created_date and days_since(created_date) <= Config.GRACE_PERIOD_DAYS:
+            if dmo_name in all_dmo_fields:
+                for field_api_name in all_dmo_fields[dmo_name]['fields']:
+                    usage_context = {"usage_type": "N/A (DMO Recém-criado)", "object_name": "DMO criado < 90 dias", "object_api_name": dmo_name}
+                    if field_api_name not in used_fields_details: used_fields_details[field_api_name] = []
+                    if not any(u['usage_type'] == usage_context['usage_type'] for u in used_fields_details[field_api_name]):
+                        used_fields_details[field_api_name].append(usage_context)
 
     for dmo_name, data in all_dmo_fields.items():
+        # <<< INÍCIO DA CORREÇÃO (V21.1) >>>
+        creator_id = dmo_creation_info.get(dmo_name, {}).get('CreatedById') or dmo_creation_info.get(dmo_name, {}).get('createdById')
+        creator_name = user_map.get(creator_id, 'Desconhecido')
+        # <<< FIM DA CORREÇÃO (V21.1) >>>
+        
         for field_api_name, field_display_name in data['fields'].items():
-            if any(field_api_name.startswith(p) for p in field_prefixes_to_exclude) or field_api_name in specific_fields_to_exclude:
+            if any(field_api_name.startswith(p) for p in Config.FIELD_PREFIXES_TO_EXCLUDE) or field_api_name in Config.SPECIFIC_FIELDS_TO_EXCLUDE:
                 continue
             
             if field_api_name in used_fields_details:
                 usages = used_fields_details[field_api_name]
-                usage_count = len(usages)
-                usage_types = sorted(list(set(u['usage_type'] for u in usages)))
-                used_field_results.append({
-                    'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name, 'FIELD_DISPLAY_NAME': field_display_name, 
-                    'FIELD_API_NAME': field_api_name, 'USAGE_COUNT': usage_count, 'USAGE_TYPES': ", ".join(usage_types),
-                    'CREATED_BY_NAME': data['creatorName']
-                })
+                used_results.append({'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name, 'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 'USAGE_COUNT': len(usages), 'USAGE_TYPES': ", ".join(sorted(list(set(u['usage_type'] for u in usages)))), 'CREATED_BY_NAME': creator_name})
             else:
-                 unused_field_results.append({
-                    'DELETAR': 'NAO', 'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name,
-                    'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 
-                    'REASON': 'Não utilizado em Segmentos, Ativações, CIs ou Pontos de Contato', 'CREATED_BY_NAME': data['creatorName']
-                })
-
-    logging.info(f"📊 Total de {len(used_fields_details)} campos únicos em uso.")
+                unused_results.append({'DELETAR': 'NAO', 'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name, 'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 'REASON': 'Não utilizado e DMO com mais de 90 dias', 'CREATED_BY_NAME': creator_name})
     
-    if unused_field_results:
-        csv_file_path_unused = 'audit_campos_dmo_nao_utilizados.csv'
-        header_unused = ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME']
-        with open(csv_file_path_unused, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=header_unused); writer.writeheader(); writer.writerows(unused_field_results)
-        logging.info(f"✅ Relatório de campos NÃO utilizados gerado: {csv_file_path_unused} ({len(unused_field_results)} campos)")
-    else:
-        logging.info("🎉 Nenhum campo não utilizado foi encontrado!")
+    logging.info(f"📊 Classificação concluída: {len(used_results)} campos utilizados, {len(unused_results)} campos não utilizados.")
+    return used_results, unused_results
+
+# ==============================================================================
+# --- 🚀 ORQUESTRADOR PRINCIPAL ---
+# ==============================================================================
+async def main():
+    logging.info("🚀 Iniciando auditoria de campos de DMO...")
+    config = Config()
+    async with SalesforceClient(config) as client:
+        logging.info("--- FASE 1/4: Coletando metadados e objetos... ---")
         
-    if used_field_results:
-        csv_file_path_used = 'audit_campos_dmo_utilizados.csv'
-        header_used = ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_COUNT', 'USAGE_TYPES', 'CREATED_BY_NAME']
-        with open(csv_file_path_used, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=header_used); writer.writeheader(); writer.writerows(used_field_results)
-        logging.info(f"✅ Relatório de campos UTILIZADOS gerado: {csv_file_path_used} ({len(used_field_results)} campos)")
-    else:
-        logging.info("ℹ️ Nenhum uso de campo de DMO customizado foi detectado.")
+        tasks_to_run = {
+            "dmo_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': 'SELECT DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject'})}", 'records'),
+            "dmo_metadata": client.fetch_api_data(f"/services/data/{config.API_VERSION}/ssot/metadata?entityType=DataModelObject", 'metadata'),
+            "segments": client.execute_query_job("SELECT Id FROM MarketSegment"),
+            "activations": client.execute_query_job("SELECT QueryPath, Name, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute"),
+            "calculated_insights": client.fetch_api_data(f"/services/data/{config.API_VERSION}/ssot/metadata?entityType=CalculatedInsight", 'metadata'),
+            "contact_points": client.execute_query_job("SELECT Name, ContactPointFilterExpression, ContactPointPath, Id FROM MktSgmntActvtnContactPoint"),
+        }
+        task_results = await asyncio.gather(*tasks_to_run.values(), return_exceptions=True)
+        
+        data = {}
+        for i, task_name in enumerate(tasks_to_run.keys()):
+            result = task_results[i]
+            if isinstance(result, Exception):
+                logging.error(f"❌ A coleta de '{task_name}' falhou definitivamente: {result}")
+                data[task_name] = []
+            else: data[task_name] = result
+        logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
+        
+        dmo_creation_info = {rec['DeveloperName']: rec for rec in data['dmo_tooling']}
+        segment_ids = [rec['Id'] for rec in data['segments'] if rec.get('Id')]
+        logging.info(f"Dados processáveis: {len(dmo_creation_info)} DMOs, {len(segment_ids)} Segmentos, {len(data['activations'])} Ativações.")
+        
+        # <<< INÍCIO DA CORREÇÃO (V21.1) >>>
+        all_creator_ids = set()
+        for dmo_details in dmo_creation_info.values():
+            if creator_id := (dmo_details.get('CreatedById') or dmo_details.get('createdById')):
+                all_creator_ids.add(creator_id)
+        # <<< FIM DA CORREÇÃO (V21.1) >>>
+        
+        segments_list, user_id_to_name_map = await asyncio.gather(
+            client.fetch_records_in_bulk("MarketSegment", ["Id", "Name", "IncludeCriteria", "ExcludeCriteria"], segment_ids),
+            client.fetch_users_by_id(all_creator_ids)
+        )
+        logging.info(f"✅ Detalhes de {len(segments_list)} segmentos e {len(user_id_to_name_map)} usuários coletados.")
 
-    if debug_data:
-        debug_file_path = 'debug_dados_de_uso.csv'
-        debug_header = ['SOURCE_OBJECT_TYPE', 'SOURCE_OBJECT_ID', 'SOURCE_OBJECT_NAME', 'RAW_CONTENT']
-        with open(debug_file_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=debug_header)
-            writer.writeheader()
-            writer.writerows(debug_data)
-        logging.info(f"🔍 Relatório de depuração gerado: {debug_file_path}")
+        logging.info("--- FASE 2/4: Analisando o uso dos campos... ---")
+        used_fields_details, debug_data = defaultdict(list), []
+        for seg in tqdm(segments_list, desc="Analisando Segmentos"):
+            find_fields_in_content(seg.get('IncludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'), used_fields_details, debug_data)
+            find_fields_in_content(seg.get('ExcludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'), used_fields_details, debug_data)
+        for attr in tqdm(data['activations'], desc="Analisando Ativações"): find_fields_in_content(attr.get('QueryPath'), "Ativação", attr.get('Name'), attr.get('MarketSegmentActivationId'), used_fields_details, debug_data)
+        for ci in tqdm(data['calculated_insights'], desc="Analisando CIs"): find_fields_in_content(json.dumps(ci), "Calculated Insight", ci.get('displayName'), ci.get('name'), used_fields_details, debug_data)
+        for cp in tqdm(data['contact_points'], desc="Analisando Pontos de Contato"):
+            find_fields_in_content(cp.get('ContactPointPath'), "Ponto de Contato", cp.get('Name'), cp.get('Id'), used_fields_details, debug_data)
+            find_fields_in_content(cp.get('ContactPointFilterExpression'), "Ponto de Contato", cp.get('Name'), cp.get('Id'), used_fields_details, debug_data)
 
+        all_dmo_fields = defaultdict(lambda: {'fields': {}, 'displayName': ''})
+        for dmo in data['dmo_metadata']:
+            dmo_name = dmo.get('name')
+            if dmo_name and dmo_name.endswith('__dlm') and not any(dmo_name.lower().startswith(p) for p in config.DMO_PREFIXES_TO_EXCLUDE):
+                all_dmo_fields[dmo_name]['displayName'] = dmo.get('displayName', dmo_name)
+                for field in dmo.get('fields', []):
+                    if field_name := field.get('name'): all_dmo_fields[dmo_name]['fields'][field_name] = field.get('displayName', field_name)
+
+        used_field_results, unused_field_results = classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_id_to_name_map)
+
+        logging.info("--- FASE 4/4: Gerando relatórios... ---")
+        write_csv_report(config.UNUSED_FIELDS_CSV, unused_field_results, ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME'])
+        write_csv_report(config.USED_FIELDS_CSV, used_field_results, ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_COUNT', 'USAGE_TYPES', 'CREATED_BY_NAME'])
+        write_csv_report(config.DEBUG_CSV, debug_data, ['SOURCE_OBJECT_TYPE', 'SOURCE_OBJECT_ID', 'SOURCE_OBJECT_NAME', 'RAW_CONTENT'])
 
 if __name__ == "__main__":
     start_time = time.time()
-    try:
-        asyncio.run(audit_dmo_fields())
-    finally:
-        end_time = time.time()
-        duration = end_time - start_time
-        logging.info(f"\nTempo total de execução: {duration:.2f} segundos")
+    try: asyncio.run(main())
+    except Exception as e: logging.critical(f"❌ Ocorreu um erro fatal e o script foi interrompido: {e}", exc_info=True)
+    finally: logging.info(f"\n🏁 Auditoria concluída. Tempo total de execução: {time.time() - start_time:.2f} segundos.")
