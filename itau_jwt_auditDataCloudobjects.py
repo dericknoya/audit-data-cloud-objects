@@ -40,14 +40,14 @@ SE TODAS as seguintes condições forem verdadeiras:
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.12 (Depuração de Uso de DMO)
-- ADICIONADO: Geração de um novo arquivo de depuração 'debug_dmos_em_uso.txt',
-  que lista todos os DMOs que o script considera como 'em uso'. Isso ajuda a
-  diagnosticar por que um DMO específico não está sendo listado como órfão.
+Versão: 10.10 (Refatoração Final da Lógica de DMO)
+- REATORAÇÃO: A lógica de auditoria de DMOs foi reescrita para usar uma única
+  fonte de dados (Tooling API), eliminando discrepâncias que impediam a busca
+  correta do 'CreatedById' e do 'Id'. Isso resolve o problema de 'CREATED_BY_NAME'
+  e 'ID_OR_API_NAME' retornando incorretamente.
 - Mantém todas as funcionalidades e correções anteriores.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
-Gera arquivo de depuração: debug_dmos_em_uso.txt
 """
 import os
 import time
@@ -183,7 +183,7 @@ def find_items_in_criteria(criteria_str, key_to_find, item_set):
 
 def get_segment_id(seg): return seg.get('Id')
 def get_segment_name(seg): return seg.get('Name') or '(Sem nome)'
-def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('MasterLabel') or dmo.get('DeveloperName') or dmo.get('name') or '(Sem nome)'
+def get_dmo_display_name(dmo): return dmo.get('MasterLabel') or dmo.get('DeveloperName') or dmo.get('name') or '(Sem nome)'
 
 def read_activation_usage_csv(file_path='ativacoes_campos.csv'):
     used_dmos = set()
@@ -266,6 +266,7 @@ async def fetch_users_by_id(session, semaphore, user_ids):
         if record_list: all_users.extend(record_list)
     return all_users
 
+
 # --- Main Audit Logic ---
 async def main():
     auth_data = get_access_token()
@@ -284,7 +285,6 @@ async def main():
         initial_tasks = [
             fetch_api_data(session, f"/services/data/v60.0/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
             fetch_api_data(session, f"/services/data/v60.0/query?{urlencode({'q': segment_soql_query})}", semaphore, 'records'),
-            fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
             execute_query_job(session, activation_attributes_query, semaphore),
             fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
             fetch_api_data(session, "/services/data/v60.0/ssot/data-streams", semaphore, 'dataStreams'),
@@ -294,7 +294,7 @@ async def main():
         
         results = await asyncio.gather(*initial_tasks, return_exceptions=True)
         
-        task_names = ["DMO Tooling", "Segment IDs", "DMO Metadata", "Activation Attributes", "Calculated Insights", "Data Streams", "Data Graphs", "Data Actions"]
+        task_names = ["DMO Tooling", "Segment IDs", "Activation Attributes", "Calculated Insights", "Data Streams", "Data Graphs", "Data Actions"]
         final_results = []
         for i, result in enumerate(results):
             task_name = task_names[i] if i < len(task_names) else f"Tarefa {i}"
@@ -305,11 +305,10 @@ async def main():
                 final_results.append(result)
 
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
-        dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions = final_results
+        dmo_tooling_data, segment_id_records, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions = final_results
         
-        dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
-        logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos e {len(activation_attributes)} Atributos de Ativação carregados.")
+        logging.info(f"✅ Etapa 1.1: {len(dmo_tooling_data)} DMOs, {len(segment_ids)} Segmentos e {len(activation_attributes)} Atributos de Ativação carregados.")
         
         activation_ids = list(set(attr['MarketSegmentActivationId'] for attr in activation_attributes if attr.get('MarketSegmentActivationId')))
         
