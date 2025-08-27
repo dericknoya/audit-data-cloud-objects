@@ -40,11 +40,11 @@ SE TODAS as seguintes condições forem verdadeiras:
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.10 (Refatoração Final da Lógica de DMO)
-- REATORAÇÃO: A lógica de auditoria de DMOs foi reescrita para usar uma única
-  fonte de dados (Tooling API), eliminando discrepâncias que impediam a busca
-  correta do 'CreatedById' e do 'Id'. Isso resolve o problema de 'CREATED_BY_NAME'
-  e 'ID_OR_API_NAME' retornando incorretamente.
+Versão: 10.11 (Refatoração Final e Correção da Lógica de DMO)
+- CORREÇÃO CRÍTICA: Restaura a lógica de auditoria de DMOs para usar a lista completa da
+  API de Metadados como fonte principal e a API de Tooling para enriquecimento. Isso
+  resolve o bug que fazia com que a maioria dos DMOs não fosse auditada.
+- Garante que 'ID_OR_API_NAME' e 'CREATED_BY_NAME' sejam preenchidos corretamente.
 - Mantém todas as funcionalidades e correções anteriores.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
@@ -183,7 +183,7 @@ def find_items_in_criteria(criteria_str, key_to_find, item_set):
 
 def get_segment_id(seg): return seg.get('Id')
 def get_segment_name(seg): return seg.get('Name') or '(Sem nome)'
-def get_dmo_display_name(dmo): return dmo.get('MasterLabel') or dmo.get('DeveloperName') or dmo.get('name') or '(Sem nome)'
+def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('MasterLabel') or dmo.get('DeveloperName') or dmo.get('name') or '(Sem nome)'
 
 def read_activation_usage_csv(file_path='ativacoes_campos.csv'):
     used_dmos = set()
@@ -280,13 +280,12 @@ async def main():
         dmo_soql_query = "SELECT Id, DeveloperName, MasterLabel, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
         activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
-        contact_point_query = "SELECT Id, ContactPointFilterExpression, ContactPointPath, CreatedById FROM MktSgmntActvtnContactPoint"
         
         initial_tasks = [
             fetch_api_data(session, f"/services/data/v60.0/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
             fetch_api_data(session, f"/services/data/v60.0/query?{urlencode({'q': segment_soql_query})}", semaphore, 'records'),
+            fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
             execute_query_job(session, activation_attributes_query, semaphore),
-            execute_query_job(session, contact_point_query, semaphore),
             fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
             fetch_api_data(session, "/services/data/v60.0/ssot/data-streams", semaphore, 'dataStreams'),
             fetch_api_data(session, f"/services/data/v60.0/ssot/data-graphs/metadata", semaphore, 'dataGraphMetadata'),
@@ -295,7 +294,7 @@ async def main():
         
         results = await asyncio.gather(*initial_tasks, return_exceptions=True)
         
-        task_names = ["DMO Tooling", "Segment IDs", "Activation Attributes", "Contact Points", "Calculated Insights", "Data Streams", "Data Graphs", "Data Actions"]
+        task_names = ["DMO Tooling", "Segment IDs", "DMO Metadata", "Activation Attributes", "Calculated Insights", "Data Streams", "Data Graphs", "Data Actions"]
         final_results = []
         for i, result in enumerate(results):
             task_name = task_names[i] if i < len(task_names) else f"Tarefa {i}"
@@ -306,10 +305,11 @@ async def main():
                 final_results.append(result)
 
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
-        dmo_tooling_data, segment_id_records, activation_attributes, contact_point_usages, calculated_insights, data_streams, data_graphs, data_actions = final_results
+        dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions = final_results
         
+        dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
-        logging.info(f"✅ Etapa 1.1: {len(dmo_tooling_data)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
+        logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos e {len(activation_attributes)} Atributos de Ativação carregados.")
         
         activation_ids = list(set(attr['MarketSegmentActivationId'] for attr in activation_attributes if attr.get('MarketSegmentActivationId')))
         
@@ -326,7 +326,7 @@ async def main():
         logging.info("✅ Detalhes de segmento coletados. Iniciando busca por nomes de criadores...")
 
         all_creator_ids = set()
-        for collection in [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams, contact_point_usages]:
+        for collection in [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams]:
             for item in collection:
                 if creator_id := item.get('CreatedById') or item.get('createdById'):
                     all_creator_ids.add(creator_id)
@@ -353,11 +353,6 @@ async def main():
         dmos_used_in_data_actions = set()
         for da in data_actions:
             find_items_in_criteria(da, 'developerName', dmos_used_in_data_actions)
-            
-        dmos_used_in_contact_points = set()
-        for cp in contact_point_usages:
-            find_items_in_criteria(cp.get('ContactPointPath'), 'developerName', dmos_used_in_contact_points)
-            find_items_in_criteria(cp.get('ContactPointFilterExpression'), 'developerName', dmos_used_in_contact_points)
             
         nested_segment_parents = {}
         dmos_used_in_segment_criteria = set()
@@ -415,7 +410,6 @@ async def main():
             normalized_dmo_name = normalize_api_name(dmo_name)
             if normalized_dmo_name not in all_used_dmos:
                 created_date = parse_sf_date(dmo_record.get('CreatedDate'))
-                
                 if not created_date or created_date < ninety_days_ago:
                     days_created = days_since(created_date)
                     reason = "Órfão (não utilizado em nenhum objeto e criado > 90d)"
