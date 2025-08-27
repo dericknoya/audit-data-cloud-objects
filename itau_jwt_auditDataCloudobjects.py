@@ -1,43 +1,4 @@
 """
-Este script audita uma instância do Salesforce Data Cloud para identificar 
-campos de DMOs (Data Model Objects) utilizados e não utilizados.
-
-================================================================================
-REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
-================================================================================
-
-Este script gera dois relatórios para fornecer uma visão completa do uso dos 
-campos de DMOs customizados. As regras abaixo definem como um campo é 
-classificado em cada relatório.
-
---------------------------------------------------------------------------------
-REGRAS PARA UM CAMPO SER CONSIDERADO "UTILIZADO"
---------------------------------------------------------------------------------
-Um campo é listado no relatório 'audit_campos_dmo_utilizados.csv' se UMA OU MAIS 
-das seguintes condições for verdadeira:
-
-1.  É encontrado nos critérios de pelo menos um **Segmento**.
-2.  É encontrado em qualquer parte da configuração de pelo menos uma **Ativação**.
-3.  É encontrado em qualquer parte da definição de pelo menos um **Calculated Insight**.
-4.  É encontrado na definição de um **Ponto de Contato de Ativação** (MktSgmntActvtnContactPoint).
-5.  Seu DMO pai foi criado **nos últimos 90 dias** (regra de carência para novos 
-    objetos que ainda não foram implementados em outras áreas).
-
---------------------------------------------------------------------------------
-REGRAS PARA UM CAMPO SER CONSIDERADO "NÃO UTILIZADO"
---------------------------------------------------------------------------------
-Um campo é listado no relatório 'audit_campos_dmo_nao_utilizados.csv' SOMENTE 
-SE TODAS as seguintes condições forem verdadeiras:
-
-1.  **NÃO é encontrado** em nenhum Segmento, Ativação, Calculated Insight ou 
-    Ponto de Contato de Ativação.
-2.  Seu DMO pai foi criado **há mais de 90 dias**.
-3.  O campo e seu DMO **não são** objetos de sistema do Salesforce (o script 
-    ignora nomes com prefixos como 'ssot__', 'unified__', 'aa_', 'aal_', etc.).
-
-================================================================================
-"""
-"""
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
 Versão: 10.19 (Geração de Arquivo de Debug para DMOs)
