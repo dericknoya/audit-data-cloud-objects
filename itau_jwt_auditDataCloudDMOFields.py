@@ -1,8 +1,18 @@
+# -*- coding: utf-8 -*-
 """
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 21.1 (Correção na busca de Criador e Esclarecimentos)
+Versão: 22.0 (Versão Final Consolidada)
+- FUNCIONALIDADE: Análise de uso de campos a partir de um arquivo CSV externo 
+  ('ativacoes_campos.csv'), conforme presente no script de objetos.
+- ROBUSTEZ: Lógica de retentativas (retry) para todas as chamadas de API, 
+  aumentando a resiliência contra falhas de rede temporárias.
+- ROBUSTEZ: Tratamento de exceções na coleta inicial de dados para permitir
+  que o script continue mesmo que uma das fontes de metadados falhe.
+- CORREÇÃO: A lógica para encontrar o ID do criador de um DMO agora verifica 
+  tanto 'CreatedById' quanto 'createdById', alinhando-se com a robustez do 
+  script de objetos e prevenindo nomes de criador "Desconhecidos".
 
 ================================================================================
 REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
@@ -19,11 +29,11 @@ Um campo é listado no relatório 'audit_campos_dmo_utilizados.csv' se UMA OU MA
 das seguintes condições for verdadeira:
 
 1.  É encontrado nos critérios de pelo menos um **Segmento**.
-2.  É encontrado em qualquer parte da configuração de pelo menos uma **Ativação**.
+2.  É encontrado em qualquer parte da configuração de pelo menos uma **Ativação (via API)**.
 3.  É encontrado em qualquer parte da definição de pelo menos um **Calculated Insight**.
-4.  É encontrado na definição de um **Ponto de Contato de Ativação** (MktSgmntActvtnContactPoint).
-5.  Seu DMO pai foi criado **nos últimos 90 dias** (regra de carência para novos 
-    objetos que ainda não foram implementados em outras áreas).
+4.  É encontrado na definição de um **Ponto de Contato de Ativação**.
+5.  Seu DMO pai foi criado **nos últimos 90 dias**.
+6.  É encontrado no arquivo de mapeamento manual **ativacoes_campos.csv**.
 
 --------------------------------------------------------------------------------
 REGRAS PARA UM CAMPO SER CONSIDERADO "NÃO UTILIZADO"
@@ -31,8 +41,8 @@ REGRAS PARA UM CAMPO SER CONSIDERADO "NÃO UTILIZADO"
 Um campo é listado no relatório 'audit_campos_dmo_nao_utilizados.csv' SOMENTE 
 SE TODAS as seguintes condições forem verdadeiras:
 
-1.  **NÃO é encontrado** em nenhum Segmento, Ativação, Calculated Insight ou 
-    Ponto de Contato de Ativação.
+1.  **NÃO é encontrado** em nenhum Segmento, Ativação, Calculated Insight, 
+    Ponto de Contato de Ativação ou no CSV de ativações.
 2.  Seu DMO pai foi criado **há mais de 90 dias**.
 3.  O campo e seu DMO **não são** objetos de sistema do Salesforce (o script 
     ignora nomes com prefixos como 'ssot__', 'unified__', 'aa_', 'aal_', etc.).
@@ -63,39 +73,77 @@ from tqdm.asyncio import tqdm
 load_dotenv()
 
 class Config:
-    # ... (Configurações inalteradas) ...
+    # Conexão
     USE_PROXY = os.getenv("USE_PROXY", "False").lower() == "true"
     PROXY_URL = os.getenv("PROXY_URL")
     VERIFY_SSL = os.getenv("VERIFY_SSL", "False").lower() == "true"
     API_VERSION = "v60.0"
+    
+    # Salesforce JWT
     SF_CLIENT_ID = os.getenv("SF_CLIENT_ID")
     SF_USERNAME = os.getenv("SF_USERNAME")
     SF_AUDIENCE = os.getenv("SF_AUDIENCE")
     SF_LOGIN_URL = os.getenv("SF_LOGIN_URL")
+    
+    # Performance e Robustez
     SEMAPHORE_LIMIT = 50
     BULK_CHUNK_SIZE = 400
     MAX_RETRIES = 3
     RETRY_DELAY_SECONDS = 5
+    
+    # Regras de Negócio
     GRACE_PERIOD_DAYS = 90
     DMO_PREFIXES_TO_EXCLUDE = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
     FIELD_PREFIXES_TO_EXCLUDE = ('ssot__', 'KQ_')
     SPECIFIC_FIELDS_TO_EXCLUDE = {'DataSource__c', 'DataSourceObject__c', 'InternalOrganization__c'}
+    
+    # Nomes de Arquivos
     USED_FIELDS_CSV = 'audit_campos_dmo_utilizados.csv'
     UNUSED_FIELDS_CSV = 'audit_campos_dmo_nao_utilizados.csv'
     DEBUG_CSV = 'debug_dados_de_uso.csv'
+    ACTIVATION_FIELDS_CSV = 'ativacoes_campos.csv'
+    
+    # Expressão Regular
     FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
 
+# Configuração do Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ==============================================================================
 # --- 헬 Helpers & Funções Auxiliares ---
 # ==============================================================================
+def read_activation_fields_from_csv(file_path):
+    """Lê um arquivo CSV para extrair um conjunto de nomes de API de campos utilizados."""
+    used_fields = set()
+    try:
+        with open(file_path, mode='r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            # A coluna com o API name do campo deve se chamar 'FIELD_API_NAME'
+            field_column_name = 'FIELD_API_NAME'
+            if field_column_name not in reader.fieldnames:
+                 logging.warning(f"⚠️ Arquivo '{file_path}' encontrado, mas a coluna esperada '{field_column_name}' não existe. Pulando análise deste arquivo.")
+                 return used_fields
+
+            for row in reader:
+                if field_api_name := row.get(field_column_name):
+                    used_fields.add(field_api_name.strip())
+        logging.info(f"✅ Arquivo '{file_path}' lido. {len(used_fields)} campos únicos encontrados em uso.")
+    except FileNotFoundError:
+        logging.warning(f"⚠️ Arquivo de uso de ativações '{file_path}' não encontrado. A auditoria prosseguirá sem esta fonte de dados.")
+    except Exception as e:
+        logging.error(f"❌ Erro inesperado ao ler o arquivo '{file_path}': {e}")
+    return used_fields
+
 def parse_sf_date(date_str):
+    """Converte uma string de data do Salesforce para um objeto datetime ciente do fuso horário."""
     if not date_str: return None
-    try: return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-    except (ValueError, TypeError): return None
+    try:
+        return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+    except (ValueError, TypeError):
+        return None
 
 def days_since(date_obj):
+    """Calcula o número de dias desde uma data até agora."""
     if not date_obj: return None
     return (datetime.now(timezone.utc) - date_obj).days
 
@@ -103,7 +151,8 @@ def days_since(date_obj):
 # ---  ক্লা Salesforce API Client ---
 # ==============================================================================
 class SalesforceClient:
-    # ... (Classe SalesforceClient inalterada) ...
+    """Encapsula a autenticação e as chamadas à API do Salesforce com lógica de retry."""
+
     def __init__(self, config):
         self.config = config
         self.access_token = None
@@ -139,10 +188,7 @@ class SalesforceClient:
         except FileNotFoundError:
             logging.error("❌ Arquivo 'private.pem' não encontrado."); raise
 
-        payload = {
-            'iss': self.config.SF_CLIENT_ID, 'sub': self.config.SF_USERNAME, 
-            'aud': self.config.SF_AUDIENCE, 'exp': int(time.time()) + 300
-        }
+        payload = {'iss': self.config.SF_CLIENT_ID, 'sub': self.config.SF_USERNAME, 'aud': self.config.SF_AUDIENCE, 'exp': int(time.time()) + 300}
         assertion = jwt.encode(payload, private_key, algorithm='RS256')
         params = {'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': assertion}
         token_url = urljoin(self.config.SF_LOGIN_URL, "/services/oauth2/token")
@@ -271,10 +317,8 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
                         used_fields_details[field_api_name].append(usage_context)
 
     for dmo_name, data in all_dmo_fields.items():
-        # <<< INÍCIO DA CORREÇÃO (V21.1) >>>
         creator_id = dmo_creation_info.get(dmo_name, {}).get('CreatedById') or dmo_creation_info.get(dmo_name, {}).get('createdById')
         creator_name = user_map.get(creator_id, 'Desconhecido')
-        # <<< FIM DA CORREÇÃO (V21.1) >>>
         
         for field_api_name, field_display_name in data['fields'].items():
             if any(field_api_name.startswith(p) for p in Config.FIELD_PREFIXES_TO_EXCLUDE) or field_api_name in Config.SPECIFIC_FIELDS_TO_EXCLUDE:
@@ -321,12 +365,10 @@ async def main():
         segment_ids = [rec['Id'] for rec in data['segments'] if rec.get('Id')]
         logging.info(f"Dados processáveis: {len(dmo_creation_info)} DMOs, {len(segment_ids)} Segmentos, {len(data['activations'])} Ativações.")
         
-        # <<< INÍCIO DA CORREÇÃO (V21.1) >>>
         all_creator_ids = set()
         for dmo_details in dmo_creation_info.values():
             if creator_id := (dmo_details.get('CreatedById') or dmo_details.get('createdById')):
                 all_creator_ids.add(creator_id)
-        # <<< FIM DA CORREÇÃO (V21.1) >>>
         
         segments_list, user_id_to_name_map = await asyncio.gather(
             client.fetch_records_in_bulk("MarketSegment", ["Id", "Name", "IncludeCriteria", "ExcludeCriteria"], segment_ids),
@@ -336,6 +378,12 @@ async def main():
 
         logging.info("--- FASE 2/4: Analisando o uso dos campos... ---")
         used_fields_details, debug_data = defaultdict(list), []
+
+        fields_from_activation_csv = read_activation_fields_from_csv(config.ACTIVATION_FIELDS_CSV)
+        for field_name in tqdm(fields_from_activation_csv, desc="Analisando campos do CSV de Ativações"):
+            usage_context = {"usage_type": "Ativação (CSV Externo)", "object_name": config.ACTIVATION_FIELDS_CSV, "object_api_name": "N/A"}
+            used_fields_details[field_name].append(usage_context)
+
         for seg in tqdm(segments_list, desc="Analisando Segmentos"):
             find_fields_in_content(seg.get('IncludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'), used_fields_details, debug_data)
             find_fields_in_content(seg.get('ExcludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'), used_fields_details, debug_data)
