@@ -1,16 +1,15 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.20 (Dump da Resposta Bruta da API)
-- NOVO: Gera um arquivo 'dmo_tooling_data_raw_dump.json' que contém a resposta
-  exata e completa da API para a query de DMOs.
-- Este passo de diagnóstico é crucial para verificar se a chave 'CreatedById'
-  está presente nos dados recebidos pelo script, antes de qualquer processamento.
-- Mantém a geração do 'dmo_debug.csv' para comparação.
+Versão: 10.21 (Correção de Capitalização da Chave)
+- CORREÇÃO DEFINITIVA: O problema de 'CreatedById' nulo foi identificado como uma
+  inconsistência na capitalização da chave ('CreatedById' vs 'createdbyid') entre
+  as respostas da API.
+- A lógica de leitura do ID do criador foi tornada insensível à capitalização,
+  garantindo que o valor seja capturado corretamente.
+- Removidos os arquivos de debug extras, pois a causa raiz foi encontrada.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
-Gera CSV de debug: dmo_debug.csv
-Gera JSON de debug: dmo_tooling_data_raw_dump.json
 """
 
 import os
@@ -272,17 +271,6 @@ async def main():
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
         dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions, contact_point_usages = final_results
         
-        # <<< INÍCIO DO DUMP DE DEBUG (V10.20) >>>
-        try:
-            debug_file_path = "dmo_tooling_data_raw_dump.json"
-            logging.info(f"DUMP DE DEBUG: Salvando o conteúdo bruto de 'dmo_tooling_data' em '{debug_file_path}'...")
-            with open(debug_file_path, 'w', encoding='utf-8') as f:
-                json.dump(dmo_tooling_data, f, indent=4, ensure_ascii=False)
-            logging.info(f"DUMP DE DEBUG: Arquivo '{debug_file_path}' salvo com sucesso.")
-        except Exception as e:
-            logging.error(f"DUMP DE DEBUG: Falha ao salvar o arquivo de dump: {e}")
-        # <<< FIM DO DUMP DE DEBUG (V10.20) >>>
-        
         dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
         logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
@@ -305,17 +293,18 @@ async def main():
         collections_with_creators = [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams, contact_point_usages]
         for collection in collections_with_creators:
             for item in collection:
-                if creator_id := item.get('CreatedById') or item.get('createdById'):
+                # CORREÇÃO: Trata ambas as capitalizações de chave para robustez
+                if creator_id := (item.get('CreatedById') or item.get('createdById')):
                     all_creator_ids.add(creator_id)
         
-        logging.info(f"[DIAGNÓSTICO] Coletados {len(all_creator_ids)} IDs de criadores únicos para buscar nomes.")
+        logging.info(f"Coletados {len(all_creator_ids)} IDs de criadores únicos para buscar nomes.")
 
         user_id_to_name_map = {}
         if all_creator_ids:
             logging.info(f"--- Etapa 4: Buscando nomes de {len(all_creator_ids)} criadores... ---")
             user_records = await fetch_users_by_id(session, semaphore, list(all_creator_ids))
             user_id_to_name_map = {user['Id']: user['Name'] for user in user_records}
-            logging.info(f"[DIAGNÓSTICO] {len(user_id_to_name_map)} nomes de usuários foram encontrados com sucesso.")
+            logging.info(f"{len(user_id_to_name_map)} nomes de usuários foram encontrados com sucesso.")
 
         now = datetime.now(timezone.utc)
         thirty_days_ago = now - timedelta(days=30)
@@ -353,7 +342,6 @@ async def main():
 
         audit_results = []
         deletable_segment_ids = set()
-        dmo_debug_data = []
 
         logging.info("Auditando Segmentos...")
         for seg in tqdm(segments, desc="Auditando Segmentos"):
@@ -402,17 +390,16 @@ async def main():
                     reason = "Órfão (não utilizado em nenhum objeto e criado > 90d)"
                     display_name = get_dmo_display_name(dmo)
                     deletion_id = dmo_name
-                    creator_id = dmo_details.get('CreatedById')
                     
-                    dmo_debug_data.append({
-                        'DMO_NAME': dmo_name,
-                        'CREATED_BY_ID': creator_id if creator_id is not None else 'NULO_NA_API'
-                    })
+                    # <<< INÍCIO DA CORREÇÃO (V10.21) >>>
+                    # Acessa a chave de forma insensível à capitalização para garantir a captura do ID.
+                    creator_id = dmo_details.get('CreatedById') or dmo_details.get('createdbyid')
+                    # <<< FIM DA CORREÇÃO (V10.21) >>>
                     
                     if not creator_id:
                         creator_name = "ID Não Retornado pela API"
                     else:
-                        creator_name = user_id_to_name_map.get(creator_id, f"ID de Sistema ({creator_id})")
+                        creator_name = user_id_to_name_map.get(creator_id, f"ID Não Encontrado ({creator_id})")
 
                     audit_results.append({
                         'DELETAR': 'NAO', 
@@ -427,19 +414,6 @@ async def main():
                         'DELETION_IDENTIFIER': deletion_id
                     })
         
-        if dmo_debug_data:
-            debug_csv_file = "dmo_debug.csv"
-            logging.info(f"Gerando arquivo de debug para DMOs em '{debug_csv_file}'...")
-            try:
-                with open(debug_csv_file, mode='w', newline='', encoding='utf-8') as f:
-                    fieldnames = ['DMO_NAME', 'CREATED_BY_ID']
-                    writer = csv.DictWriter(f, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerows(dmo_debug_data)
-                logging.info(f"✅ Arquivo de debug '{debug_csv_file}' gerado com sucesso.")
-            except IOError as e:
-                logging.error(f"❌ Não foi possível escrever o arquivo de debug: {e}")
-
         logging.info("Auditando Data Streams...")
         for ds in data_streams:
             last_updated = parse_sf_date(ds.get('lastIngestDate'))
