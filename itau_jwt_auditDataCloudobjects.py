@@ -49,6 +49,7 @@ Versão: 10.8 (Integração com CSV Externo de Ativações)
 - Mantém todas as funcionalidades e correções das versões anteriores.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
+activacoes_campos.csv
 """
 import os
 import time
