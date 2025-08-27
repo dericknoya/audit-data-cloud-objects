@@ -46,8 +46,7 @@ Versão: 10.8 (Integração com CSV Externo de Ativações)
 - MELHORIA: A precisão da auditoria de DMOs foi aprimorada. Um DMO só é
   considerado órfão se não for encontrado em NENHUMA fonte de uso, incluindo
   o novo arquivo CSV.
-- CORREÇÃO: Garante que todas as bibliotecas necessárias, incluindo 'datetime',
-  sejam importadas corretamente.
+- Mantém todas as funcionalidades e correções das versões anteriores.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -269,7 +268,6 @@ async def fetch_users_by_id(session, semaphore, user_ids):
         if record_list: all_users.extend(record_list)
     return all_users
 
-
 # --- Main Audit Logic ---
 async def main():
     auth_data = get_access_token()
@@ -284,7 +282,7 @@ async def main():
         dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
         activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
-        contact_point_query = "SELECT Id, Name, MarketSegmentActivationId, ContactPointFilterExpression, ContactPointPath, CreatedById FROM MktSgmntActvtnContactPoint"
+        contact_point_query = "SELECT Id, ContactPointFilterExpression, ContactPointPath, CreatedById FROM MktSgmntActvtnContactPoint"
         
         initial_tasks = [
             fetch_api_data(session, f"/services/data/v60.0/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
@@ -316,7 +314,7 @@ async def main():
         dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
         logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
-        
+
         activation_ids = list(set(attr['MarketSegmentActivationId'] for attr in activation_attributes if attr.get('MarketSegmentActivationId')))
         
         logging.info(f"--- Etapa 2: Buscando detalhes de {len(activation_ids)} ativações únicas... ---")
