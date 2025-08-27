@@ -40,14 +40,14 @@ SE TODAS as seguintes condições forem verdadeiras:
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.11 (Refatoração Final e Correção da Lógica de DMO)
-- CORREÇÃO CRÍTICA: Restaura a lógica de auditoria de DMOs para usar a lista completa da
-  API de Metadados como fonte principal e a API de Tooling para enriquecimento. Isso
-  resolve o bug que fazia com que a maioria dos DMOs não fosse auditada.
-- Garante que 'ID_OR_API_NAME' e 'CREATED_BY_NAME' sejam preenchidos corretamente.
+Versão: 10.12 (Depuração de Uso de DMO)
+- ADICIONADO: Geração de um novo arquivo de depuração 'debug_dmos_em_uso.txt',
+  que lista todos os DMOs que o script considera como 'em uso'. Isso ajuda a
+  diagnosticar por que um DMO específico não está sendo listado como órfão.
 - Mantém todas as funcionalidades e correções anteriores.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
+Gera arquivo de depuração: debug_dmos_em_uso.txt
 """
 import os
 import time
