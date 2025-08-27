@@ -1,15 +1,16 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.19 (Geração de Arquivo de Debug para DMOs)
-- NOVO: Gera um arquivo 'dmo_debug.csv' que lista todos os DMOs candidatos à
-  exclusão e o valor bruto do 'CreatedById' retornado pela Tooling API.
-- O objetivo é permitir uma análise detalhada de por que certos IDs de criador
-  não estão sendo encontrados, isolando o problema nos dados recebidos.
-- Mantém todas as funcionalidades e correções das versões anteriores.
+Versão: 10.20 (Dump da Resposta Bruta da API)
+- NOVO: Gera um arquivo 'dmo_tooling_data_raw_dump.json' que contém a resposta
+  exata e completa da API para a query de DMOs.
+- Este passo de diagnóstico é crucial para verificar se a chave 'CreatedById'
+  está presente nos dados recebidos pelo script, antes de qualquer processamento.
+- Mantém a geração do 'dmo_debug.csv' para comparação.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 Gera CSV de debug: dmo_debug.csv
+Gera JSON de debug: dmo_tooling_data_raw_dump.json
 """
 
 import os
@@ -194,7 +195,7 @@ async def execute_query_job(session, query, semaphore):
                     lines = csv_text.strip().splitlines()
                     if len(lines) > 1: reader = csv.DictReader(lines); reader.fieldnames = [field.strip('"') for field in reader.fieldnames]; return list(reader)
                     return []
-            except (aiohtto.ClientError, asyncio.TimeoutError) as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if attempt < MAX_RETRIES - 1:
                     logging.warning(f" Tentativa {attempt + 1} do job de query '{query[:50]}...' falhou: {e}. Tentando novamente em {RETRY_DELAY}s...")
                     await asyncio.sleep(RETRY_DELAY)
@@ -271,6 +272,17 @@ async def main():
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
         dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions, contact_point_usages = final_results
         
+        # <<< INÍCIO DO DUMP DE DEBUG (V10.20) >>>
+        try:
+            debug_file_path = "dmo_tooling_data_raw_dump.json"
+            logging.info(f"DUMP DE DEBUG: Salvando o conteúdo bruto de 'dmo_tooling_data' em '{debug_file_path}'...")
+            with open(debug_file_path, 'w', encoding='utf-8') as f:
+                json.dump(dmo_tooling_data, f, indent=4, ensure_ascii=False)
+            logging.info(f"DUMP DE DEBUG: Arquivo '{debug_file_path}' salvo com sucesso.")
+        except Exception as e:
+            logging.error(f"DUMP DE DEBUG: Falha ao salvar o arquivo de dump: {e}")
+        # <<< FIM DO DUMP DE DEBUG (V10.20) >>>
+        
         dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
         logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
@@ -341,7 +353,6 @@ async def main():
 
         audit_results = []
         deletable_segment_ids = set()
-        
         dmo_debug_data = []
 
         logging.info("Auditando Segmentos...")
@@ -393,7 +404,6 @@ async def main():
                     deletion_id = dmo_name
                     creator_id = dmo_details.get('CreatedById')
                     
-                    # Popula a lista de debug com o dado bruto recebido da API.
                     dmo_debug_data.append({
                         'DMO_NAME': dmo_name,
                         'CREATED_BY_ID': creator_id if creator_id is not None else 'NULO_NA_API'
@@ -417,7 +427,6 @@ async def main():
                         'DELETION_IDENTIFIER': deletion_id
                     })
         
-        # Escreve o arquivo de debug CSV se houver dados para registrar.
         if dmo_debug_data:
             debug_csv_file = "dmo_debug.csv"
             logging.info(f"Gerando arquivo de debug para DMOs em '{debug_csv_file}'...")
