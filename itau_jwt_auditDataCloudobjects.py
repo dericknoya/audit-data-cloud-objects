@@ -1,49 +1,54 @@
 """
 Este script audita uma instância do Salesforce Data Cloud para identificar 
-objetos e campos não utilizados.
+campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
 ================================================================================
-REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE OBJETOS
+REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
 ================================================================================
 
-Este script gera um relatório CSV (`audit_objetos_para_exclusao.csv`) para 
-fornecer uma visão completa de objetos que podem ser removidos com segurança.
+Este script gera dois relatórios para fornecer uma visão completa do uso dos 
+campos de DMOs customizados. As regras abaixo definem como um campo é 
+classificado em cada relatório.
 
 --------------------------------------------------------------------------------
-REGRAS PARA UM OBJETO SER CONSIDERADO CANDIDATO À EXCLUSÃO
+REGRAS PARA UM CAMPO SER CONSIDERADO "UTILIZADO"
 --------------------------------------------------------------------------------
+Um campo é listado no relatório 'audit_campos_dmo_utilizados.csv' se UMA OU MAIS 
+das seguintes condições for verdadeira:
 
-Um objeto é listado no relatório se atender a critérios específicos de 
-inatividade ou se for considerado "órfão" (sem uso por outros componentes).
+1.  É encontrado nos critérios de pelo menos um **Segmento**.
+2.  É encontrado em qualquer parte da configuração de pelo menos uma **Ativação**.
+3.  É encontrado em qualquer parte da definição de pelo menos um **Calculated Insight**.
+4.  É encontrado na definição de um **Ponto de Contato de Ativação** (MktSgmntActvtnContactPoint).
+5.  Seu DMO pai foi criado **nos últimos 90 dias** (regra de carência para novos 
+    objetos que ainda não foram implementados em outras áreas).
 
-1.  **Segmentos:** Inativos se não forem publicados há mais de 30 dias E não 
-    forem usados como filtro em outros segmentos.
+--------------------------------------------------------------------------------
+REGRAS PARA UM CAMPO SER CONSIDERADO "NÃO UTILIZADO"
+--------------------------------------------------------------------------------
+Um campo é listado no relatório 'audit_campos_dmo_nao_utilizados.csv' SOMENTE 
+SE TODAS as seguintes condições forem verdadeiras:
 
-2.  **Ativações:** Órfãs se o seu segmento pai for considerado inativo.
-
-3.  **Data Model Objects (DMOs):** Órfãos se não forem referenciados por nenhum 
-    Segmento, Ativação, Calculated Insight, Data Action, etc., E tiverem sido 
-    criados há mais de 90 dias.
-
-4.  **Data Streams:** Inativos se não houver ingestão de dados há mais de 30 dias.
-    Uma distinção é feita se possuem ou não mapeamentos.
-
-5.  **Calculated Insights:** Inativos se o último processamento bem-sucedido 
-    ocorreu há mais de 90 dias.
+1.  **NÃO é encontrado** em nenhum Segmento, Ativação, Calculated Insight ou 
+    Ponto de Contato de Ativação.
+2.  Seu DMO pai foi criado **há mais de 90 dias**.
+3.  O campo e seu DMO **não são** objetos de sistema do Salesforce (o script 
+    ignora nomes com prefixos como 'ssot__', 'unified__', 'aa_', 'aal_', etc.).
 
 ================================================================================
 """
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.15 (Diagnóstico Aprimorado para Criadores de DMO)
-- MELHORIA: Adicionados logs detalhados para rastrear a busca de nomes de
-  usuários (CreatedById).
-- MELHORIA: O script agora emite um aviso se o ID do criador de um DMO não for
-  encontrado, facilitando a depuração de problemas de permissão ou dados.
+Versão: 10.19 (Geração de Arquivo de Debug para DMOs)
+- NOVO: Gera um arquivo 'dmo_debug.csv' que lista todos os DMOs candidatos à
+  exclusão e o valor bruto do 'CreatedById' retornado pela Tooling API.
+- O objetivo é permitir uma análise detalhada de por que certos IDs de criador
+  não estão sendo encontrados, isolando o problema nos dados recebidos.
 - Mantém todas as funcionalidades e correções das versões anteriores.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
+Gera CSV de debug: dmo_debug.csv
 """
 
 import os
@@ -74,11 +79,10 @@ VERIFY_SSL = False
 CHUNK_SIZE = 400
 MAX_RETRIES = 3
 RETRY_DELAY = 5 # segundos
+API_VERSION = "v64.0" 
 
 # --- Logging Setup ---
-# Alterado para DEBUG para capturar as novas mensagens de diagnóstico
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Funções de Autenticação, API, e Helpers ---
 def get_access_token():
@@ -132,8 +136,7 @@ async def fetch_api_data(session, relative_url, semaphore, key_name=None):
                             if next_page_url:
                                 current_url = urljoin(str(session._base_url), next_page_url)
                             elif is_tooling_api and query_locator and not data.get('done', True):
-                                version = "v60.0"; match = re.search(r'/(v\d+\.\d+)/', str(response.url))
-                                if match: version = match.group(1)
+                                version = API_VERSION
                                 current_url = f"/services/data/{version}/tooling/query/{query_locator}"
                             else:
                                 current_url = None
@@ -185,7 +188,6 @@ def get_segment_name(seg): return seg.get('Name') or '(Sem nome)'
 def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('name') or '(Sem nome)'
 
 def read_activation_usage_csv(file_path='ativacoes_campos.csv'):
-    """Lê o CSV de uso de ativações e retorna um set de DMOs utilizados."""
     used_dmos = set()
     try:
         with open(file_path, 'r', encoding='utf-8-sig') as f:
@@ -202,12 +204,11 @@ def read_activation_usage_csv(file_path='ativacoes_campos.csv'):
         logging.error(f"❌ Erro ao ler o arquivo '{file_path}': {e}")
         return used_dmos
 
-
 async def execute_query_job(session, query, semaphore):
     async with semaphore:
         for attempt in range(MAX_RETRIES):
             try:
-                job_url_path = "/services/data/v60.0/jobs/query"
+                job_url_path = f"/services/data/{API_VERSION}/jobs/query"
                 payload = {"operation": "query", "query": query, "contentType": "CSV"}
                 proxy = PROXY_URL if USE_PROXY and PROXY_URL else None
                 
@@ -232,7 +233,7 @@ async def execute_query_job(session, query, semaphore):
                     lines = csv_text.strip().splitlines()
                     if len(lines) > 1: reader = csv.DictReader(lines); reader.fieldnames = [field.strip('"') for field in reader.fieldnames]; return list(reader)
                     return []
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            except (aiohtto.ClientError, asyncio.TimeoutError) as e:
                 if attempt < MAX_RETRIES - 1:
                     logging.warning(f" Tentativa {attempt + 1} do job de query '{query[:50]}...' falhou: {e}. Tentando novamente em {RETRY_DELAY}s...")
                     await asyncio.sleep(RETRY_DELAY)
@@ -259,13 +260,12 @@ async def fetch_users_by_id(session, semaphore, user_ids):
     for i in range(0, len(user_ids), CHUNK_SIZE):
         chunk = user_ids[i:i + CHUNK_SIZE]; formatted_ids = "','".join(chunk)
         query = f"SELECT {field_str} FROM User WHERE Id IN ('{formatted_ids}')"
-        url = f"/services/data/v60.0/query?{urlencode({'q': query})}"
+        url = f"/services/data/{API_VERSION}/query?{urlencode({'q': query})}"
         tasks.append(fetch_api_data(session, url, semaphore, 'records'))
     results = await tqdm.gather(*tasks, desc="Buscando nomes de criadores (REST API)")
     for record_list in results:
         if record_list: all_users.extend(record_list)
     return all_users
-
 
 # --- Main Audit Logic ---
 async def main():
@@ -278,21 +278,20 @@ async def main():
     async with aiohttp.ClientSession(headers=headers, base_url=instance_url, connector=aiohttp.TCPConnector(ssl=VERIFY_SSL)) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
         
-        # Query para DMOs na Tooling API, que contém o CreatedById
         dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
         activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
         contact_point_query = "SELECT Id, ContactPointFilterExpression, ContactPointPath, CreatedById FROM MktSgmntActvtnContactPoint"
         
         initial_tasks = [
-            fetch_api_data(session, f"/services/data/v60.0/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
-            fetch_api_data(session, f"/services/data/v60.0/query?{urlencode({'q': segment_soql_query})}", semaphore, 'records'),
-            fetch_api_data(session, "/services/data/v64.0/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
+            fetch_api_data(session, f"/services/data/{API_VERSION}/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
+            fetch_api_data(session, f"/services/data/{API_VERSION}/query?{urlencode({'q': segment_soql_query})}", semaphore, 'records'),
+            fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
             execute_query_job(session, activation_attributes_query, semaphore),
-            fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
-            fetch_api_data(session, "/services/data/v60.0/ssot/data-streams", semaphore, 'dataStreams'),
-            fetch_api_data(session, f"/services/data/v60.0/ssot/data-graphs/metadata", semaphore, 'dataGraphMetadata'),
-            fetch_api_data(session, f"/services/data/v60.0/ssot/data-actions", semaphore, 'dataActions'),
+            fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
+            fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/data-streams", semaphore, 'dataStreams'),
+            fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/data-graphs/metadata", semaphore, 'dataGraphMetadata'),
+            fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/data-actions", semaphore, 'dataActions'),
             execute_query_job(session, contact_point_query, semaphore),
         ]
         
@@ -329,24 +328,21 @@ async def main():
         segments = await fetch_records_in_bulk(session, semaphore, "MarketSegment", segment_fields_to_query, segment_ids)
         logging.info("✅ Detalhes de segmento coletados. Iniciando busca por nomes de criadores...")
 
-        # <<< INÍCIO DA MELHORIA DE DIAGNÓSTICO >>>
         all_creator_ids = set()
-        # A coleção `dmo_tooling_data` contém os `CreatedById` dos DMOs
         collections_with_creators = [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams, contact_point_usages]
         for collection in collections_with_creators:
             for item in collection:
                 if creator_id := item.get('CreatedById') or item.get('createdById'):
                     all_creator_ids.add(creator_id)
         
-        logging.info(f"🔎 [DIAGNÓSTICO] Coletados {len(all_creator_ids)} IDs de criadores únicos para buscar nomes.")
+        logging.info(f"[DIAGNÓSTICO] Coletados {len(all_creator_ids)} IDs de criadores únicos para buscar nomes.")
 
         user_id_to_name_map = {}
         if all_creator_ids:
             logging.info(f"--- Etapa 4: Buscando nomes de {len(all_creator_ids)} criadores... ---")
             user_records = await fetch_users_by_id(session, semaphore, list(all_creator_ids))
             user_id_to_name_map = {user['Id']: user['Name'] for user in user_records}
-            logging.info(f"✅ [DIAGNÓSTICO] {len(user_id_to_name_map)} nomes de usuários foram encontrados com sucesso.")
-        # <<< FIM DA MELHORIA DE DIAGNÓSTICO >>>
+            logging.info(f"[DIAGNÓSTICO] {len(user_id_to_name_map)} nomes de usuários foram encontrados com sucesso.")
 
         now = datetime.now(timezone.utc)
         thirty_days_ago = now - timedelta(days=30)
@@ -385,6 +381,8 @@ async def main():
         audit_results = []
         deletable_segment_ids = set()
         
+        dmo_debug_data = []
+
         logging.info("Auditando Segmentos...")
         for seg in tqdm(segments, desc="Auditando Segmentos"):
             seg_id = str(get_segment_id(seg) or '')[:15];
@@ -431,14 +429,19 @@ async def main():
                     days_created = days_since(created_date)
                     reason = "Órfão (não utilizado em nenhum objeto e criado > 90d)"
                     display_name = get_dmo_display_name(dmo)
-                    creator_id = dmo_details.get('CreatedById')
-                    creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
                     deletion_id = dmo_name
+                    creator_id = dmo_details.get('CreatedById')
                     
-                    # <<< INÍCIO DA MELHORIA DE DIAGNÓSTICO >>>
-                    if creator_name == 'Desconhecido' and creator_id:
-                        logging.warning(f"⚠️ [DIAGNÓSTICO] Não foi possível encontrar o nome para o criador do DMO '{dmo_name}'. ID do criador: '{creator_id}'. Verifique permissões ou se o ID existe na tabela User.")
-                    # <<< FIM DA MELHORIA DE DIAGNÓSTICO >>>
+                    # Popula a lista de debug com o dado bruto recebido da API.
+                    dmo_debug_data.append({
+                        'DMO_NAME': dmo_name,
+                        'CREATED_BY_ID': creator_id if creator_id is not None else 'NULO_NA_API'
+                    })
+                    
+                    if not creator_id:
+                        creator_name = "ID Não Retornado pela API"
+                    else:
+                        creator_name = user_id_to_name_map.get(creator_id, f"ID de Sistema ({creator_id})")
 
                     audit_results.append({
                         'DELETAR': 'NAO', 
@@ -453,8 +456,21 @@ async def main():
                         'DELETION_IDENTIFIER': deletion_id
                     })
         
+        # Escreve o arquivo de debug CSV se houver dados para registrar.
+        if dmo_debug_data:
+            debug_csv_file = "dmo_debug.csv"
+            logging.info(f"Gerando arquivo de debug para DMOs em '{debug_csv_file}'...")
+            try:
+                with open(debug_csv_file, mode='w', newline='', encoding='utf-8') as f:
+                    fieldnames = ['DMO_NAME', 'CREATED_BY_ID']
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(dmo_debug_data)
+                logging.info(f"✅ Arquivo de debug '{debug_csv_file}' gerado com sucesso.")
+            except IOError as e:
+                logging.error(f"❌ Não foi possível escrever o arquivo de debug: {e}")
+
         logging.info("Auditando Data Streams...")
-        # (O restante do código permanece o mesmo)
         for ds in data_streams:
             last_updated = parse_sf_date(ds.get('lastIngestDate'))
             if not last_updated or last_updated < thirty_days_ago:
