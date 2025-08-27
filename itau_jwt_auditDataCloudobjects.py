@@ -1,13 +1,15 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.21 (Correção de Capitalização da Chave)
-- CORREÇÃO DEFINITIVA: O problema de 'CreatedById' nulo foi identificado como uma
-  inconsistência na capitalização da chave ('CreatedById' vs 'createdbyid') entre
-  as respostas da API.
-- A lógica de leitura do ID do criador foi tornada insensível à capitalização,
-  garantindo que o valor seja capturado corretamente.
-- Removidos os arquivos de debug extras, pois a causa raiz foi encontrada.
+Versão: 10.24 (Ajustes Finais de Saída para DMOs)
+- AJUSTE FINAL: Refinadas as colunas de saída para DMOs para otimizar o
+  processo de exclusão subsequente.
+- A coluna 'ID_OR_API_NAME' para DMOs agora contém o Id do objeto da Tooling
+  API (ex: 0gj...).
+- A coluna 'DELETION_IDENTIFIER' para DMOs contém o nome completo da API com o
+  sufixo __dlm (ex: MeuObjeto__dlm), que é o identificador correto para
+  operações de delete.
+- Mantém a correção de lógica da v10.23.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -209,10 +211,15 @@ async def fetch_records_in_bulk(session, semaphore, object_name, fields, record_
         chunk = record_ids[i:i + CHUNK_SIZE]; formatted_ids = "','".join(chunk)
         query = f"SELECT {field_str} FROM {object_name} WHERE Id IN ('{formatted_ids}')"
         tasks.append(execute_query_job(session, query, semaphore))
-    results = await tqdm.gather(*tasks, desc=f"Buscando {object_name} (Bulk API)")
-    for record_list in results:
-        if record_list: all_records.extend(record_list)
-    return all_records
+    
+    try:
+        results = await tqdm.gather(*tasks, desc=f"Buscando {object_name} (Bulk API)")
+        for record_list in results:
+            if record_list: all_records.extend(record_list)
+        return all_records
+    except Exception as e:
+        logging.error(f"❌ Falha crítica ao buscar registros em massa para '{object_name}': {e}. O script continuará com os dados que possui.")
+        return []
 
 async def fetch_users_by_id(session, semaphore, user_ids):
     if not user_ids: return []
@@ -293,7 +300,6 @@ async def main():
         collections_with_creators = [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams, contact_point_usages]
         for collection in collections_with_creators:
             for item in collection:
-                # CORREÇÃO: Trata ambas as capitalizações de chave para robustez
                 if creator_id := (item.get('CreatedById') or item.get('createdById')):
                     all_creator_ids.add(creator_id)
         
@@ -342,7 +348,7 @@ async def main():
 
         audit_results = []
         deletable_segment_ids = set()
-
+        
         logging.info("Auditando Segmentos...")
         for seg in tqdm(segments, desc="Auditando Segmentos"):
             seg_id = str(get_segment_id(seg) or '')[:15];
@@ -380,21 +386,24 @@ async def main():
             if not dmo_name.endswith('__dlm') or any(dmo_name.lower().startswith(p) for p in dmo_prefixes_to_exclude):
                 continue
             
-            normalized_dmo_name = normalize_api_name(dmo_name)
-            if normalized_dmo_name not in all_used_dmos:
-                dmo_details = dmo_info_map.get(dmo_name, {})
-                created_date = parse_sf_date(dmo_details.get('CreatedDate'))
-                
-                if not created_date or created_date < ninety_days_ago:
+            lookup_key = normalize_api_name(dmo_name)
+            dmo_details = dmo_info_map.get(lookup_key, {})
+
+            created_date = parse_sf_date(dmo_details.get('CreatedDate'))
+            
+            if not created_date or created_date < ninety_days_ago:
+                normalized_dmo_name_for_usage_check = normalize_api_name(dmo_name)
+                if normalized_dmo_name_for_usage_check not in all_used_dmos:
                     days_created = days_since(created_date)
                     reason = "Órfão (não utilizado em nenhum objeto e criado > 90d)"
                     display_name = get_dmo_display_name(dmo)
-                    deletion_id = dmo_name
                     
-                    # <<< INÍCIO DA CORREÇÃO (V10.21) >>>
-                    # Acessa a chave de forma insensível à capitalização para garantir a captura do ID.
+                    # <<< INÍCIO DO AJUSTE FINAL (V10.24) >>>
+                    deletion_id = dmo_name # Garante que o identificador de exclusão tem o sufixo __dlm
+                    dmo_tooling_id = dmo_details.get('Id', 'ID não encontrado')
+                    # <<< FIM DO AJUSTE FINAL (V10.24) >>>
+                    
                     creator_id = dmo_details.get('CreatedById') or dmo_details.get('createdbyid')
-                    # <<< FIM DA CORREÇÃO (V10.21) >>>
                     
                     if not creator_id:
                         creator_name = "ID Não Retornado pela API"
@@ -403,7 +412,8 @@ async def main():
 
                     audit_results.append({
                         'DELETAR': 'NAO', 
-                        'ID_OR_API_NAME': dmo_name, 
+                        # <<< INÍCIO DO AJUSTE FINAL (V10.24) >>>
+                        'ID_OR_API_NAME': dmo_tooling_id, 
                         'DISPLAY_NAME': display_name, 
                         'OBJECT_TYPE': 'DMO', 
                         'STATUS': 'N/A', 
@@ -412,6 +422,7 @@ async def main():
                         'DIAS_ATIVIDADE': days_created if days_created is not None else '>90', 
                         'CREATED_BY_NAME': creator_name, 
                         'DELETION_IDENTIFIER': deletion_id
+                        # <<< FIM DO AJUSTE FINAL (V10.24) >>>
                     })
         
         logging.info("Auditando Data Streams...")
