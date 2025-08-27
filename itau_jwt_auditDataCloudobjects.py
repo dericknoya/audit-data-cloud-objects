@@ -40,12 +40,12 @@ SE TODAS as seguintes condições forem verdadeiras:
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.10 (Refatoração Final da Lógica de DMO)
-- REATORAÇÃO: A lógica de auditoria de DMOs foi reescrita para usar uma única
-  fonte de dados (Tooling API), eliminando discrepâncias que impediam a busca
-  correta do 'CreatedById' e do 'Id'. Isso resolve o problema de 'CREATED_BY_NAME'
-  e 'ID_OR_API_NAME' retornando incorretamente.
-- Mantém todas as funcionalidades e correções anteriores.
+Versão: 10.11 (Refatoração Final da Lógica de DMO)
+- REATORAÇÃO: A lógica de auditoria de DMOs foi reescrita para usar a lista da
+  Tooling API como a única fonte de verdade. Isso elimina discrepâncias entre
+  APIs que impediam a busca correta do 'CreatedById' e do 'Id', resolvendo os
+  problemas de 'CREATED_BY_NAME' e 'ID_OR_API_NAME' retornando incorretamente.
+- Mantém todas as funcionalidades e correções da base estável v10.8.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -265,6 +265,7 @@ async def fetch_users_by_id(session, semaphore, user_ids):
     for record_list in results:
         if record_list: all_users.extend(record_list)
     return all_users
+
 
 # --- Main Audit Logic ---
 async def main():
