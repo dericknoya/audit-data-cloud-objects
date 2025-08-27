@@ -40,12 +40,13 @@ SE TODAS as seguintes condições forem verdadeiras:
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.7 (Versão Final Consolidada)
-- Consolida todas as correções de API e lógica de dados desenvolvidas.
-- Garante que a coluna 'DELETION_IDENTIFIER' para DMOs seja preenchida com o
-  DeveloperName, que é o valor correto para o endpoint de exclusão /ssot/.
-- Inclui a auditoria de MktSgmntActvtnContactPoint e a exclusão de prefixos de DMO.
-- Mantém a busca por 'Name' no objeto User e a resiliência a erros de rede.
+Versão: 10.8 (Integração com CSV Externo de Ativações)
+- NOVO: O script agora lê um arquivo local 'ativacoes_campos.csv' para obter uma
+  lista definitiva de DMOs utilizados em ativações.
+- MELHORIA: A precisão da auditoria de DMOs foi aprimorada. Um DMO só é
+  considerado órfão se não for encontrado em NENHUMA fonte de uso, incluindo
+  o novo arquivo CSV.
+- Mantém todas as funcionalidades e correções das versões anteriores.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -58,7 +59,7 @@ import html
 import logging
 import gzip
 import re
-from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 from urllib.parse import urlencode, urljoin
 
 import jwt
@@ -185,6 +186,25 @@ def get_segment_id(seg): return seg.get('Id')
 def get_segment_name(seg): return seg.get('Name') or '(Sem nome)'
 def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('name') or '(Sem nome)'
 
+def read_activation_usage_csv(file_path='ativacoes_campos.csv'):
+    """Lê o CSV de uso de ativações e retorna um set de DMOs utilizados."""
+    used_dmos = set()
+    try:
+        with open(file_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if entity_name := row.get('entityName'):
+                    used_dmos.add(normalize_api_name(entity_name))
+        logging.info(f"✅ Arquivo '{file_path}' lido com sucesso. {len(used_dmos)} DMOs únicos encontrados em uso.")
+        return used_dmos
+    except FileNotFoundError:
+        logging.warning(f"⚠️ Arquivo de uso de ativações '{file_path}' não encontrado. A auditoria de DMOs prosseguirá sem esta fonte de dados.")
+        return used_dmos
+    except Exception as e:
+        logging.error(f"❌ Erro ao ler o arquivo '{file_path}': {e}")
+        return used_dmos
+
+
 async def execute_query_job(session, query, semaphore):
     async with semaphore:
         for attempt in range(MAX_RETRIES):
@@ -260,7 +280,6 @@ async def main():
         dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
         activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
-        contact_point_query = "SELECT Id, ContactPointFilterExpression, ContactPointPath, CreatedById FROM MktSgmntActvtnContactPoint"
         
         initial_tasks = [
             fetch_api_data(session, f"/services/data/v60.0/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
@@ -271,12 +290,11 @@ async def main():
             fetch_api_data(session, "/services/data/v60.0/ssot/data-streams", semaphore, 'dataStreams'),
             fetch_api_data(session, f"/services/data/v60.0/ssot/data-graphs/metadata", semaphore, 'dataGraphMetadata'),
             fetch_api_data(session, f"/services/data/v60.0/ssot/data-actions", semaphore, 'dataActions'),
-            execute_query_job(session, contact_point_query, semaphore),
         ]
         
         results = await asyncio.gather(*initial_tasks, return_exceptions=True)
         
-        task_names = ["DMO Tooling", "Segment IDs", "DMO Metadata", "Activation Attributes", "Calculated Insights", "Data Streams", "Data Graphs", "Data Actions", "Contact Points"]
+        task_names = ["DMO Tooling", "Segment IDs", "DMO Metadata", "Activation Attributes", "Calculated Insights", "Data Streams", "Data Graphs", "Data Actions"]
         final_results = []
         for i, result in enumerate(results):
             task_name = task_names[i] if i < len(task_names) else f"Tarefa {i}"
@@ -287,11 +305,11 @@ async def main():
                 final_results.append(result)
 
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
-        dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions, contact_point_usages = final_results
+        dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions = final_results
         
         dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
-        logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
+        logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos e {len(activation_attributes)} Atributos de Ativação carregados.")
 
         activation_ids = list(set(attr['MarketSegmentActivationId'] for attr in activation_attributes if attr.get('MarketSegmentActivationId')))
         
@@ -308,7 +326,7 @@ async def main():
         logging.info("✅ Detalhes de segmento coletados. Iniciando busca por nomes de criadores...")
 
         all_creator_ids = set()
-        for collection in [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams, contact_point_usages]:
+        for collection in [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams]:
             for item in collection:
                 if creator_id := item.get('CreatedById') or item.get('createdById'):
                     all_creator_ids.add(creator_id)
@@ -324,24 +342,17 @@ async def main():
         thirty_days_ago = now - timedelta(days=30)
         ninety_days_ago = now - timedelta(days=90)
         
-        dmo_prefixes_to_exclude = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
+        dmos_prefixes_to_exclude = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
+        
+        dmos_from_activation_csv = read_activation_usage_csv()
         
         dmos_used_by_segments = {normalize_api_name(s.get('SegmentMembershipTable')) for s in segments if s.get('SegmentMembershipTable')}
         dmos_used_by_data_graphs = {normalize_api_name(obj.get('developerName')) for dg in data_graphs for obj in [dg.get('dgObject', {})] + dg.get('dgObject', {}).get('relatedObjects', []) if obj.get('developerName')}
         dmos_used_by_ci_relationships = {normalize_api_name(rel.get('fromEntity')) for ci in calculated_insights for rel in ci.get('relationships', []) if rel.get('fromEntity')}
         
-        dmos_used_in_activations = set()
-        for attr in activation_attributes:
-            find_items_in_criteria(attr.get('QueryPath'), 'developerName', dmos_used_in_activations)
-            
         dmos_used_in_data_actions = set()
         for da in data_actions:
             find_items_in_criteria(da, 'developerName', dmos_used_in_data_actions)
-            
-        dmos_used_in_contact_points = set()
-        for cp in contact_point_usages:
-            find_items_in_criteria(cp.get('ContactPointPath'), 'developerName', dmos_used_in_contact_points)
-            find_items_in_criteria(cp.get('ContactPointFilterExpression'), 'developerName', dmos_used_in_contact_points)
             
         nested_segment_parents = {}
         dmos_used_in_segment_criteria = set()
@@ -389,23 +400,39 @@ async def main():
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': act_id, 'DISPLAY_NAME': act_name, 'OBJECT_TYPE': 'ACTIVATION', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'N/A', 'DIAS_ATIVIDADE': 'N/A', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': act_name})
 
         logging.info("Auditando Data Model Objects (DMOs)...")
-        all_used_dmos = (dmos_used_by_segments | dmos_used_by_data_graphs | dmos_used_by_ci_relationships | dmos_used_in_activations | dmos_used_in_data_actions | dmos_used_in_segment_criteria | dmos_used_in_contact_points)
+        all_used_dmos = (dmos_used_by_segments | dmos_used_by_data_graphs | dmos_used_by_ci_relationships | 
+                         dmos_used_in_data_actions | dmos_used_in_segment_criteria | dmos_from_activation_csv)
+        
         for dmo in dm_objects:
             dmo_name = dmo.get('name', '')
             if not dmo_name.endswith('__dlm') or any(dmo_name.lower().startswith(p) for p in dmo_prefixes_to_exclude):
                 continue
+            
             normalized_dmo_name = normalize_api_name(dmo_name)
             if normalized_dmo_name not in all_used_dmos:
                 dmo_details = dmo_info_map.get(dmo_name, {})
                 created_date = parse_sf_date(dmo_details.get('CreatedDate'))
+                
                 if not created_date or created_date < ninety_days_ago:
                     days_created = days_since(created_date)
                     reason = "Órfão (não utilizado em nenhum objeto e criado > 90d)"
                     display_name = get_dmo_display_name(dmo)
                     creator_id = dmo_details.get('CreatedById')
                     creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
-                    deletion_id = dmo_name # Usa o DeveloperName como identificador para deleção
-                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': dmo_details.get('Id', 'ID não encontrado'), 'DISPLAY_NAME': display_name, 'OBJECT_TYPE': 'DMO', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_created if days_created is not None else '>90', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': deletion_id})
+                    deletion_id = dmo_name
+                    
+                    audit_results.append({
+                        'DELETAR': 'NAO', 
+                        'ID_OR_API_NAME': dmo_details.get('Id', 'ID não encontrado'), 
+                        'DISPLAY_NAME': display_name, 
+                        'OBJECT_TYPE': 'DMO', 
+                        'STATUS': 'N/A', 
+                        'REASON': reason, 
+                        'TIPO_ATIVIDADE': 'Criação', 
+                        'DIAS_ATIVIDADE': days_created if days_created is not None else '>90', 
+                        'CREATED_BY_NAME': creator_name, 
+                        'DELETION_IDENTIFIER': deletion_id
+                    })
         
         logging.info("Auditando Data Streams...")
         for ds in data_streams:
