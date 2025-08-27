@@ -38,18 +38,56 @@ SE TODAS as seguintes condições forem verdadeiras:
 ================================================================================
 """
 """
+Este script audita uma instância do Salesforce Data Cloud para identificar 
+campos de DMOs (Data Model Objects) utilizados e não utilizados.
+
+================================================================================
+REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
+================================================================================
+
+Este script gera dois relatórios para fornecer uma visão completa do uso dos 
+campos de DMOs customizados. As regras abaixo definem como um campo é 
+classificado em cada relatório.
+
+--------------------------------------------------------------------------------
+REGRAS PARA UM CAMPO SER CONSIDERADO "UTILIZADO"
+--------------------------------------------------------------------------------
+Um campo é listado no relatório 'audit_campos_dmo_utilizados.csv' se UMA OU MAIS 
+das seguintes condições for verdadeira:
+
+1.  É encontrado nos critérios de pelo menos um **Segmento**.
+2.  É encontrado em qualquer parte da configuração de pelo menos uma **Ativação**.
+3.  É encontrado em qualquer parte da definição de pelo menos um **Calculated Insight**.
+4.  É encontrado na definição de um **Ponto de Contato de Ativação** (MktSgmntActvtnContactPoint).
+5.  Seu DMO pai foi criado **nos últimos 90 dias** (regra de carência para novos 
+    objetos que ainda não foram implementados em outras áreas).
+
+--------------------------------------------------------------------------------
+REGRAS PARA UM CAMPO SER CONSIDERADO "NÃO UTILIZADO"
+--------------------------------------------------------------------------------
+Um campo é listado no relatório 'audit_campos_dmo_nao_utilizados.csv' SOMENTE 
+SE TODAS as seguintes condições forem verdadeiras:
+
+1.  **NÃO é encontrado** em nenhum Segmento, Ativação, Calculated Insight ou 
+    Ponto de Contato de Ativação.
+2.  Seu DMO pai foi criado **há mais de 90 dias**.
+3.  O campo e seu DMO **não são** objetos de sistema do Salesforce (o script 
+    ignora nomes com prefixos como 'ssot__', 'unified__', 'aa_', 'aal_', etc.).
+
+================================================================================
+"""
+"""
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.8 (Integração com CSV Externo de Ativações)
-- NOVO: O script agora lê um arquivo local 'ativacoes_campos.csv' para obter uma
-  lista definitiva de DMOs utilizados em ativações.
-- MELHORIA: A precisão da auditoria de DMOs foi aprimorada. Um DMO só é
-  considerado órfão se não for encontrado em NENHUMA fonte de uso, incluindo
-  o novo arquivo CSV.
+Versão: 10.14 (Ajuste Final de Coluna para DMO)
+- CORREÇÃO: A coluna 'ID_OR_API_NAME' para DMOs agora é preenchida
+  corretamente com o 'name' do objeto (ex: 'Cliente_Telco__dlm'),
+  conforme retornado pela API de metadados SSOT, em vez do Id interno.
 - Mantém todas as funcionalidades e correções das versões anteriores.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
+
 import os
 import time
 import asyncio
@@ -288,7 +326,7 @@ async def main():
         initial_tasks = [
             fetch_api_data(session, f"/services/data/v60.0/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
             fetch_api_data(session, f"/services/data/v60.0/query?{urlencode({'q': segment_soql_query})}", semaphore, 'records'),
-            fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
+            fetch_api_data(session, "/services/data/v64.0/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
             execute_query_job(session, activation_attributes_query, semaphore),
             fetch_api_data(session, "/services/data/v60.0/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
             fetch_api_data(session, "/services/data/v60.0/ssot/data-streams", semaphore, 'dataStreams'),
@@ -430,7 +468,22 @@ async def main():
                     creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
                     deletion_id = dmo_name
                     
-                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': dmo_details.get('Id', 'ID não encontrado'), 'DISPLAY_NAME': display_name, 'OBJECT_TYPE': 'DMO', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_created if days_created is not None else '>90', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': deletion_id})
+                    
+                    # O campo 'ID_OR_API_NAME' agora usa 'dmo_name', que contém o nome da API
+                    # (ex: 'Cliente_Telco__dlm') vindo diretamente dos metadados.
+                    audit_results.append({
+                        'DELETAR': 'NAO', 
+                        'ID_OR_API_NAME': dmo_name, 
+                        'DISPLAY_NAME': display_name, 
+                        'OBJECT_TYPE': 'DMO', 
+                        'STATUS': 'N/A', 
+                        'REASON': reason, 
+                        'TIPO_ATIVIDADE': 'Criação', 
+                        'DIAS_ATIVIDADE': days_created if days_created is not None else '>90', 
+                        'CREATED_BY_NAME': creator_name, 
+                        'DELETION_IDENTIFIER': deletion_id
+                    })
+                    
         
         logging.info("Auditando Data Streams...")
         for ds in data_streams:
