@@ -3,7 +3,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 24.2 (Correção de Estabilidade - NameError)
+Versão: 26.0 (Sincronia com Lógica de Chamada Estável)
 - CORREÇÃO: O nome da coluna esperado no arquivo 'ativacoes_campos.csv' foi 
   ajustado de 'FIELD_API_NAME' para 'Fieldname' para corresponder ao arquivo real.
 - MELHORIA: O nome da coluna do CSV foi movido para a classe 'Config' para
@@ -45,18 +45,18 @@ SE TODAS as seguintes condições forem verdadeiras:
 
 ================================================================================
 """
-# -*- coding: utf-8 -*-
 """
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 25.1 (Versão Estável Definitiva)
-- BASE: Código restaturado a partir da versão estável 23.1.
-- CORREÇÃO CRÍTICA: Corrigido o erro 'Bad Request' (400) reintroduzido nas
-  chamadas em massa (Bulk API). A formatação da cláusula IN na query SOQL
-  foi permanentemente corrigida para o formato correto.
-- CORREÇÃO: Mantida a lógica focada para coletar e mapear o 'createdById'
-  exclusivamente do DMO pai, resolvendo o problema do 'CREATED_BY_NAME'.
+Versão: 26.0 (Sincronia com Lógica de Chamada Estável)
+- BASE: Código baseado na versão estável 25.1.
+- CORREÇÃO CRÍTICA: A sintaxe da chamada de POST na função 'execute_query_job'
+  foi ajustada para usar 'data=json.dumps(payload)' em vez de 'json=payload',
+  espelhando 100% o comportamento do script de objetos v10.27, que não
+  apresenta o erro '400 Bad Request'.
+- MANTÉM: A lógica focada para coletar e mapear o 'createdById' do DMO pai
+  para preencher corretamente a coluna 'CREATED_BY_NAME'.
 
 """
 import os
@@ -206,6 +206,7 @@ class SalesforceClient:
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
                     else:
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para {relative_url[:60]} falharam."); raise e
+
     async def execute_query_job(self, query):
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
@@ -213,8 +214,17 @@ class SalesforceClient:
                     job_url_path = f"/services/data/{self.config.API_VERSION}/jobs/query"
                     payload = {"operation": "query", "query": query, "contentType": "CSV"}
                     proxy = self.config.PROXY_URL if self.config.USE_PROXY else None
-                    async with self.session.post(job_url_path, json=payload, proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
-                        res.raise_for_status(); job_info = await res.json(); job_id = job_info['id']
+                    
+                    # <<< INÍCIO DA CORREÇÃO (V26.0) >>>
+                    # Alterado de 'json=payload' para 'data=json.dumps(payload)' para espelhar
+                    # a sintaxe do script de objetos estável (v10.27).
+                    async with self.session.post(job_url_path, data=json.dumps(payload), proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
+                    # <<< FIM DA CORREÇÃO (V26.0) >>>
+                        res.raise_for_status()
+                        job_info = await res.json()
+                        job_id = job_info.get('id')
+                        if not job_id: logging.error(f"❌ JobId não retornado para query: {query[:100]}..."); return []
+
                     job_status_path = f"{job_url_path}/{job_id}"
                     while True:
                         await asyncio.sleep(5)
@@ -223,6 +233,7 @@ class SalesforceClient:
                             if status_info['state'] == 'JobComplete': break
                             if status_info['state'] in ['Failed', 'Aborted']:
                                 logging.error(f"❌ Job {job_id} falhou: {status_info.get('errorMessage')}"); return []
+                    
                     results_path = f"{job_status_path}/results"
                     async with self.session.get(results_path, headers={'Accept-Encoding': 'gzip'}, proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
                         res.raise_for_status()
@@ -242,11 +253,8 @@ class SalesforceClient:
         tasks, field_str = [], ", ".join(fields)
         for i in range(0, len(record_ids), self.config.BULK_CHUNK_SIZE):
             chunk = record_ids[i:i + self.config.BULK_CHUNK_SIZE]
-            # <<< INÍCIO DA CORREÇÃO (V25.1) >>>
-            # A formatação da query foi restaurada para o formato correto e funcional.
             formatted_ids = "','".join(chunk)
             query = f"SELECT {field_str} FROM {object_name} WHERE Id IN ('{formatted_ids}')"
-            # <<< FIM DA CORREÇÃO (V25.1) >>>
             tasks.append(self.execute_query_job(query))
         results = await tqdm.gather(*tasks, desc=f"Buscando {object_name} (Bulk API)")
         return [record for record_list in results if record_list for record in record_list]
@@ -340,8 +348,6 @@ async def main():
         
         logging.info(f"Dados processáveis: {len(dmo_creation_info)} DMOs, {len(segment_ids)} Segmentos, {len(data['activations'])} Ativações.")
         
-        # <<< INÍCIO DA CORREÇÃO (V25.1) >>>
-        # Coleta de IDs focada apenas nos DMOs, que são os pais dos campos.
         dmo_creator_ids = set()
         for dmo_details in dmo_creation_info.values():
             if creator_id := (dmo_details.get('CreatedById') or dmo_details.get('createdById')):
@@ -349,9 +355,8 @@ async def main():
         
         segments_list, user_id_to_name_map = await asyncio.gather(
             client.fetch_records_in_bulk("MarketSegment", ["Id", "Name", "IncludeCriteria", "ExcludeCriteria"], segment_ids),
-            client.fetch_users_by_id(dmo_creator_ids) # Busca apenas os nomes dos criadores de DMOs
+            client.fetch_users_by_id(dmo_creator_ids)
         )
-        # <<< FIM DA CORREÇÃO (V25.1) >>>
         
         logging.info(f"✅ Detalhes de {len(segments_list)} segmentos e {len(user_id_to_name_map)} usuários coletados.")
 
