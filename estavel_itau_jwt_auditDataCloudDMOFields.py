@@ -3,7 +3,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 26.0 (Sincronia com Lógica de Chamada Estável)
+Versão: 26.0-final-b (Correção no Campo de Nome do Criador)
 - CORREÇÃO: O nome da coluna esperado no arquivo 'ativacoes_campos.csv' foi 
   ajustado de 'FIELD_API_NAME' para 'Fieldname' para corresponder ao arquivo real.
 - MELHORIA: O nome da coluna do CSV foi movido para a classe 'Config' para
@@ -45,18 +45,16 @@ SE TODAS as seguintes condições forem verdadeiras:
 
 ================================================================================
 """
+# -*- coding: utf-8 -*-
 """
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 26.0 (Sincronia com Lógica de Chamada Estável)
-- BASE: Código baseado na versão estável 25.1.
-- CORREÇÃO CRÍTICA: A sintaxe da chamada de POST na função 'execute_query_job'
-  foi ajustada para usar 'data=json.dumps(payload)' em vez de 'json=payload',
-  espelhando 100% o comportamento do script de objetos v10.27, que não
-  apresenta o erro '400 Bad Request'.
-- MANTÉM: A lógica focada para coletar e mapear o 'createdById' do DMO pai
-  para preencher corretamente a coluna 'CREATED_BY_NAME'.
+Versão: 26.0-final-b (Correção no Campo de Nome do Criador)
+- BASE: Código baseado na versão estável e funcional 26.0-final.
+- CORREÇÃO: A query que busca os dados do criador foi alterada de 'Username'
+  para 'Name', garantindo que o nome de exibição do usuário seja exibido no
+  relatório em vez do email.
 
 """
 import os
@@ -164,6 +162,10 @@ def days_since(date_obj):
     if not date_obj: return None
     return (datetime.now(timezone.utc) - date_obj).days
 
+def normalize_api_name(name):
+    if not isinstance(name, str): return ""
+    return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
+
 # ==============================================================================
 # ---  Classe Salesforce API Client ---
 # ==============================================================================
@@ -206,7 +208,6 @@ class SalesforceClient:
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
                     else:
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para {relative_url[:60]} falharam."); raise e
-
     async def execute_query_job(self, query):
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
@@ -214,17 +215,11 @@ class SalesforceClient:
                     job_url_path = f"/services/data/{self.config.API_VERSION}/jobs/query"
                     payload = {"operation": "query", "query": query, "contentType": "CSV"}
                     proxy = self.config.PROXY_URL if self.config.USE_PROXY else None
-                    
-                    # <<< INÍCIO DA CORREÇÃO (V26.0) >>>
-                    # Alterado de 'json=payload' para 'data=json.dumps(payload)' para espelhar
-                    # a sintaxe do script de objetos estável (v10.27).
                     async with self.session.post(job_url_path, data=json.dumps(payload), proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
-                    # <<< FIM DA CORREÇÃO (V26.0) >>>
                         res.raise_for_status()
                         job_info = await res.json()
                         job_id = job_info.get('id')
                         if not job_id: logging.error(f"❌ JobId não retornado para query: {query[:100]}..."); return []
-
                     job_status_path = f"{job_url_path}/{job_id}"
                     while True:
                         await asyncio.sleep(5)
@@ -233,7 +228,6 @@ class SalesforceClient:
                             if status_info['state'] == 'JobComplete': break
                             if status_info['state'] in ['Failed', 'Aborted']:
                                 logging.error(f"❌ Job {job_id} falhou: {status_info.get('errorMessage')}"); return []
-                    
                     results_path = f"{job_status_path}/results"
                     async with self.session.get(results_path, headers={'Accept-Encoding': 'gzip'}, proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
                         res.raise_for_status()
@@ -247,7 +241,6 @@ class SalesforceClient:
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
                     else:
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para o job de query '{query[:50]}...' falharam."); raise e
-
     async def fetch_records_in_bulk(self, object_name, fields, record_ids):
         if not record_ids: return []
         tasks, field_str = [], ", ".join(fields)
@@ -258,11 +251,15 @@ class SalesforceClient:
             tasks.append(self.execute_query_job(query))
         results = await tqdm.gather(*tasks, desc=f"Buscando {object_name} (Bulk API)")
         return [record for record_list in results if record_list for record in record_list]
-        
+    
+    # <<< INÍCIO DA CORREÇÃO (26.0-final-b) >>>
     async def fetch_users_by_id(self, user_ids):
         if not user_ids: return {}
-        users = await self.fetch_records_in_bulk('User', ['Id', 'Username'], list(user_ids))
-        return {user['Id']: user.get('Username', 'Nome não encontrado') for user in users}
+        # Alterado de 'Username' para 'Name' para buscar o nome de exibição.
+        users = await self.fetch_records_in_bulk('User', ['Id', 'Name'], list(user_ids))
+        # Alterado de .get('Username',...) para .get('Name',...)
+        return {user['Id']: user.get('Name', 'Nome não encontrado') for user in users}
+    # <<< FIM DA CORREÇÃO (26.0-final-b) >>>
 
 # ==============================================================================
 # --- 📊 FUNÇÕES DE ANÁLISE E PROCESSAMENTO ---
@@ -294,14 +291,17 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
     for dmo_name, dmo_info in dmo_creation_info.items():
         created_date = parse_sf_date(dmo_info.get('CreatedDate'))
         if created_date and days_since(created_date) <= Config.GRACE_PERIOD_DAYS:
-            if dmo_name in all_dmo_fields:
-                for field_api_name in all_dmo_fields[dmo_name]['fields']:
-                    usage_context = {"usage_type": "N/A (DMO Recém-criado)", "object_name": "DMO criado < 90 dias", "object_api_name": dmo_name}
+            full_dmo_name = f"{dmo_name}__dlm"
+            if full_dmo_name in all_dmo_fields:
+                for field_api_name in all_dmo_fields[full_dmo_name]['fields']:
+                    usage_context = {"usage_type": "N/A (DMO Recém-criado)", "object_name": "DMO criado < 90 dias", "object_api_name": full_dmo_name}
                     if field_api_name not in used_fields_details: used_fields_details[field_api_name] = []
                     if not any(u['usage_type'] == usage_context['usage_type'] for u in used_fields_details[field_api_name]):
                         used_fields_details[field_api_name].append(usage_context)
     for dmo_name, data in all_dmo_fields.items():
-        creator_id = dmo_creation_info.get(dmo_name, {}).get('CreatedById') or dmo_creation_info.get(dmo_name, {}).get('createdById')
+        developer_name = normalize_api_name(dmo_name)
+        dmo_details = dmo_creation_info.get(developer_name, {})
+        creator_id = dmo_details.get('CreatedById') or dmo_details.get('createdById')
         creator_name = user_map.get(creator_id, 'Desconhecido')
         for field_api_name, field_display_name in data['fields'].items():
             if any(field_api_name.startswith(p) for p in Config.FIELD_PREFIXES_TO_EXCLUDE) or field_api_name in Config.SPECIFIC_FIELDS_TO_EXCLUDE:
