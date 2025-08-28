@@ -3,7 +3,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 26.0-final (Estável com Correção Definitiva do Criador)
+Versão: 26.0-final-b (Correção no Campo de Nome do Criador)
 - CORREÇÃO: O nome da coluna esperado no arquivo 'ativacoes_campos.csv' foi 
   ajustado de 'FIELD_API_NAME' para 'Fieldname' para corresponder ao arquivo real.
 - MELHORIA: O nome da coluna do CSV foi movido para a classe 'Config' para
@@ -50,12 +50,11 @@ SE TODAS as seguintes condições forem verdadeiras:
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 26.0-final (Estável com Correção Definitiva do Criador)
-- BASE: Código baseado na versão estável e funcional 26.0.
-- CORREÇÃO: Aplicada a correção final para o problema do 'CREATED_BY_NAME',
-  normalizando o nome do DMO (removendo o sufixo __dlm) antes de buscar o
-  ID do criador na etapa de classificação.
-- Esta é a versão consolidada e estável.
+Versão: 26.0-final-b (Correção no Campo de Nome do Criador)
+- BASE: Código baseado na versão estável e funcional 26.0-final.
+- CORREÇÃO: A query que busca os dados do criador foi alterada de 'Username'
+  para 'Name', garantindo que o nome de exibição do usuário seja exibido no
+  relatório em vez do email.
 
 """
 import os
@@ -252,10 +251,15 @@ class SalesforceClient:
             tasks.append(self.execute_query_job(query))
         results = await tqdm.gather(*tasks, desc=f"Buscando {object_name} (Bulk API)")
         return [record for record_list in results if record_list for record in record_list]
+    
+    # <<< INÍCIO DA CORREÇÃO (26.0-final-b) >>>
     async def fetch_users_by_id(self, user_ids):
         if not user_ids: return {}
-        users = await self.fetch_records_in_bulk('User', ['Id', 'Username'], list(user_ids))
-        return {user['Id']: user.get('Username', 'Nome não encontrado') for user in users}
+        # Alterado de 'Username' para 'Name' para buscar o nome de exibição.
+        users = await self.fetch_records_in_bulk('User', ['Id', 'Name'], list(user_ids))
+        # Alterado de .get('Username',...) para .get('Name',...)
+        return {user['Id']: user.get('Name', 'Nome não encontrado') for user in users}
+    # <<< FIM DA CORREÇÃO (26.0-final-b) >>>
 
 # ==============================================================================
 # --- 📊 FUNÇÕES DE ANÁLISE E PROCESSAMENTO ---
@@ -287,7 +291,6 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
     for dmo_name, dmo_info in dmo_creation_info.items():
         created_date = parse_sf_date(dmo_info.get('CreatedDate'))
         if created_date and days_since(created_date) <= Config.GRACE_PERIOD_DAYS:
-            # A chave de all_dmo_fields é o nome completo, com __dlm
             full_dmo_name = f"{dmo_name}__dlm"
             if full_dmo_name in all_dmo_fields:
                 for field_api_name in all_dmo_fields[full_dmo_name]['fields']:
@@ -296,11 +299,9 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
                     if not any(u['usage_type'] == usage_context['usage_type'] for u in used_fields_details[field_api_name]):
                         used_fields_details[field_api_name].append(usage_context)
     for dmo_name, data in all_dmo_fields.items():
-        # <<< INÍCIO DA CORREÇÃO (26.0-final) >>>
         developer_name = normalize_api_name(dmo_name)
         dmo_details = dmo_creation_info.get(developer_name, {})
         creator_id = dmo_details.get('CreatedById') or dmo_details.get('createdById')
-        # <<< FIM DA CORREÇÃO (26.0-final) >>>
         creator_name = user_map.get(creator_id, 'Desconhecido')
         for field_api_name, field_display_name in data['fields'].items():
             if any(field_api_name.startswith(p) for p in Config.FIELD_PREFIXES_TO_EXCLUDE) or field_api_name in Config.SPECIFIC_FIELDS_TO_EXCLUDE:
