@@ -1,14 +1,14 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.30 (Versão Estável Final)
-- CORREÇÃO DEFINITIVA: Restaurada a sintaxe simplificada das queries para
-  'MktSgmntActvtnAudAttribute' e 'MktSgmntActvtnContactPoint' (da v10.27),
-  que foi comprovada como a única versão que não causa o erro '400 Bad Request'
-  neste ambiente específico.
-- ESTABILIDADE: Esta versão combina a sintaxe de query estável com toda a
-  lógica de processamento de dados corrigida para DMOs, Data Streams e CIs
-  das versões anteriores.
+Versão: 10.27 (Ajustes Finais de Lógica e Nomenclatura)
+- MELHORIA (DMO): O script agora ignora DMOs retornados pela API de metadados que
+  não possuem um registro correspondente na Tooling API. Isso remove as linhas
+  com 'ID não encontrado' e foca apenas em DMOs que podem ser auditados com segurança.
+- CORREÇÃO (Data Stream): As colunas 'ID_OR_API_NAME' e 'DISPLAY_NAME' agora
+  utilizam corretamente o 'label' (nome de exibição) do Data Stream, em vez do
+  nome do Data Lake Object, para maior clareza no relatório.
+- Mantém a estabilidade da v10.26 sem alterar a sintaxe das queries.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -247,11 +247,8 @@ async def main():
         
         dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
-        # <<< INÍCIO DA CORREÇÃO (V10.30) >>>
-        # Restaurando queries simplificadas da v10.27 que não causam erro 400.
-        activation_attributes_query = "SELECT Id, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
-        contact_point_query = "SELECT Id, CreatedById FROM MktSgmntActvtnContactPoint"
-        # <<< FIM DA CORREÇÃO (V10.30) >>>
+        activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
+        contact_point_query = "SELECT Id, ContactPointFilterExpression, ContactPointPath, CreatedById FROM MktSgmntActvtnContactPoint"
         
         initial_tasks = [
             fetch_api_data(session, f"/services/data/{API_VERSION}/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
@@ -302,7 +299,7 @@ async def main():
         collections_with_creators = [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams, contact_point_usages]
         for collection in collections_with_creators:
             for item in collection:
-                if creator_id := (item.get('CreatedById') or item.get('createdById') or (item.get('createdBy') and item['createdBy'].get('id'))):
+                if creator_id := (item.get('CreatedById') or item.get('createdById')):
                     all_creator_ids.add(creator_id)
         
         logging.info(f"Coletados {len(all_creator_ids)} IDs de criadores únicos para buscar nomes.")
@@ -391,8 +388,11 @@ async def main():
             lookup_key = normalize_api_name(dmo_name)
             dmo_details = dmo_info_map.get(lookup_key, {})
 
+            # <<< INÍCIO DA MELHORIA (V10.27) >>>
+            # Pula DMOs "fantasmas" que não têm um registro correspondente na Tooling API.
             if not dmo_details:
                 continue
+            # <<< FIM DA MELHORIA (V10.27) >>>
 
             created_date = parse_sf_date(dmo_details.get('CreatedDate'))
             
@@ -431,13 +431,14 @@ async def main():
             if not last_updated or last_updated < thirty_days_ago:
                 days_inactive = days_since(last_updated)
                 
+                # <<< INÍCIO DA CORREÇÃO (V10.27) >>>
                 ds_label = ds.get('label') or ds.get('name')
                 ds_id = ds.get('id')
                 
                 created_by_info = ds.get('createdBy', {})
                 creator_name = created_by_info.get('name')
                 if not creator_name:
-                    creator_id = ds.get('createdById') or created_by_info.get('id') or (created_by_info and created_by_info.get('id'))
+                    creator_id = ds.get('createdById') or created_by_info.get('id')
                     creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
 
                 has_mappings = bool(ds.get('mappings'))
@@ -448,6 +449,7 @@ async def main():
                     reason = "Inativo (sem ingestão > 30d, mas possui mapeamentos)"
                 
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_label, 'DISPLAY_NAME': ds_label, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_id})
+                # <<< FIM DA CORREÇÃO (V10.27) >>>
         
         logging.info("Auditando Calculated Insights...")
         for ci in calculated_insights:
@@ -459,7 +461,7 @@ async def main():
                 created_by_info = ci.get('createdBy', {})
                 creator_name = created_by_info.get('name')
                 if not creator_name:
-                    creator_id = ci.get('createdById') or created_by_info.get('id') or (created_by_info and created_by_info.get('id'))
+                    creator_id = ci.get('createdById') or created_by_info.get('id')
                     creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
 
                 reason = "Inativo (último processamento bem-sucedido > 90d)"
