@@ -1,18 +1,17 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.28 (Diagnóstico Final para Data Streams e CIs)
-- FOCO: Identificar a estrutura exata do payload da API para Data Streams e
-  Calculated Insights, que se mostrou diferente do esperado.
-- NOVO: Gera dois arquivos de diagnóstico em JSON: 'data_streams_raw_dump.json' e
-  'calculated_insights_raw_dump.json', contendo a resposta bruta da API.
-- A lógica de processamento para Data Streams e CIs foi temporariamente
-  simplificada para evitar erros enquanto a estrutura correta dos dados é
-  investigada através dos arquivos de dump.
+Versão: 10.29 (Estável + Correções Finais)
+- BASE ESTÁVEL: Script baseado na v10.26, utilizando as queries SOQL completas
+  que não causam o erro '400 Bad Request'.
+- CORREÇÃO (DMO): Mantido o filtro que ignora DMOs sem correspondência na Tooling
+  API, evitando as linhas com 'ID não encontrado'.
+- CORREÇÃO (Data Stream): As colunas 'ID_OR_API_NAME' e 'DISPLAY_NAME' agora
+  utilizam o 'label' (nome de exibição).
+- CORREÇÃO (Data Stream & CI): A busca pelo 'CREATED_BY_NAME' foi corrigida para
+  ler os dados do criador do payload da API SSOT, resolvendo nomes 'Desconhecido'.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
-Gera JSON de debug: data_streams_raw_dump.json
-Gera JSON de debug: calculated_insights_raw_dump.json
 """
 
 import os
@@ -249,8 +248,11 @@ async def main():
         
         dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
+        # <<< INÍCIO DA CORREÇÃO (V10.29) >>>
+        # Restaurando queries completas que funcionam no ambiente do usuário para evitar 400 Bad Request
         activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
         contact_point_query = "SELECT Id, ContactPointFilterExpression, ContactPointPath, CreatedById FROM MktSgmntActvtnContactPoint"
+        # <<< FIM DA CORREÇÃO (V10.29) >>>
         
         initial_tasks = [
             fetch_api_data(session, f"/services/data/{API_VERSION}/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
@@ -279,23 +281,6 @@ async def main():
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
         dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions, contact_point_usages = final_results
         
-        # <<< INÍCIO DO DUMP DE DEBUG (V10.28) >>>
-        try:
-            ds_dump_path = "data_streams_raw_dump.json"
-            logging.info(f"DUMP DE DEBUG: Salvando o conteúdo bruto de 'data_streams' em '{ds_dump_path}'...")
-            with open(ds_dump_path, 'w', encoding='utf-8') as f:
-                json.dump(data_streams, f, indent=4, ensure_ascii=False)
-            logging.info(f"DUMP DE DEBUG: Arquivo '{ds_dump_path}' salvo com sucesso.")
-
-            ci_dump_path = "calculated_insights_raw_dump.json"
-            logging.info(f"DUMP DE DEBUG: Salvando o conteúdo bruto de 'calculated_insights' em '{ci_dump_path}'...")
-            with open(ci_dump_path, 'w', encoding='utf-8') as f:
-                json.dump(calculated_insights, f, indent=4, ensure_ascii=False)
-            logging.info(f"DUMP DE DEBUG: Arquivo '{ci_dump_path}' salvo com sucesso.")
-        except Exception as e:
-            logging.error(f"DUMP DE DEBUG: Falha ao salvar arquivos de dump: {e}")
-        # <<< FIM DO DUMP DE DEBUG (V10.28) >>>
-
         dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
         logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
@@ -447,10 +432,15 @@ async def main():
             if not last_updated or last_updated < thirty_days_ago:
                 days_inactive = days_since(last_updated)
                 
-                # Lógica temporária para auditoria enquanto se aguarda o dump
-                ds_name = ds.get('name') or ds.get('label') or 'Nome não encontrado'
+                ds_label = ds.get('label') or ds.get('name')
                 ds_id = ds.get('id')
-                creator_name = user_id_to_name_map.get(ds.get('createdById'), 'Desconhecido') # Usa a lógica antiga por enquanto
+                
+                created_by_info = ds.get('createdBy', {})
+                creator_name = created_by_info.get('name')
+                if not creator_name:
+                    creator_id = ds.get('createdById') or created_by_info.get('id')
+                    creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
+
                 has_mappings = bool(ds.get('mappings'))
                 
                 if not has_mappings:
@@ -458,7 +448,7 @@ async def main():
                 else:
                     reason = "Inativo (sem ingestão > 30d, mas possui mapeamentos)"
                 
-                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_name, 'DISPLAY_NAME': ds_name, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_id})
+                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_label, 'DISPLAY_NAME': ds_label, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_id})
         
         logging.info("Auditando Calculated Insights...")
         for ci in calculated_insights:
@@ -467,8 +457,11 @@ async def main():
                 days_inactive = days_since(last_processed)
                 ci_name = ci.get('name')
                 
-                # Lógica temporária para auditoria enquanto se aguarda o dump
-                creator_name = user_id_to_name_map.get(ci.get('createdById'), 'Desconhecido') # Usa a lógica antiga por enquanto
+                created_by_info = ci.get('createdBy', {})
+                creator_name = created_by_info.get('name')
+                if not creator_name:
+                    creator_id = ci.get('createdById') or created_by_info.get('id')
+                    creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
 
                 reason = "Inativo (último processamento bem-sucedido > 90d)"
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ci_name, 'DISPLAY_NAME': ci.get('displayName'), 'OBJECT_TYPE': 'CALCULATED_INSIGHT', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Último Processamento', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ci_name})
