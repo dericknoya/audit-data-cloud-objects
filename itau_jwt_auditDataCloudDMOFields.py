@@ -3,16 +3,14 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 22.0 (Versão Final Consolidada)
-- FUNCIONALIDADE: Análise de uso de campos a partir de um arquivo CSV externo 
-  ('ativacoes_campos.csv'), conforme presente no script de objetos.
-- ROBUSTEZ: Lógica de retentativas (retry) para todas as chamadas de API, 
-  aumentando a resiliência contra falhas de rede temporárias.
-- ROBUSTEZ: Tratamento de exceções na coleta inicial de dados para permitir
-  que o script continue mesmo que uma das fontes de metadados falhe.
-- CORREÇÃO: A lógica para encontrar o ID do criador de um DMO agora verifica 
-  tanto 'CreatedById' quanto 'createdById', alinhando-se com a robustez do 
-  script de objetos e prevenindo nomes de criador "Desconhecidos".
+Versão: 23.0 (Correção de Autenticação em Redes Restritivas)
+- CORREÇÃO CRÍTICA: A lógica de autenticação foi revertida para usar a 
+  biblioteca 'requests' (síncrona), espelhando o funcionamento do script de
+  objetos que opera com sucesso em ambientes com proxies complexos.
+- O restante do script permanece 100% assíncrono com 'aiohttp' para garantir
+  máxima performance na coleta e processamento de dados.
+- MANTÉM: Todos os mecanismos de robustez (retry, semáforo, Bulk API) e 
+  funcionalidades (análise de CSV, etc.) das versões anteriores.
 
 ================================================================================
 REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
@@ -63,6 +61,7 @@ from urllib.parse import urljoin, urlencode
 from datetime import datetime, timedelta, timezone
 
 import jwt
+import requests # <--- ADICIONADO para autenticação robusta
 import aiohttp
 from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
@@ -74,7 +73,7 @@ load_dotenv()
 
 class Config:
     # Conexão
-    USE_PROXY = os.getenv("USE_PROXY", "False").lower() == "true"
+    USE_PROXY = os.getenv("USE_PROXY", "True").lower() == "true"
     PROXY_URL = os.getenv("PROXY_URL")
     VERIFY_SSL = os.getenv("VERIFY_SSL", "False").lower() == "true"
     API_VERSION = "v60.0"
@@ -110,8 +109,35 @@ class Config:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ==============================================================================
-# --- 헬 Helpers & Funções Auxiliares ---
+# --- Helpers & Funções Auxiliares ---
 # ==============================================================================
+def get_access_token():
+    """Realiza a autenticação JWT de forma síncrona usando a biblioteca requests."""
+    logging.info("🔑 Autenticando com o Salesforce via JWT (método robusto)...")
+    config = Config()
+    if not all([config.SF_CLIENT_ID, config.SF_USERNAME, config.SF_AUDIENCE, config.SF_LOGIN_URL]):
+        raise ValueError("Variáveis de ambiente de autenticação faltando no .env.")
+    
+    try:
+        with open('private.pem', 'r') as f: private_key = f.read()
+    except FileNotFoundError:
+        logging.error("❌ Arquivo 'private.pem' não encontrado."); raise
+
+    payload = {'iss': config.SF_CLIENT_ID, 'sub': config.SF_USERNAME, 'aud': config.SF_AUDIENCE, 'exp': int(time.time()) + 300}
+    assertion = jwt.encode(payload, private_key, algorithm='RS256')
+    params = {'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': assertion}
+    token_url = urljoin(config.SF_LOGIN_URL, "/services/oauth2/token")
+    
+    proxies = {'http': config.PROXY_URL, 'https': config.PROXY_URL} if config.USE_PROXY and config.PROXY_URL else None
+    
+    try:
+        res = requests.post(token_url, data=params, proxies=proxies, verify=config.VERIFY_SSL)
+        res.raise_for_status()
+        logging.info("✅ Autenticação bem-sucedida.")
+        return res.json()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"❌ Erro na autenticação: {e.response.text if e.response else e}"); raise
+
 def read_activation_fields_from_csv(file_path):
     """Lê um arquivo CSV para extrair um conjunto de nomes de API de campos utilizados."""
     used_fields = set()
@@ -123,7 +149,6 @@ def read_activation_fields_from_csv(file_path):
             if field_column_name not in reader.fieldnames:
                  logging.warning(f"⚠️ Arquivo '{file_path}' encontrado, mas a coluna esperada '{field_column_name}' não existe. Pulando análise deste arquivo.")
                  return used_fields
-
             for row in reader:
                 if field_api_name := row.get(field_column_name):
                     used_fields.add(field_api_name.strip())
@@ -148,20 +173,18 @@ def days_since(date_obj):
     return (datetime.now(timezone.utc) - date_obj).days
 
 # ==============================================================================
-# ---  ক্লা Salesforce API Client ---
+# --- Salesforce API Client ---
 # ==============================================================================
 class SalesforceClient:
-    """Encapsula a autenticação e as chamadas à API do Salesforce com lógica de retry."""
-
-    def __init__(self, config):
+    """Encapsula as chamadas à API do Salesforce com lógica de retry."""
+    def __init__(self, config, auth_data):
         self.config = config
-        self.access_token = None
-        self.instance_url = None
+        self.access_token = auth_data['access_token']
+        self.instance_url = auth_data['instance_url']
         self.session = None
         self.semaphore = asyncio.Semaphore(config.SEMAPHORE_LIMIT)
 
     async def __aenter__(self):
-        await self._authenticate()
         headers = {
             'Authorization': f'Bearer {self.access_token}',
             'Content-Type': 'application/json',
@@ -178,33 +201,8 @@ class SalesforceClient:
         if self.session and not self.session.closed:
             await self.session.close()
 
-    async def _authenticate(self):
-        logging.info("🔑 Autenticando com o Salesforce via JWT...")
-        if not all([self.config.SF_CLIENT_ID, self.config.SF_USERNAME, self.config.SF_AUDIENCE, self.config.SF_LOGIN_URL]):
-            raise ValueError("Variáveis de ambiente de autenticação faltando no .env.")
-        
-        try:
-            with open('private.pem', 'r') as f: private_key = f.read()
-        except FileNotFoundError:
-            logging.error("❌ Arquivo 'private.pem' não encontrado."); raise
-
-        payload = {'iss': self.config.SF_CLIENT_ID, 'sub': self.config.SF_USERNAME, 'aud': self.config.SF_AUDIENCE, 'exp': int(time.time()) + 300}
-        assertion = jwt.encode(payload, private_key, algorithm='RS256')
-        params = {'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': assertion}
-        token_url = urljoin(self.config.SF_LOGIN_URL, "/services/oauth2/token")
-        
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.post(token_url, data=params, proxy=self.config.PROXY_URL if self.config.USE_PROXY else None, ssl=self.config.VERIFY_SSL) as res:
-                    res.raise_for_status()
-                    data = await res.json()
-                    self.access_token = data['access_token']
-                    self.instance_url = data['instance_url']
-                    logging.info("✅ Autenticação bem-sucedida.")
-            except aiohttp.ClientError as e:
-                logging.error(f"❌ Erro na autenticação: {e}"); raise
-
     async def fetch_api_data(self, relative_url, key_name=None):
+        """Busca dados de uma API REST com paginação e retentativas."""
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
                 try:
@@ -232,6 +230,7 @@ class SalesforceClient:
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para {relative_url[:60]} falharam."); raise e
 
     async def execute_query_job(self, query):
+        """Executa uma query via Bulk API 2.0 com retentativas."""
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
                 try:
@@ -263,6 +262,7 @@ class SalesforceClient:
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para o job de query '{query[:50]}...' falharam."); raise e
 
     async def fetch_records_in_bulk(self, object_name, fields, record_ids):
+        """Busca múltiplos registros em lotes usando a Bulk API."""
         if not record_ids: return []
         tasks, field_str = [], ", ".join(fields)
         for i in range(0, len(record_ids), self.config.BULK_CHUNK_SIZE):
@@ -274,6 +274,7 @@ class SalesforceClient:
         return [record for record_list in results if record_list for record in record_list]
 
     async def fetch_users_by_id(self, user_ids):
+        """Busca usernames de usuários a partir de seus IDs."""
         if not user_ids: return {}
         users = await self.fetch_records_in_bulk('User', ['Id', 'Username'], list(user_ids))
         return {user['Id']: user.get('Username', 'Nome não encontrado') for user in users}
@@ -282,6 +283,7 @@ class SalesforceClient:
 # --- 📊 FUNÇÕES DE ANÁLISE E PROCESSAMENTO ---
 # ==============================================================================
 def find_fields_in_content(content_string, usage_type, object_name, object_api_name, used_fields_details, debug_data):
+    """Usa regex para encontrar nomes de campos em uma string de conteúdo."""
     if not content_string: return
     debug_data.append({'SOURCE_OBJECT_TYPE': usage_type, 'SOURCE_OBJECT_ID': object_api_name, 'SOURCE_OBJECT_NAME': object_name, 'RAW_CONTENT': content_string})
     for match in Config.FIELD_NAME_PATTERN.finditer(html.unescape(str(content_string))):
@@ -290,6 +292,7 @@ def find_fields_in_content(content_string, usage_type, object_name, object_api_n
         used_fields_details[field_name].append(usage_context)
 
 def write_csv_report(filename, data, headers):
+    """Escreve uma lista de dicionários em um arquivo CSV."""
     if not data:
         logging.info(f"ℹ️ Nenhum dado para gerar o relatório '{filename}'.")
         return
@@ -303,9 +306,11 @@ def write_csv_report(filename, data, headers):
         logging.error(f"❌ Erro ao escrever o arquivo {filename}: {e}")
         
 def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_map):
+    """Classifica todos os campos de DMOs em 'utilizados' ou 'não utilizados'."""
     logging.info("--- FASE 3/4: Classificando campos... ---")
     used_results, unused_results = [], []
     
+    # Aplica a regra de carência de 90 dias
     for dmo_name, dmo_info in dmo_creation_info.items():
         created_date = parse_sf_date(dmo_info.get('CreatedDate'))
         if created_date and days_since(created_date) <= Config.GRACE_PERIOD_DAYS:
@@ -316,11 +321,13 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
                     if not any(u['usage_type'] == usage_context['usage_type'] for u in used_fields_details[field_api_name]):
                         used_fields_details[field_api_name].append(usage_context)
 
+    # Itera sobre todos os campos e classifica-os
     for dmo_name, data in all_dmo_fields.items():
         creator_id = dmo_creation_info.get(dmo_name, {}).get('CreatedById') or dmo_creation_info.get(dmo_name, {}).get('createdById')
         creator_name = user_map.get(creator_id, 'Desconhecido')
         
         for field_api_name, field_display_name in data['fields'].items():
+            # Regra de exclusão de campos
             if any(field_api_name.startswith(p) for p in Config.FIELD_PREFIXES_TO_EXCLUDE) or field_api_name in Config.SPECIFIC_FIELDS_TO_EXCLUDE:
                 continue
             
@@ -337,9 +344,15 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
 # --- 🚀 ORQUESTRADOR PRINCIPAL ---
 # ==============================================================================
 async def main():
+    """Função principal que orquestra todo o processo de auditoria."""
     logging.info("🚀 Iniciando auditoria de campos de DMO...")
     config = Config()
-    async with SalesforceClient(config) as client:
+    
+    # Autenticação síncrona primeiro para máxima compatibilidade de rede
+    auth_data = get_access_token()
+    
+    # O cliente assíncrono é inicializado com os dados da autenticação já prontos
+    async with SalesforceClient(config, auth_data) as client:
         logging.info("--- FASE 1/4: Coletando metadados e objetos... ---")
         
         tasks_to_run = {
