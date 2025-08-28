@@ -1,15 +1,14 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.29 (Estável + Correções Finais)
-- BASE ESTÁVEL: Script baseado na v10.26, utilizando as queries SOQL completas
-  que não causam o erro '400 Bad Request'.
-- CORREÇÃO (DMO): Mantido o filtro que ignora DMOs sem correspondência na Tooling
-  API, evitando as linhas com 'ID não encontrado'.
-- CORREÇÃO (Data Stream): As colunas 'ID_OR_API_NAME' e 'DISPLAY_NAME' agora
-  utilizam o 'label' (nome de exibição).
-- CORREÇÃO (Data Stream & CI): A busca pelo 'CREATED_BY_NAME' foi corrigida para
-  ler os dados do criador do payload da API SSOT, resolvendo nomes 'Desconhecido'.
+Versão: 10.30 (Versão Estável Final)
+- CORREÇÃO DEFINITIVA: Restaurada a sintaxe simplificada das queries para
+  'MktSgmntActvtnAudAttribute' e 'MktSgmntActvtnContactPoint' (da v10.27),
+  que foi comprovada como a única versão que não causa o erro '400 Bad Request'
+  neste ambiente específico.
+- ESTABILIDADE: Esta versão combina a sintaxe de query estável com toda a
+  lógica de processamento de dados corrigida para DMOs, Data Streams e CIs
+  das versões anteriores.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -248,11 +247,11 @@ async def main():
         
         dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
-        # <<< INÍCIO DA CORREÇÃO (V10.29) >>>
-        # Restaurando queries completas que funcionam no ambiente do usuário para evitar 400 Bad Request
-        activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
-        contact_point_query = "SELECT Id, ContactPointFilterExpression, ContactPointPath, CreatedById FROM MktSgmntActvtnContactPoint"
-        # <<< FIM DA CORREÇÃO (V10.29) >>>
+        # <<< INÍCIO DA CORREÇÃO (V10.30) >>>
+        # Restaurando queries simplificadas da v10.27 que não causam erro 400.
+        activation_attributes_query = "SELECT Id, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
+        contact_point_query = "SELECT Id, CreatedById FROM MktSgmntActvtnContactPoint"
+        # <<< FIM DA CORREÇÃO (V10.30) >>>
         
         initial_tasks = [
             fetch_api_data(session, f"/services/data/{API_VERSION}/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
@@ -303,7 +302,7 @@ async def main():
         collections_with_creators = [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams, contact_point_usages]
         for collection in collections_with_creators:
             for item in collection:
-                if creator_id := (item.get('CreatedById') or item.get('createdById')):
+                if creator_id := (item.get('CreatedById') or item.get('createdById') or (item.get('createdBy') and item['createdBy'].get('id'))):
                     all_creator_ids.add(creator_id)
         
         logging.info(f"Coletados {len(all_creator_ids)} IDs de criadores únicos para buscar nomes.")
@@ -438,7 +437,7 @@ async def main():
                 created_by_info = ds.get('createdBy', {})
                 creator_name = created_by_info.get('name')
                 if not creator_name:
-                    creator_id = ds.get('createdById') or created_by_info.get('id')
+                    creator_id = ds.get('createdById') or created_by_info.get('id') or (created_by_info and created_by_info.get('id'))
                     creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
 
                 has_mappings = bool(ds.get('mappings'))
@@ -460,7 +459,7 @@ async def main():
                 created_by_info = ci.get('createdBy', {})
                 creator_name = created_by_info.get('name')
                 if not creator_name:
-                    creator_id = ci.get('createdById') or created_by_info.get('id')
+                    creator_id = ci.get('createdById') or created_by_info.get('id') or (created_by_info and created_by_info.get('id'))
                     creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
 
                 reason = "Inativo (último processamento bem-sucedido > 90d)"
