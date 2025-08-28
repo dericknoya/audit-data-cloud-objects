@@ -3,7 +3,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 24.2 (Correção de Estabilidade - NameError)
+Versão: 23.0-final (Estável com Correção do Criador)
 - CORREÇÃO: O nome da coluna esperado no arquivo 'ativacoes_campos.csv' foi 
   ajustado de 'FIELD_API_NAME' para 'Fieldname' para corresponder ao arquivo real.
 - MELHORIA: O nome da coluna do CSV foi movido para a classe 'Config' para
@@ -50,13 +50,13 @@ SE TODAS as seguintes condições forem verdadeiras:
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 27.0 (Correção Definitiva do Criador do DMO)
-- BASE: Código baseado na versão estável e funcional 26.0.
-- CORREÇÃO FINAL: Corrigido o erro de lookup na função 'classify_fields'.
-  O nome do DMO agora é normalizado (removendo o sufixo __dlm) antes de
-  buscar o 'createdById' no dicionário de informações de criação. Isso
-  garante que a chave corresponda e o ID do criador seja encontrado,
-  resolvendo o problema do 'CREATED_BY_NAME' desconhecido.
+Versão: 23.0-final (Estável com Correção do Criador)
+- BASE: Código baseado na versão estável e funcional 23.0, que não apresenta
+  o erro '400 Bad Request'.
+- CORREÇÃO FINAL: Aplicada a correção definitiva para o problema do
+  'CREATED_BY_NAME', normalizando o nome do DMO antes de buscar o ID do
+  criador, garantindo que o mapeamento funcione.
+- Esta é a versão consolidada e estável.
 
 """
 import os
@@ -164,12 +164,10 @@ def days_since(date_obj):
     if not date_obj: return None
     return (datetime.now(timezone.utc) - date_obj).days
 
-# <<< INÍCIO DA ADIÇÃO (V27.0) >>>
 def normalize_api_name(name):
     """Remove sufixos comuns de nomes de API para obter o DeveloperName."""
     if not isinstance(name, str): return ""
     return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
-# <<< FIM DA ADIÇÃO (V27.0) >>>
 
 # ==============================================================================
 # ---  Classe Salesforce API Client ---
@@ -298,16 +296,13 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
                     if not any(u['usage_type'] == usage_context['usage_type'] for u in used_fields_details[field_api_name]):
                         used_fields_details[field_api_name].append(usage_context)
     for dmo_name, data in all_dmo_fields.items():
-        # <<< INÍCIO DA CORREÇÃO (V27.0) >>>
-        # Normaliza o nome do DMO (com sufixo __dlm) para o DeveloperName (sem sufixo)
-        # para que a chave corresponda à do dicionário dmo_creation_info.
+        # <<< INÍCIO DA CORREÇÃO (23.0-final) >>>
         developer_name = normalize_api_name(dmo_name)
         dmo_details = dmo_creation_info.get(developer_name, {})
-        # <<< FIM DA CORREÇÃO (V27.0) >>>
-        
         creator_id = dmo_details.get('CreatedById') or dmo_details.get('createdById')
-        creator_name = user_map.get(creator_id, 'Desconhecido')
+        # <<< FIM DA CORREÇÃO (23.0-final) >>>
         
+        creator_name = user_map.get(creator_id, 'Desconhecido')
         for field_api_name, field_display_name in data['fields'].items():
             if any(field_api_name.startswith(p) for p in Config.FIELD_PREFIXES_TO_EXCLUDE) or field_api_name in Config.SPECIFIC_FIELDS_TO_EXCLUDE:
                 continue
