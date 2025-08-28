@@ -2,17 +2,13 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 11.0 (Correções de Precisão para Data Streams e Criadores)
-- CORREÇÃO (Data Stream): A lógica para detectar mapeamentos foi refeita.
-  Agora o script verifica ativamente as relações de DMOs para determinar
-  se um Data Stream possui mapeamentos, corrigindo falsos negativos.
-- CORREÇÃO (Data Stream): O ID do Data Stream agora é corretamente capturado
-  e preenchido na coluna 'ID_OR_API_NAME'.
-- CORREÇÃO (Data Stream): O nome exibido na coluna 'DISPLAY_NAME' agora é
-  o nome do Data Stream (ex: "Like Dislike") e não o nome do DLO.
-- CORREÇÃO (Criadores): A coleta de IDs de criadores foi expandida para
-  incluir Data Streams e Calculated Insights, garantindo que a coluna
-  'CREATED_BY_NAME' seja preenchida corretamente para todos os objetos.
+Versão: 11.1 (Correção de Query SOQL na Bulk API)
+- CORREÇÃO CRÍTICA: Corrigido um erro de formatação na cláusula IN das queries
+  SOQL geradas para a Bulk API (ex: ao buscar MarketSegment). Isso resolve
+  o erro 'Bad Request' (400) que impedia a execução. A formatação agora
+  corresponde à da versão funcional 10.24.
+- MANTÉM: Todas as correções de precisão da versão 11.0 para Data Streams
+  e nomes de criadores.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -201,7 +197,11 @@ async def fetch_records_in_bulk(session, semaphore, object_name, fields, record_
     tasks = []
     for i in range(0, len(record_ids), Config.CHUNK_SIZE):
         chunk = record_ids[i:i + Config.CHUNK_SIZE]
-        query = f"SELECT {', '.join(fields)} FROM {object_name} WHERE Id IN ({','.join(f'\'{r_id}\'' for r_id in chunk)})"
+        # <<< INÍCIO DA CORREÇÃO (V11.1) >>>
+        # Formata a lista de IDs corretamente, com cada ID entre aspas
+        formatted_ids = "','".join(chunk)
+        query = f"SELECT {', '.join(fields)} FROM {object_name} WHERE Id IN ('{formatted_ids}')"
+        # <<< FIM DA CORREÇÃO (V11.1) >>>
         tasks.append(execute_query_job(session, query, semaphore))
     results = await tqdm.gather(*tasks, desc=f"Buscando {object_name} (Bulk API)")
     return [record for record_list in results if record_list for record in record_list]
@@ -243,7 +243,7 @@ async def main():
                 data[task_name] = results[i]
 
         dmo_info_map = {rec['DeveloperName']: rec for rec in data["dmo_tooling"]}
-        segment_ids = [rec['Id'] for rec in data["segments"]]
+        segment_ids = [rec['Id'] for rec in data["segments"] if rec.get('Id')]
 
         logging.info("--- Etapa 2: Buscando detalhes de Segmentos e Ativações ---")
         activations = await execute_query_job(session, "SELECT MarketSegmentId, LastModifiedDate FROM MarketSegmentActivation", semaphore)
@@ -295,7 +295,7 @@ async def main():
             if not seg_id: continue
             last_pub_date = segment_publications.get(seg_id)
             if not last_pub_date or last_pub_date < (now - timedelta(days=Config.SEGMENT_INACTIVITY_DAYS)):
-                is_nested = seg_id in nested_segment_parents.keys()
+                is_nested = seg_id in nested_segment_parents
                 reason = f"Inativo, mas usado como filtro em outros segmentos" if is_nested else 'Inativo (sem atividade recente e não é filtro aninhado)'
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': seg.get('Name'), 'OBJECT_TYPE': 'SEGMENT', 'STATUS': seg.get('SegmentStatus'), 'REASON': reason, 'DIAS_ATIVIDADE': days_since(last_pub_date), 'CREATED_BY_NAME': user_id_to_name_map.get(seg.get('CreatedById'), 'Desconhecido'), 'DELETION_IDENTIFIER': seg.get('Name')})
 
