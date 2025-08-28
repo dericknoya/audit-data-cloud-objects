@@ -1,17 +1,11 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.25 (Refinamento de Data Streams e CIs)
-- CORREÇÃO (Data Stream): A coluna 'DISPLAY_NAME' agora usa o 'label' do Data
-  Stream (nome de exibição) em vez do nome do DLO.
-- CORREÇÃO (Data Stream): A coluna 'ID_OR_API_NAME' é preenchida com o nome do DLO
-  e 'DELETION_IDENTIFIER' com o ID único, melhorando a clareza e utilidade.
-- CORREÇÃO (Data Stream): A lógica para detectar mapeamentos foi aprimorada para
-  interpretar corretamente listas vazias, tornando a coluna 'REASON' mais precisa.
-- CORREÇÃO (Data Stream & CI): A busca pelo 'CREATED_BY_NAME' foi corrigida para
-  ler o nome do criador diretamente do payload da API (objeto 'createdBy'),
-  resolvendo o problema de nomes 'Desconhecido'.
-- Mantém a estabilidade e a lógica central da v10.24.
+Versão: 10.26 (Correção de NameError)
+- CORREÇÃO: Corrigido um erro 'NameError: name 'all_records' is not defined' na
+  função fetch_users_by_id, que foi introduzido na versão anterior. A variável
+  correta 'all_users' foi restaurada, permitindo a execução completa do script.
+- Mantém todas as funcionalidades e correções da v10.25.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -226,7 +220,7 @@ async def fetch_records_in_bulk(session, semaphore, object_name, fields, record_
 async def fetch_users_by_id(session, semaphore, user_ids):
     if not user_ids: return []
     all_users, tasks = [], []
-    field_str = "Id, Name" 
+    field_str = "Id, Name"
     for i in range(0, len(user_ids), CHUNK_SIZE):
         chunk = user_ids[i:i + CHUNK_SIZE]; formatted_ids = "','".join(chunk)
         query = f"SELECT {field_str} FROM User WHERE Id IN ('{formatted_ids}')"
@@ -234,7 +228,9 @@ async def fetch_users_by_id(session, semaphore, user_ids):
         tasks.append(fetch_api_data(session, url, semaphore, 'records'))
     results = await tqdm.gather(*tasks, desc="Buscando nomes de criadores (REST API)")
     for record_list in results:
-        if record_list: all_records.extend(record_list)
+        # <<< INÍCIO DA CORREÇÃO (V10.26) >>>
+        if record_list: all_users.extend(record_list)
+        # <<< FIM DA CORREÇÃO (V10.26) >>>
     return all_users
 
 # --- Main Audit Logic ---
@@ -428,7 +424,6 @@ async def main():
             if not last_updated or last_updated < thirty_days_ago:
                 days_inactive = days_since(last_updated)
                 
-                # <<< INÍCIO DA CORREÇÃO (V10.25) >>>
                 ds_display_name = ds.get('label') or ds.get('name')
                 ds_api_name = ds.get('name')
                 ds_id = ds.get('id')
@@ -447,7 +442,6 @@ async def main():
                 else:
                     reason = "Inativo (sem ingestão > 30d, mas possui mapeamentos)"
                     audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_api_name, 'DISPLAY_NAME': ds_display_name, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_id})
-                # <<< FIM DA CORREÇÃO (V10.25) >>>
         
         logging.info("Auditando Calculated Insights...")
         for ci in calculated_insights:
@@ -456,13 +450,11 @@ async def main():
                 days_inactive = days_since(last_processed)
                 ci_name = ci.get('name')
                 
-                # <<< INÍCIO DA CORREÇÃO (V10.25) >>>
                 created_by_info = ci.get('createdBy', {})
                 creator_name = created_by_info.get('name')
                 if not creator_name:
                     creator_id = ci.get('createdById') or created_by_info.get('id')
                     creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
-                # <<< FIM DA CORREÇÃO (V10.25) >>>
 
                 reason = "Inativo (último processamento bem-sucedido > 90d)"
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ci_name, 'DISPLAY_NAME': ci.get('displayName'), 'OBJECT_TYPE': 'CALCULATED_INSIGHT', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Último Processamento', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ci_name})
