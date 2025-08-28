@@ -3,7 +3,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 26.3-diag (Diagnóstico Avançado do Criador do DMO)
+Versão: 24.2 (Correção de Estabilidade - NameError)
 - CORREÇÃO: O nome da coluna esperado no arquivo 'ativacoes_campos.csv' foi 
   ajustado de 'FIELD_API_NAME' para 'Fieldname' para corresponder ao arquivo real.
 - MELHORIA: O nome da coluna do CSV foi movido para a classe 'Config' para
@@ -50,14 +50,13 @@ SE TODAS as seguintes condições forem verdadeiras:
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 26.3-diag (Diagnóstico Avançado do Criador do DMO)
-- ADICIONADO: Função de diagnóstico 'dump_to_json' para salvar variáveis em
-  arquivos e permitir uma depuração aprofundada.
-- ADICIONADO: Geração de 3 arquivos de depuração:
-  1. debug_dmo_payload.json: Dados brutos dos DMOs recebidos da API.
-  2. debug_user_map.json: O mapa de ID de usuário para nome de usuário.
-  3. debug_classification_trace.txt: Um log da tentativa de mapeamento para cada DMO.
-- Nenhuma outra lógica funcional foi alterada. Baseado na versão estável 26.0.
+Versão: 27.0 (Correção Definitiva do Criador do DMO)
+- BASE: Código baseado na versão estável e funcional 26.0.
+- CORREÇÃO FINAL: Corrigido o erro de lookup na função 'classify_fields'.
+  O nome do DMO agora é normalizado (removendo o sufixo __dlm) antes de
+  buscar o 'createdById' no dicionário de informações de criação. Isso
+  garante que a chave corresponda e o ID do criador seja encontrado,
+  resolvendo o problema do 'CREATED_BY_NAME' desconhecido.
 
 """
 import os
@@ -85,7 +84,6 @@ from tqdm.asyncio import tqdm
 load_dotenv()
 
 class Config:
-    # ... (Configuração inalterada) ...
     USE_PROXY = os.getenv("USE_PROXY", "True").lower() == "true"
     PROXY_URL = os.getenv("PROXY_URL")
     VERIFY_SSL = os.getenv("VERIFY_SSL", "False").lower() == "true"
@@ -109,26 +107,13 @@ class Config:
     ACTIVATION_FIELDS_CSV_COLUMN = 'Fieldname' 
     FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
 
-
 # Configuração do Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ==============================================================================
 # --- 헬 Helpers & Funções Auxiliares ---
 # ==============================================================================
-# <<< INÍCIO DA ADIÇÃO (V26.3-diag) >>>
-def dump_to_json(data, filename):
-    """Salva uma variável em um arquivo JSON formatado para depuração."""
-    logging.info(f"🔍 Gerando arquivo de depuração: {filename}")
-    # Converte set para list para ser serializável em JSON
-    if isinstance(data, set):
-        data = list(data)
-    with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
-# <<< FIM DA ADIÇÃO (V26.3-diag) >>>
-
 def get_access_token():
-    # ... (Função inalterada) ...
     logging.info("🔑 Autenticando com o Salesforce via JWT (método robusto)...")
     config = Config()
     if not all([config.SF_CLIENT_ID, config.SF_USERNAME, config.SF_AUDIENCE, config.SF_LOGIN_URL]):
@@ -151,7 +136,6 @@ def get_access_token():
         logging.error(f"❌ Erro na autenticação: {e.response.text if e.response else e}"); raise
 
 def read_activation_fields_from_csv(config):
-    # ... (Função inalterada) ...
     used_fields = set()
     file_path = config.ACTIVATION_FIELDS_CSV
     field_column_name = config.ACTIVATION_FIELDS_CSV_COLUMN
@@ -180,11 +164,17 @@ def days_since(date_obj):
     if not date_obj: return None
     return (datetime.now(timezone.utc) - date_obj).days
 
+# <<< INÍCIO DA ADIÇÃO (V27.0) >>>
+def normalize_api_name(name):
+    """Remove sufixos comuns de nomes de API para obter o DeveloperName."""
+    if not isinstance(name, str): return ""
+    return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
+# <<< FIM DA ADIÇÃO (V27.0) >>>
+
 # ==============================================================================
 # ---  Classe Salesforce API Client ---
 # ==============================================================================
 class SalesforceClient:
-    # ... (Classe inalterada) ...
     def __init__(self, config, auth_data):
         self.config = config
         self.access_token = auth_data['access_token']
@@ -298,11 +288,6 @@ def write_csv_report(filename, data, headers):
 def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_map):
     logging.info("--- FASE 3/4: Classificando campos... ---")
     used_results, unused_results = [], []
-    
-    # <<< INÍCIO DA ADIÇÃO (V26.3-diag) >>>
-    trace_log_lines = []
-    # <<< FIM DA ADIÇÃO (V26.3-diag) >>>
-
     for dmo_name, dmo_info in dmo_creation_info.items():
         created_date = parse_sf_date(dmo_info.get('CreatedDate'))
         if created_date and days_since(created_date) <= Config.GRACE_PERIOD_DAYS:
@@ -312,17 +297,17 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
                     if field_api_name not in used_fields_details: used_fields_details[field_api_name] = []
                     if not any(u['usage_type'] == usage_context['usage_type'] for u in used_fields_details[field_api_name]):
                         used_fields_details[field_api_name].append(usage_context)
-
     for dmo_name, data in all_dmo_fields.items():
-        dmo_details = dmo_creation_info.get(dmo_name, {})
+        # <<< INÍCIO DA CORREÇÃO (V27.0) >>>
+        # Normaliza o nome do DMO (com sufixo __dlm) para o DeveloperName (sem sufixo)
+        # para que a chave corresponda à do dicionário dmo_creation_info.
+        developer_name = normalize_api_name(dmo_name)
+        dmo_details = dmo_creation_info.get(developer_name, {})
+        # <<< FIM DA CORREÇÃO (V27.0) >>>
+        
         creator_id = dmo_details.get('CreatedById') or dmo_details.get('createdById')
         creator_name = user_map.get(creator_id, 'Desconhecido')
         
-        # <<< INÍCIO DA ADIÇÃO (V26.3-diag) >>>
-        found_in_map = "SIM" if creator_id in user_map else "NAO"
-        trace_log_lines.append(f"DMO: {dmo_name:<50} | ID do Criador: {str(creator_id):<20} | Encontrado no Mapa: {found_in_map} | Nome Mapeado: {creator_name}")
-        # <<< FIM DA ADIÇÃO (V26.3-diag) >>>
-
         for field_api_name, field_display_name in data['fields'].items():
             if any(field_api_name.startswith(p) for p in Config.FIELD_PREFIXES_TO_EXCLUDE) or field_api_name in Config.SPECIFIC_FIELDS_TO_EXCLUDE:
                 continue
@@ -331,16 +316,6 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
                 used_results.append({'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name, 'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 'USAGE_COUNT': len(usages), 'USAGE_TYPES': ", ".join(sorted(list(set(u['usage_type'] for u in usages)))), 'CREATED_BY_NAME': creator_name})
             else:
                 unused_results.append({'DELETAR': 'NAO', 'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name, 'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 'REASON': 'Não utilizado e DMO com mais de 90 dias', 'CREATED_BY_NAME': creator_name})
-    
-    # <<< INÍCIO DA ADIÇÃO (V26.3-diag) >>>
-    try:
-        with open('debug_classification_trace.txt', 'w', encoding='utf-8') as f:
-            f.write('\n'.join(trace_log_lines))
-        logging.info("🔍 Arquivo de rastreamento 'debug_classification_trace.txt' gerado.")
-    except IOError as e:
-        logging.error(f"❌ Não foi possível escrever o arquivo de rastreamento: {e}")
-    # <<< FIM DA ADIÇÃO (V26.3-diag) >>>
-    
     logging.info(f"📊 Classificação concluída: {len(used_results)} campos utilizados, {len(unused_results)} campos não utilizados.")
     return used_results, unused_results
 
@@ -373,10 +348,6 @@ async def main():
             else: data[task_name] = result
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
         
-        # <<< INÍCIO DA ADIÇÃO (V26.3-diag) >>>
-        dump_to_json(data['dmo_tooling'], 'debug_dmo_payload.json')
-        # <<< FIM DA ADIÇÃO (V26.3-diag) >>>
-        
         dmo_creation_info = {rec['DeveloperName']: rec for rec in data['dmo_tooling']}
         segment_ids = [rec['Id'] for rec in data['segments'] if rec.get('Id')]
         
@@ -391,10 +362,6 @@ async def main():
             client.fetch_records_in_bulk("MarketSegment", ["Id", "Name", "IncludeCriteria", "ExcludeCriteria"], segment_ids),
             client.fetch_users_by_id(dmo_creator_ids)
         )
-        
-        # <<< INÍCIO DA ADIÇÃO (V26.3-diag) >>>
-        dump_to_json(user_id_to_name_map, 'debug_user_map.json')
-        # <<< FIM DA ADIÇÃO (V26.3-diag) >>>
         
         logging.info(f"✅ Detalhes de {len(segments_list)} segmentos e {len(user_id_to_name_map)} usuários coletados.")
 
