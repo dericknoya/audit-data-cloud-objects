@@ -45,17 +45,16 @@ SE TODAS as seguintes condições forem verdadeiras:
 
 ================================================================================
 """
-# -*- coding: utf-8 -*-
 """
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 24.2 (Correção de Estabilidade - NameError)
-- CORREÇÃO CRÍTICA: Corrigido o erro 'NameError: name 'semaphore' is not defined'
-  causado pela remoção acidental da inicialização do semáforo na versão anterior.
-  A estabilidade da versão 23.1 foi restaurada.
-- MANTÉM: A lógica corrigida e focada na busca do 'createdById' do DMO pai 
-  para preencher corretamente a coluna 'CREATED_BY_NAME'.
+Versão: 25.0 (Estável com Correção do Criador)
+- BASE: Código baseado na versão estável 23.1 para garantir a execução
+  correta das queries de job e evitar o erro 'Bad Request'.
+- CORREÇÃO: Aplicada a lógica focada da versão 24.1 para coletar e mapear 
+  o 'createdById' exclusivamente do DMO pai de cada campo. Isso resolve o
+  problema do 'CREATED_BY_NAME' desconhecido, mantendo a estabilidade.
 
 """
 import os
@@ -308,14 +307,8 @@ async def main():
     config = Config()
     auth_data = get_access_token()
     async with SalesforceClient(config, auth_data) as client:
-        # <<< INÍCIO DA CORREÇÃO (V24.2) >>>
-        # A inicialização do semaphore foi acidentalmente removida e agora está restaurada.
-        semaphore = asyncio.Semaphore(config.SEMAPHORE_LIMIT)
-        # <<< FIM DA CORREÇÃO (V24.2) >>>
-
         logging.info("--- FASE 1/4: Coletando metadados e objetos... ---")
         
-        # As chamadas agora não precisam mais passar o 'semaphore', pois ele é gerenciado dentro do client.
         tasks_to_run = {
             "dmo_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': 'SELECT DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject'})}", 'records'),
             "dmo_metadata": client.fetch_api_data(f"/services/data/{config.API_VERSION}/ssot/metadata?entityType=DataModelObject", 'metadata'),
@@ -340,6 +333,8 @@ async def main():
         
         logging.info(f"Dados processáveis: {len(dmo_creation_info)} DMOs, {len(segment_ids)} Segmentos, {len(data['activations'])} Ativações.")
         
+        # <<< INÍCIO DA CORREÇÃO (V25.0) >>>
+        # Coleta de IDs focada apenas nos DMOs, que são os pais dos campos.
         dmo_creator_ids = set()
         for dmo_details in dmo_creation_info.values():
             if creator_id := (dmo_details.get('CreatedById') or dmo_details.get('createdById')):
@@ -347,8 +342,10 @@ async def main():
         
         segments_list, user_id_to_name_map = await asyncio.gather(
             client.fetch_records_in_bulk("MarketSegment", ["Id", "Name", "IncludeCriteria", "ExcludeCriteria"], segment_ids),
-            client.fetch_users_by_id(dmo_creator_ids)
+            client.fetch_users_by_id(dmo_creator_ids) # Busca apenas os nomes dos criadores de DMOs
         )
+        # <<< FIM DA CORREÇÃO (V25.0) >>>
+        
         logging.info(f"✅ Detalhes de {len(segments_list)} segmentos e {len(user_id_to_name_map)} usuários coletados.")
 
         logging.info("--- FASE 2/4: Analisando o uso dos campos... ---")
