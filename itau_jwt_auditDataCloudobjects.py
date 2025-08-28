@@ -1,15 +1,11 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.24 (Ajustes Finais de Saída para DMOs)
-- AJUSTE FINAL: Refinadas as colunas de saída para DMOs para otimizar o
-  processo de exclusão subsequente.
-- A coluna 'ID_OR_API_NAME' para DMOs agora contém o Id do objeto da Tooling
-  API (ex: 0gj...).
-- A coluna 'DELETION_IDENTIFIER' para DMOs contém o nome completo da API com o
-  sufixo __dlm (ex: MeuObjeto__dlm), que é o identificador correto para
-  operações de delete.
-- Mantém a correção de lógica da v10.23.
+Versão: 10.27 (Revertida para Estabilidade)
+- REVERSÃO: Retornando à sintaxe de query da v10.27, que se provou estável e não
+  causa o erro '400 Bad Request' neste ambiente.
+- Mantém as correções de lógica para DMOs, Data Streams e Calculated Insights
+  implementadas até a versão mais recente.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -224,7 +220,7 @@ async def fetch_records_in_bulk(session, semaphore, object_name, fields, record_
 async def fetch_users_by_id(session, semaphore, user_ids):
     if not user_ids: return []
     all_users, tasks = [], []
-    field_str = "Id, Name" 
+    field_str = "Id, Name"
     for i in range(0, len(user_ids), CHUNK_SIZE):
         chunk = user_ids[i:i + CHUNK_SIZE]; formatted_ids = "','".join(chunk)
         query = f"SELECT {field_str} FROM User WHERE Id IN ('{formatted_ids}')"
@@ -248,8 +244,11 @@ async def main():
         
         dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
-        activation_attributes_query = "SELECT Id, QueryPath, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
-        contact_point_query = "SELECT Id, ContactPointFilterExpression, ContactPointPath, CreatedById FROM MktSgmntActvtnContactPoint"
+        # <<< INÍCIO DA CORREÇÃO (V10.30) >>>
+        # Restaurando queries simplificadas da v10.27 que não causam erro 400.
+        activation_attributes_query = "SELECT Id, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
+        contact_point_query = "SELECT Id, CreatedById FROM MktSgmntActvtnContactPoint"
+        # <<< FIM DA CORREÇÃO (V10.30) >>>
         
         initial_tasks = [
             fetch_api_data(session, f"/services/data/{API_VERSION}/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
@@ -300,7 +299,7 @@ async def main():
         collections_with_creators = [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams, contact_point_usages]
         for collection in collections_with_creators:
             for item in collection:
-                if creator_id := (item.get('CreatedById') or item.get('createdById')):
+                if creator_id := (item.get('CreatedById') or item.get('createdById') or (item.get('createdBy') and item['createdBy'].get('id'))):
                     all_creator_ids.add(creator_id)
         
         logging.info(f"Coletados {len(all_creator_ids)} IDs de criadores únicos para buscar nomes.")
@@ -389,6 +388,9 @@ async def main():
             lookup_key = normalize_api_name(dmo_name)
             dmo_details = dmo_info_map.get(lookup_key, {})
 
+            if not dmo_details:
+                continue
+
             created_date = parse_sf_date(dmo_details.get('CreatedDate'))
             
             if not created_date or created_date < ninety_days_ago:
@@ -397,11 +399,8 @@ async def main():
                     days_created = days_since(created_date)
                     reason = "Órfão (não utilizado em nenhum objeto e criado > 90d)"
                     display_name = get_dmo_display_name(dmo)
-                    
-                    # <<< INÍCIO DO AJUSTE FINAL (V10.24) >>>
-                    deletion_id = dmo_name # Garante que o identificador de exclusão tem o sufixo __dlm
+                    deletion_id = dmo_name
                     dmo_tooling_id = dmo_details.get('Id', 'ID não encontrado')
-                    # <<< FIM DO AJUSTE FINAL (V10.24) >>>
                     
                     creator_id = dmo_details.get('CreatedById') or dmo_details.get('createdbyid')
                     
@@ -412,7 +411,6 @@ async def main():
 
                     audit_results.append({
                         'DELETAR': 'NAO', 
-                        # <<< INÍCIO DO AJUSTE FINAL (V10.24) >>>
                         'ID_OR_API_NAME': dmo_tooling_id, 
                         'DISPLAY_NAME': display_name, 
                         'OBJECT_TYPE': 'DMO', 
@@ -422,7 +420,6 @@ async def main():
                         'DIAS_ATIVIDADE': days_created if days_created is not None else '>90', 
                         'CREATED_BY_NAME': creator_name, 
                         'DELETION_IDENTIFIER': deletion_id
-                        # <<< FIM DO AJUSTE FINAL (V10.24) >>>
                     })
         
         logging.info("Auditando Data Streams...")
@@ -430,14 +427,24 @@ async def main():
             last_updated = parse_sf_date(ds.get('lastIngestDate'))
             if not last_updated or last_updated < thirty_days_ago:
                 days_inactive = days_since(last_updated)
-                ds_name = ds.get('name'); ds_id = ds.get('id')
-                creator_name = user_id_to_name_map.get(ds.get('createdById'), 'Desconhecido')
-                if not ds.get('mappings'):
+                
+                ds_label = ds.get('label') or ds.get('name')
+                ds_id = ds.get('id')
+                
+                created_by_info = ds.get('createdBy', {})
+                creator_name = created_by_info.get('name')
+                if not creator_name:
+                    creator_id = ds.get('createdById') or created_by_info.get('id') or (created_by_info and created_by_info.get('id'))
+                    creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
+
+                has_mappings = bool(ds.get('mappings'))
+                
+                if not has_mappings:
                     reason = "Inativo (sem ingestão > 30d e sem mapeamentos)"
-                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_id, 'DISPLAY_NAME': ds_name, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_id})
                 else:
                     reason = "Inativo (sem ingestão > 30d, mas possui mapeamentos)"
-                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_id, 'DISPLAY_NAME': ds_name, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_id})
+                
+                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_label, 'DISPLAY_NAME': ds_label, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_id})
         
         logging.info("Auditando Calculated Insights...")
         for ci in calculated_insights:
@@ -445,8 +452,14 @@ async def main():
             if not last_processed or last_processed < ninety_days_ago:
                 days_inactive = days_since(last_processed)
                 ci_name = ci.get('name')
+                
+                created_by_info = ci.get('createdBy', {})
+                creator_name = created_by_info.get('name')
+                if not creator_name:
+                    creator_id = ci.get('createdById') or created_by_info.get('id') or (created_by_info and created_by_info.get('id'))
+                    creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
+
                 reason = "Inativo (último processamento bem-sucedido > 90d)"
-                creator_name = user_id_to_name_map.get(ci.get('createdById'), 'Desconhecido')
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ci_name, 'DISPLAY_NAME': ci.get('displayName'), 'OBJECT_TYPE': 'CALCULATED_INSIGHT', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Último Processamento', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ci_name})
 
         if audit_results:
