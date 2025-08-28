@@ -1,11 +1,14 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.26 (Correção de NameError)
-- CORREÇÃO: Corrigido um erro 'NameError: name 'all_records' is not defined' na
-  função fetch_users_by_id, que foi introduzido na versão anterior. A variável
-  correta 'all_users' foi restaurada, permitindo a execução completa do script.
-- Mantém todas as funcionalidades e correções da v10.25.
+Versão: 10.27 (Ajustes Finais de Lógica e Nomenclatura)
+- MELHORIA (DMO): O script agora ignora DMOs retornados pela API de metadados que
+  não possuem um registro correspondente na Tooling API. Isso remove as linhas
+  com 'ID não encontrado' e foca apenas em DMOs que podem ser auditados com segurança.
+- CORREÇÃO (Data Stream): As colunas 'ID_OR_API_NAME' e 'DISPLAY_NAME' agora
+  utilizam corretamente o 'label' (nome de exibição) do Data Stream, em vez do
+  nome do Data Lake Object, para maior clareza no relatório.
+- Mantém a estabilidade da v10.26 sem alterar a sintaxe das queries.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -228,9 +231,7 @@ async def fetch_users_by_id(session, semaphore, user_ids):
         tasks.append(fetch_api_data(session, url, semaphore, 'records'))
     results = await tqdm.gather(*tasks, desc="Buscando nomes de criadores (REST API)")
     for record_list in results:
-        # <<< INÍCIO DA CORREÇÃO (V10.26) >>>
         if record_list: all_users.extend(record_list)
-        # <<< FIM DA CORREÇÃO (V10.26) >>>
     return all_users
 
 # --- Main Audit Logic ---
@@ -387,6 +388,12 @@ async def main():
             lookup_key = normalize_api_name(dmo_name)
             dmo_details = dmo_info_map.get(lookup_key, {})
 
+            # <<< INÍCIO DA MELHORIA (V10.27) >>>
+            # Pula DMOs "fantasmas" que não têm um registro correspondente na Tooling API.
+            if not dmo_details:
+                continue
+            # <<< FIM DA MELHORIA (V10.27) >>>
+
             created_date = parse_sf_date(dmo_details.get('CreatedDate'))
             
             if not created_date or created_date < ninety_days_ago:
@@ -424,8 +431,8 @@ async def main():
             if not last_updated or last_updated < thirty_days_ago:
                 days_inactive = days_since(last_updated)
                 
-                ds_display_name = ds.get('label') or ds.get('name')
-                ds_api_name = ds.get('name')
+                # <<< INÍCIO DA CORREÇÃO (V10.27) >>>
+                ds_label = ds.get('label') or ds.get('name')
                 ds_id = ds.get('id')
                 
                 created_by_info = ds.get('createdBy', {})
@@ -438,10 +445,11 @@ async def main():
                 
                 if not has_mappings:
                     reason = "Inativo (sem ingestão > 30d e sem mapeamentos)"
-                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_api_name, 'DISPLAY_NAME': ds_display_name, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_id})
                 else:
                     reason = "Inativo (sem ingestão > 30d, mas possui mapeamentos)"
-                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_api_name, 'DISPLAY_NAME': ds_display_name, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_id})
+                
+                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_label, 'DISPLAY_NAME': ds_label, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_id})
+                # <<< FIM DA CORREÇÃO (V10.27) >>>
         
         logging.info("Auditando Calculated Insights...")
         for ci in calculated_insights:
