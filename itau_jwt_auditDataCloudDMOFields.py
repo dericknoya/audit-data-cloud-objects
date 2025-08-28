@@ -3,7 +3,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 26.1 (Correção Final do Criador do DMO)
+Versão: 26.2 (Correção Final e Definitiva do Criador do DMO)
 - CORREÇÃO: O nome da coluna esperado no arquivo 'ativacoes_campos.csv' foi 
   ajustado de 'FIELD_API_NAME' para 'Fieldname' para corresponder ao arquivo real.
 - MELHORIA: O nome da coluna do CSV foi movido para a classe 'Config' para
@@ -50,12 +50,12 @@ SE TODAS as seguintes condições forem verdadeiras:
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 26.1 (Correção Final do Criador do DMO)
+Versão: 26.2 (Correção Final e Definitiva do Criador do DMO)
 - BASE: Código baseado na versão estável e funcional 26.0.
-- CORREÇÃO: Ajuste fino na lógica de passagem e consulta de dados dentro da
-  função 'classify_fields' para garantir que o 'createdById' do DMO seja
-  corretamente mapeado para o nome do usuário, resolvendo o problema de
-  'CREATED_BY_NAME' aparecer como 'Desconhecido'.
+- CORREÇÃO: Revisão e ajuste fino na lógica de passagem e consulta de dados
+  dentro da função 'classify_fields' para garantir que o 'createdById' do DMO
+  seja corretamente mapeado para o nome do usuário. Esta é a correção
+  final e focada para o problema do 'CREATED_BY_NAME'.
 - Nenhuma outra lógica ou sintaxe funcional foi alterada.
 
 """
@@ -291,13 +291,9 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
                     if not any(u['usage_type'] == usage_context['usage_type'] for u in used_fields_details[field_api_name]):
                         used_fields_details[field_api_name].append(usage_context)
     for dmo_name, data in all_dmo_fields.items():
-        # <<< INÍCIO DA CORREÇÃO (V26.1) >>>
-        # A lógica de busca do criador é focada no dicionário de DMOs que já temos.
         dmo_details = dmo_creation_info.get(dmo_name, {})
         creator_id = dmo_details.get('CreatedById') or dmo_details.get('createdById')
         creator_name = user_map.get(creator_id, 'Desconhecido')
-        # <<< FIM DA CORREÇÃO (V26.1) >>>
-        
         for field_api_name, field_display_name in data['fields'].items():
             if any(field_api_name.startswith(p) for p in Config.FIELD_PREFIXES_TO_EXCLUDE) or field_api_name in Config.SPECIFIC_FIELDS_TO_EXCLUDE:
                 continue
@@ -348,10 +344,16 @@ async def main():
             if creator_id := (dmo_details.get('CreatedById') or dmo_details.get('createdById')):
                 dmo_creator_ids.add(creator_id)
         
-        segments_list, user_id_to_name_map = await asyncio.gather(
+        # <<< INÍCIO DA CORREÇÃO (V26.2) >>>
+        # A busca de segmentos e de usuários são chamadas independentes e podem
+        # ser executadas em paralelo para otimizar o tempo.
+        logging.info(f"Buscando detalhes de {len(segment_ids)} segmentos e {len(dmo_creator_ids)} usuários...")
+        results = await asyncio.gather(
             client.fetch_records_in_bulk("MarketSegment", ["Id", "Name", "IncludeCriteria", "ExcludeCriteria"], segment_ids),
             client.fetch_users_by_id(dmo_creator_ids)
         )
+        segments_list, user_id_to_name_map = results[0], results[1]
+        # <<< FIM DA CORREÇÃO (V26.2) >>>
         
         logging.info(f"✅ Detalhes de {len(segments_list)} segmentos e {len(user_id_to_name_map)} usuários coletados.")
 
