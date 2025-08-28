@@ -3,7 +3,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 23.1 (Ajuste no Nome da Coluna do CSV de Ativações)
+Versão: 26.0 (Sincronia com Lógica de Chamada Estável)
 - CORREÇÃO: O nome da coluna esperado no arquivo 'ativacoes_campos.csv' foi 
   ajustado de 'FIELD_API_NAME' para 'Fieldname' para corresponder ao arquivo real.
 - MELHORIA: O nome da coluna do CSV foi movido para a classe 'Config' para
@@ -45,6 +45,20 @@ SE TODAS as seguintes condições forem verdadeiras:
 
 ================================================================================
 """
+"""
+Este script audita uma instância do Salesforce Data Cloud para identificar 
+campos de DMOs (Data Model Objects) utilizados e não utilizados.
+
+Versão: 26.0 (Sincronia com Lógica de Chamada Estável)
+- BASE: Código baseado na versão estável 25.1.
+- CORREÇÃO CRÍTICA: A sintaxe da chamada de POST na função 'execute_query_job'
+  foi ajustada para usar 'data=json.dumps(payload)' em vez de 'json=payload',
+  espelhando 100% o comportamento do script de objetos v10.27, que não
+  apresenta o erro '400 Bad Request'.
+- MANTÉM: A lógica focada para coletar e mapear o 'createdById' do DMO pai
+  para preencher corretamente a coluna 'CREATED_BY_NAME'.
+
+"""
 import os
 import time
 import asyncio
@@ -70,40 +84,27 @@ from tqdm.asyncio import tqdm
 load_dotenv()
 
 class Config:
-    # Conexão
     USE_PROXY = os.getenv("USE_PROXY", "True").lower() == "true"
     PROXY_URL = os.getenv("PROXY_URL")
     VERIFY_SSL = os.getenv("VERIFY_SSL", "False").lower() == "true"
     API_VERSION = "v60.0"
-    
-    # Salesforce JWT
     SF_CLIENT_ID = os.getenv("SF_CLIENT_ID")
     SF_USERNAME = os.getenv("SF_USERNAME")
     SF_AUDIENCE = os.getenv("SF_AUDIENCE")
     SF_LOGIN_URL = os.getenv("SF_LOGIN_URL")
-    
-    # Performance e Robustez
     SEMAPHORE_LIMIT = 50
     BULK_CHUNK_SIZE = 400
     MAX_RETRIES = 3
     RETRY_DELAY_SECONDS = 5
-    
-    # Regras de Negócio
     GRACE_PERIOD_DAYS = 90
     DMO_PREFIXES_TO_EXCLUDE = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
     FIELD_PREFIXES_TO_EXCLUDE = ('ssot__', 'KQ_')
     SPECIFIC_FIELDS_TO_EXCLUDE = {'DataSource__c', 'DataSourceObject__c', 'InternalOrganization__c'}
-    
-    # Nomes de Arquivos e Colunas
     USED_FIELDS_CSV = 'audit_campos_dmo_utilizados.csv'
     UNUSED_FIELDS_CSV = 'audit_campos_dmo_nao_utilizados.csv'
     DEBUG_CSV = 'debug_dados_de_uso.csv'
     ACTIVATION_FIELDS_CSV = 'ativacoes_campos.csv'
-    # <<< INÍCIO DA ALTERAÇÃO (V23.1) >>>
     ACTIVATION_FIELDS_CSV_COLUMN = 'Fieldname' 
-    # <<< FIM DA ALTERAÇÃO (V23.1) >>>
-    
-    # Expressão Regular
     FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
 
 # Configuração do Logging
@@ -113,55 +114,43 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- 헬 Helpers & Funções Auxiliares ---
 # ==============================================================================
 def get_access_token():
-    """Realiza a autenticação JWT de forma síncrona usando a biblioteca requests."""
     logging.info("🔑 Autenticando com o Salesforce via JWT (método robusto)...")
     config = Config()
     if not all([config.SF_CLIENT_ID, config.SF_USERNAME, config.SF_AUDIENCE, config.SF_LOGIN_URL]):
         raise ValueError("Variáveis de ambiente de autenticação faltando no .env.")
-    
     try:
         with open('private.pem', 'r') as f: private_key = f.read()
     except FileNotFoundError:
         logging.error("❌ Arquivo 'private.pem' não encontrado."); raise
-
     payload = {'iss': config.SF_CLIENT_ID, 'sub': config.SF_USERNAME, 'aud': config.SF_AUDIENCE, 'exp': int(time.time()) + 300}
     assertion = jwt.encode(payload, private_key, algorithm='RS256')
     params = {'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': assertion}
     token_url = urljoin(config.SF_LOGIN_URL, "/services/oauth2/token")
-    
     proxies = {'http': config.PROXY_URL, 'https': config.PROXY_URL} if config.USE_PROXY and config.PROXY_URL else None
-    
     try:
         res = requests.post(token_url, data=params, proxies=proxies, verify=config.VERIFY_SSL)
         res.raise_for_status()
         logging.info("✅ Autenticação bem-sucedida.")
         return res.json()
     except requests.exceptions.RequestException as e:
-        error_message = f"❌ Erro na autenticação: {e}"
-        if e.response is not None:
-            error_message += f" | Detalhes: {e.response.text}"
-        logging.error(error_message)
-        raise
+        logging.error(f"❌ Erro na autenticação: {e.response.text if e.response else e}"); raise
 
 def read_activation_fields_from_csv(config):
-    """Lê um arquivo CSV para extrair um conjunto de nomes de API de campos utilizados."""
     used_fields = set()
     file_path = config.ACTIVATION_FIELDS_CSV
     field_column_name = config.ACTIVATION_FIELDS_CSV_COLUMN
-    
     try:
         with open(file_path, mode='r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             if field_column_name not in reader.fieldnames:
                  logging.warning(f"⚠️ Arquivo '{file_path}' encontrado, mas a coluna esperada '{field_column_name}' não existe. Pulando análise deste arquivo.")
                  return used_fields
-
             for row in reader:
                 if field_api_name := row.get(field_column_name):
                     used_fields.add(field_api_name.strip())
         logging.info(f"✅ Arquivo '{file_path}' lido. {len(used_fields)} campos únicos encontrados em uso.")
     except FileNotFoundError:
-        logging.warning(f"⚠️ Arquivo de uso de ativações '{file_path}' não encontrado. A auditoria prosseguirá sem esta fonte de dados.")
+        logging.warning(f"⚠️ Arquivo '{file_path}' não encontrado. A auditoria prosseguirá sem esta fonte de dados.")
     except Exception as e:
         logging.error(f"❌ Erro inesperado ao ler o arquivo '{file_path}': {e}")
     return used_fields
@@ -176,7 +165,7 @@ def days_since(date_obj):
     return (datetime.now(timezone.utc) - date_obj).days
 
 # ==============================================================================
-# ---  ক্লা Salesforce API Client ---
+# ---  Classe Salesforce API Client ---
 # ==============================================================================
 class SalesforceClient:
     def __init__(self, config, auth_data):
@@ -185,25 +174,12 @@ class SalesforceClient:
         self.instance_url = auth_data['instance_url']
         self.session = None
         self.semaphore = asyncio.Semaphore(config.SEMAPHORE_LIMIT)
-
     async def __aenter__(self):
-        headers = {
-            'Authorization': f'Bearer {self.access_token}',
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-        }
-        connector = aiohttp.TCPConnector(ssl=self.config.VERIFY_SSL, limit_per_host=self.config.SEMAPHORE_LIMIT)
-        self.session = aiohttp.ClientSession(
-            base_url=self.instance_url,
-            headers=headers,
-            connector=connector
-        )
+        headers = {'Authorization': f'Bearer {self.access_token}', 'Content-Type': 'application/json', 'Accept': 'application/json'}
+        self.session = aiohttp.ClientSession(base_url=self.instance_url, headers=headers, connector=aiohttp.TCPConnector(ssl=self.config.VERIFY_SSL))
         return self
-
     async def __aexit__(self, exc_type, exc, tb):
-        if self.session and not self.session.closed:
-            await self.session.close()
-
+        if self.session and not self.session.closed: await self.session.close()
     async def fetch_api_data(self, relative_url, key_name=None):
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
@@ -238,8 +214,17 @@ class SalesforceClient:
                     job_url_path = f"/services/data/{self.config.API_VERSION}/jobs/query"
                     payload = {"operation": "query", "query": query, "contentType": "CSV"}
                     proxy = self.config.PROXY_URL if self.config.USE_PROXY else None
-                    async with self.session.post(job_url_path, json=payload, proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
-                        res.raise_for_status(); job_info = await res.json(); job_id = job_info['id']
+                    
+                    # <<< INÍCIO DA CORREÇÃO (V26.0) >>>
+                    # Alterado de 'json=payload' para 'data=json.dumps(payload)' para espelhar
+                    # a sintaxe do script de objetos estável (v10.27).
+                    async with self.session.post(job_url_path, data=json.dumps(payload), proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
+                    # <<< FIM DA CORREÇÃO (V26.0) >>>
+                        res.raise_for_status()
+                        job_info = await res.json()
+                        job_id = job_info.get('id')
+                        if not job_id: logging.error(f"❌ JobId não retornado para query: {query[:100]}..."); return []
+
                     job_status_path = f"{job_url_path}/{job_id}"
                     while True:
                         await asyncio.sleep(5)
@@ -248,6 +233,7 @@ class SalesforceClient:
                             if status_info['state'] == 'JobComplete': break
                             if status_info['state'] in ['Failed', 'Aborted']:
                                 logging.error(f"❌ Job {job_id} falhou: {status_info.get('errorMessage')}"); return []
+                    
                     results_path = f"{job_status_path}/results"
                     async with self.session.get(results_path, headers={'Accept-Encoding': 'gzip'}, proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
                         res.raise_for_status()
@@ -272,7 +258,7 @@ class SalesforceClient:
             tasks.append(self.execute_query_job(query))
         results = await tqdm.gather(*tasks, desc=f"Buscando {object_name} (Bulk API)")
         return [record for record_list in results if record_list for record in record_list]
-
+        
     async def fetch_users_by_id(self, user_ids):
         if not user_ids: return {}
         users = await self.fetch_records_in_bulk('User', ['Id', 'Username'], list(user_ids))
@@ -305,7 +291,6 @@ def write_csv_report(filename, data, headers):
 def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_map):
     logging.info("--- FASE 3/4: Classificando campos... ---")
     used_results, unused_results = [], []
-    
     for dmo_name, dmo_info in dmo_creation_info.items():
         created_date = parse_sf_date(dmo_info.get('CreatedDate'))
         if created_date and days_since(created_date) <= Config.GRACE_PERIOD_DAYS:
@@ -315,21 +300,17 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
                     if field_api_name not in used_fields_details: used_fields_details[field_api_name] = []
                     if not any(u['usage_type'] == usage_context['usage_type'] for u in used_fields_details[field_api_name]):
                         used_fields_details[field_api_name].append(usage_context)
-
     for dmo_name, data in all_dmo_fields.items():
         creator_id = dmo_creation_info.get(dmo_name, {}).get('CreatedById') or dmo_creation_info.get(dmo_name, {}).get('createdById')
         creator_name = user_map.get(creator_id, 'Desconhecido')
-        
         for field_api_name, field_display_name in data['fields'].items():
             if any(field_api_name.startswith(p) for p in Config.FIELD_PREFIXES_TO_EXCLUDE) or field_api_name in Config.SPECIFIC_FIELDS_TO_EXCLUDE:
                 continue
-            
             if field_api_name in used_fields_details:
                 usages = used_fields_details[field_api_name]
                 used_results.append({'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name, 'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 'USAGE_COUNT': len(usages), 'USAGE_TYPES': ", ".join(sorted(list(set(u['usage_type'] for u in usages)))), 'CREATED_BY_NAME': creator_name})
             else:
                 unused_results.append({'DELETAR': 'NAO', 'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name, 'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 'REASON': 'Não utilizado e DMO com mais de 90 dias', 'CREATED_BY_NAME': creator_name})
-    
     logging.info(f"📊 Classificação concluída: {len(used_results)} campos utilizados, {len(unused_results)} campos não utilizados.")
     return used_results, unused_results
 
@@ -340,7 +321,6 @@ async def main():
     logging.info("🚀 Iniciando auditoria de campos de DMO...")
     config = Config()
     auth_data = get_access_token()
-    
     async with SalesforceClient(config, auth_data) as client:
         logging.info("--- FASE 1/4: Coletando metadados e objetos... ---")
         
@@ -352,8 +332,8 @@ async def main():
             "calculated_insights": client.fetch_api_data(f"/services/data/{config.API_VERSION}/ssot/metadata?entityType=CalculatedInsight", 'metadata'),
             "contact_points": client.execute_query_job("SELECT Name, ContactPointFilterExpression, ContactPointPath, Id FROM MktSgmntActvtnContactPoint"),
         }
-        task_results = await asyncio.gather(*tasks_to_run.values(), return_exceptions=True)
         
+        task_results = await asyncio.gather(*tasks_to_run.values(), return_exceptions=True)
         data = {}
         for i, task_name in enumerate(tasks_to_run.keys()):
             result = task_results[i]
@@ -365,25 +345,25 @@ async def main():
         
         dmo_creation_info = {rec['DeveloperName']: rec for rec in data['dmo_tooling']}
         segment_ids = [rec['Id'] for rec in data['segments'] if rec.get('Id')]
+        
         logging.info(f"Dados processáveis: {len(dmo_creation_info)} DMOs, {len(segment_ids)} Segmentos, {len(data['activations'])} Ativações.")
         
-        all_creator_ids = set()
+        dmo_creator_ids = set()
         for dmo_details in dmo_creation_info.values():
             if creator_id := (dmo_details.get('CreatedById') or dmo_details.get('createdById')):
-                all_creator_ids.add(creator_id)
+                dmo_creator_ids.add(creator_id)
         
         segments_list, user_id_to_name_map = await asyncio.gather(
             client.fetch_records_in_bulk("MarketSegment", ["Id", "Name", "IncludeCriteria", "ExcludeCriteria"], segment_ids),
-            client.fetch_users_by_id(all_creator_ids)
+            client.fetch_users_by_id(dmo_creator_ids)
         )
+        
         logging.info(f"✅ Detalhes de {len(segments_list)} segmentos e {len(user_id_to_name_map)} usuários coletados.")
 
         logging.info("--- FASE 2/4: Analisando o uso dos campos... ---")
         used_fields_details, debug_data = defaultdict(list), []
 
-        # <<< INÍCIO DA ALTERAÇÃO (V23.1) >>>
         fields_from_activation_csv = read_activation_fields_from_csv(config)
-        # <<< FIM DA ALTERAÇÃO (V23.1) >>>
         for field_name in tqdm(fields_from_activation_csv, desc="Analisando campos do CSV de Ativações"):
             usage_context = {"usage_type": "Ativação (CSV Externo)", "object_name": config.ACTIVATION_FIELDS_CSV, "object_api_name": "N/A"}
             used_fields_details[field_name].append(usage_context)

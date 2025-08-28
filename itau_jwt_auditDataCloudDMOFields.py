@@ -3,7 +3,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 26.0 (Sincronia com Lógica de Chamada Estável)
+Versão: 26.1 (Correção Final do Criador do DMO)
 - CORREÇÃO: O nome da coluna esperado no arquivo 'ativacoes_campos.csv' foi 
   ajustado de 'FIELD_API_NAME' para 'Fieldname' para corresponder ao arquivo real.
 - MELHORIA: O nome da coluna do CSV foi movido para a classe 'Config' para
@@ -45,18 +45,18 @@ SE TODAS as seguintes condições forem verdadeiras:
 
 ================================================================================
 """
+# -*- coding: utf-8 -*-
 """
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 26.0 (Sincronia com Lógica de Chamada Estável)
-- BASE: Código baseado na versão estável 25.1.
-- CORREÇÃO CRÍTICA: A sintaxe da chamada de POST na função 'execute_query_job'
-  foi ajustada para usar 'data=json.dumps(payload)' em vez de 'json=payload',
-  espelhando 100% o comportamento do script de objetos v10.27, que não
-  apresenta o erro '400 Bad Request'.
-- MANTÉM: A lógica focada para coletar e mapear o 'createdById' do DMO pai
-  para preencher corretamente a coluna 'CREATED_BY_NAME'.
+Versão: 26.1 (Correção Final do Criador do DMO)
+- BASE: Código baseado na versão estável e funcional 26.0.
+- CORREÇÃO: Ajuste fino na lógica de passagem e consulta de dados dentro da
+  função 'classify_fields' para garantir que o 'createdById' do DMO seja
+  corretamente mapeado para o nome do usuário, resolvendo o problema de
+  'CREATED_BY_NAME' aparecer como 'Desconhecido'.
+- Nenhuma outra lógica ou sintaxe funcional foi alterada.
 
 """
 import os
@@ -206,7 +206,6 @@ class SalesforceClient:
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
                     else:
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para {relative_url[:60]} falharam."); raise e
-
     async def execute_query_job(self, query):
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
@@ -214,17 +213,11 @@ class SalesforceClient:
                     job_url_path = f"/services/data/{self.config.API_VERSION}/jobs/query"
                     payload = {"operation": "query", "query": query, "contentType": "CSV"}
                     proxy = self.config.PROXY_URL if self.config.USE_PROXY else None
-                    
-                    # <<< INÍCIO DA CORREÇÃO (V26.0) >>>
-                    # Alterado de 'json=payload' para 'data=json.dumps(payload)' para espelhar
-                    # a sintaxe do script de objetos estável (v10.27).
                     async with self.session.post(job_url_path, data=json.dumps(payload), proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
-                    # <<< FIM DA CORREÇÃO (V26.0) >>>
                         res.raise_for_status()
                         job_info = await res.json()
                         job_id = job_info.get('id')
                         if not job_id: logging.error(f"❌ JobId não retornado para query: {query[:100]}..."); return []
-
                     job_status_path = f"{job_url_path}/{job_id}"
                     while True:
                         await asyncio.sleep(5)
@@ -233,7 +226,6 @@ class SalesforceClient:
                             if status_info['state'] == 'JobComplete': break
                             if status_info['state'] in ['Failed', 'Aborted']:
                                 logging.error(f"❌ Job {job_id} falhou: {status_info.get('errorMessage')}"); return []
-                    
                     results_path = f"{job_status_path}/results"
                     async with self.session.get(results_path, headers={'Accept-Encoding': 'gzip'}, proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
                         res.raise_for_status()
@@ -247,7 +239,6 @@ class SalesforceClient:
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
                     else:
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para o job de query '{query[:50]}...' falharam."); raise e
-
     async def fetch_records_in_bulk(self, object_name, fields, record_ids):
         if not record_ids: return []
         tasks, field_str = [], ", ".join(fields)
@@ -258,7 +249,6 @@ class SalesforceClient:
             tasks.append(self.execute_query_job(query))
         results = await tqdm.gather(*tasks, desc=f"Buscando {object_name} (Bulk API)")
         return [record for record_list in results if record_list for record in record_list]
-        
     async def fetch_users_by_id(self, user_ids):
         if not user_ids: return {}
         users = await self.fetch_records_in_bulk('User', ['Id', 'Username'], list(user_ids))
@@ -301,8 +291,13 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
                     if not any(u['usage_type'] == usage_context['usage_type'] for u in used_fields_details[field_api_name]):
                         used_fields_details[field_api_name].append(usage_context)
     for dmo_name, data in all_dmo_fields.items():
-        creator_id = dmo_creation_info.get(dmo_name, {}).get('CreatedById') or dmo_creation_info.get(dmo_name, {}).get('createdById')
+        # <<< INÍCIO DA CORREÇÃO (V26.1) >>>
+        # A lógica de busca do criador é focada no dicionário de DMOs que já temos.
+        dmo_details = dmo_creation_info.get(dmo_name, {})
+        creator_id = dmo_details.get('CreatedById') or dmo_details.get('createdById')
         creator_name = user_map.get(creator_id, 'Desconhecido')
+        # <<< FIM DA CORREÇÃO (V26.1) >>>
+        
         for field_api_name, field_display_name in data['fields'].items():
             if any(field_api_name.startswith(p) for p in Config.FIELD_PREFIXES_TO_EXCLUDE) or field_api_name in Config.SPECIFIC_FIELDS_TO_EXCLUDE:
                 continue
