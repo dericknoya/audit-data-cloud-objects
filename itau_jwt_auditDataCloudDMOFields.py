@@ -3,7 +3,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 24.1 (Correção Focada no Criador do DMO)
+Versão: 24.2 (Correção de Estabilidade - NameError)
 - CORREÇÃO: O nome da coluna esperado no arquivo 'ativacoes_campos.csv' foi 
   ajustado de 'FIELD_API_NAME' para 'Fieldname' para corresponder ao arquivo real.
 - MELHORIA: O nome da coluna do CSV foi movido para a classe 'Config' para
@@ -50,14 +50,12 @@ SE TODAS as seguintes condições forem verdadeiras:
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 24.1 (Correção Focada no Criador do DMO)
-- CORREÇÃO: A lógica de busca do nome do criador foi simplificada e corrigida.
-  O script agora foca em coletar e mapear o 'createdById' exclusivamente 
-  do DMO pai de cada campo, garantindo que a coluna 'CREATED_BY_NAME' 
-  seja preenchida com o valor correto e eliminando o problema do "Desconhecido".
-- REMOVIDO: Coleta desnecessária de 'createdById' de outros objetos (segmentos,
-  ativações) que não são relevantes para o criador do campo.
-- MANTÉM: Todas as funcionalidades e correções de robustez da versão 23.1.
+Versão: 24.2 (Correção de Estabilidade - NameError)
+- CORREÇÃO CRÍTICA: Corrigido o erro 'NameError: name 'semaphore' is not defined'
+  causado pela remoção acidental da inicialização do semáforo na versão anterior.
+  A estabilidade da versão 23.1 foi restaurada.
+- MANTÉM: A lógica corrigida e focada na busca do 'createdById' do DMO pai 
+  para preencher corretamente a coluna 'CREATED_BY_NAME'.
 
 """
 import os
@@ -310,15 +308,21 @@ async def main():
     config = Config()
     auth_data = get_access_token()
     async with SalesforceClient(config, auth_data) as client:
+        # <<< INÍCIO DA CORREÇÃO (V24.2) >>>
+        # A inicialização do semaphore foi acidentalmente removida e agora está restaurada.
+        semaphore = asyncio.Semaphore(config.SEMAPHORE_LIMIT)
+        # <<< FIM DA CORREÇÃO (V24.2) >>>
+
         logging.info("--- FASE 1/4: Coletando metadados e objetos... ---")
         
+        # As chamadas agora não precisam mais passar o 'semaphore', pois ele é gerenciado dentro do client.
         tasks_to_run = {
             "dmo_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': 'SELECT DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject'})}", 'records'),
             "dmo_metadata": client.fetch_api_data(f"/services/data/{config.API_VERSION}/ssot/metadata?entityType=DataModelObject", 'metadata'),
-            "segments": client.execute_query_job("SELECT Id FROM MarketSegment", semaphore),
-            "activations": client.execute_query_job("SELECT QueryPath, Name, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute", semaphore),
+            "segments": client.execute_query_job("SELECT Id FROM MarketSegment"),
+            "activations": client.execute_query_job("SELECT QueryPath, Name, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute"),
             "calculated_insights": client.fetch_api_data(f"/services/data/{config.API_VERSION}/ssot/metadata?entityType=CalculatedInsight", 'metadata'),
-            "contact_points": client.execute_query_job("SELECT Name, ContactPointFilterExpression, ContactPointPath, Id FROM MktSgmntActvtnContactPoint", semaphore),
+            "contact_points": client.execute_query_job("SELECT Name, ContactPointFilterExpression, ContactPointPath, Id FROM MktSgmntActvtnContactPoint"),
         }
         
         task_results = await asyncio.gather(*tasks_to_run.values(), return_exceptions=True)
@@ -336,17 +340,14 @@ async def main():
         
         logging.info(f"Dados processáveis: {len(dmo_creation_info)} DMOs, {len(segment_ids)} Segmentos, {len(data['activations'])} Ativações.")
         
-        # <<< INÍCIO DA CORREÇÃO (V24.1) >>>
-        # Coleta de IDs focada apenas nos DMOs, que são os pais dos campos.
         dmo_creator_ids = set()
         for dmo_details in dmo_creation_info.values():
             if creator_id := (dmo_details.get('CreatedById') or dmo_details.get('createdById')):
                 dmo_creator_ids.add(creator_id)
-        # <<< FIM DA CORREÇÃO (V24.1) >>>
         
         segments_list, user_id_to_name_map = await asyncio.gather(
             client.fetch_records_in_bulk("MarketSegment", ["Id", "Name", "IncludeCriteria", "ExcludeCriteria"], segment_ids),
-            client.fetch_users_by_id(dmo_creator_ids) # Busca apenas os nomes dos criadores de DMOs
+            client.fetch_users_by_id(dmo_creator_ids)
         )
         logging.info(f"✅ Detalhes de {len(segments_list)} segmentos e {len(user_id_to_name_map)} usuários coletados.")
 
