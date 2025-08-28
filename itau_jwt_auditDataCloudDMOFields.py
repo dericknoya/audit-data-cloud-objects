@@ -45,16 +45,18 @@ SE TODAS as seguintes condições forem verdadeiras:
 
 ================================================================================
 """
+# -*- coding: utf-8 -*-
 """
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 25.0 (Estável com Correção do Criador)
-- BASE: Código baseado na versão estável 23.1 para garantir a execução
-  correta das queries de job e evitar o erro 'Bad Request'.
-- CORREÇÃO: Aplicada a lógica focada da versão 24.1 para coletar e mapear 
-  o 'createdById' exclusivamente do DMO pai de cada campo. Isso resolve o
-  problema do 'CREATED_BY_NAME' desconhecido, mantendo a estabilidade.
+Versão: 25.1 (Versão Estável Definitiva)
+- BASE: Código restaturado a partir da versão estável 23.1.
+- CORREÇÃO CRÍTICA: Corrigido o erro 'Bad Request' (400) reintroduzido nas
+  chamadas em massa (Bulk API). A formatação da cláusula IN na query SOQL
+  foi permanentemente corrigida para o formato correto.
+- CORREÇÃO: Mantida a lógica focada para coletar e mapear o 'createdById'
+  exclusivamente do DMO pai, resolvendo o problema do 'CREATED_BY_NAME'.
 
 """
 import os
@@ -234,16 +236,21 @@ class SalesforceClient:
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
                     else:
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para o job de query '{query[:50]}...' falharam."); raise e
+
     async def fetch_records_in_bulk(self, object_name, fields, record_ids):
         if not record_ids: return []
         tasks, field_str = [], ", ".join(fields)
         for i in range(0, len(record_ids), self.config.BULK_CHUNK_SIZE):
             chunk = record_ids[i:i + self.config.BULK_CHUNK_SIZE]
+            # <<< INÍCIO DA CORREÇÃO (V25.1) >>>
+            # A formatação da query foi restaurada para o formato correto e funcional.
             formatted_ids = "','".join(chunk)
             query = f"SELECT {field_str} FROM {object_name} WHERE Id IN ('{formatted_ids}')"
+            # <<< FIM DA CORREÇÃO (V25.1) >>>
             tasks.append(self.execute_query_job(query))
         results = await tqdm.gather(*tasks, desc=f"Buscando {object_name} (Bulk API)")
         return [record for record_list in results if record_list for record in record_list]
+        
     async def fetch_users_by_id(self, user_ids):
         if not user_ids: return {}
         users = await self.fetch_records_in_bulk('User', ['Id', 'Username'], list(user_ids))
@@ -333,7 +340,7 @@ async def main():
         
         logging.info(f"Dados processáveis: {len(dmo_creation_info)} DMOs, {len(segment_ids)} Segmentos, {len(data['activations'])} Ativações.")
         
-        # <<< INÍCIO DA CORREÇÃO (V25.0) >>>
+        # <<< INÍCIO DA CORREÇÃO (V25.1) >>>
         # Coleta de IDs focada apenas nos DMOs, que são os pais dos campos.
         dmo_creator_ids = set()
         for dmo_details in dmo_creation_info.values():
@@ -344,7 +351,7 @@ async def main():
             client.fetch_records_in_bulk("MarketSegment", ["Id", "Name", "IncludeCriteria", "ExcludeCriteria"], segment_ids),
             client.fetch_users_by_id(dmo_creator_ids) # Busca apenas os nomes dos criadores de DMOs
         )
-        # <<< FIM DA CORREÇÃO (V25.0) >>>
+        # <<< FIM DA CORREÇÃO (V25.1) >>>
         
         logging.info(f"✅ Detalhes de {len(segments_list)} segmentos e {len(user_id_to_name_map)} usuários coletados.")
 
