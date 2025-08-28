@@ -1,18 +1,17 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.31 (Diagnóstico para DS e CI)
-- OBJETIVO: Gerar arquivos de diagnóstico para Data Streams e Calculated Insights
-  para identificar a estrutura correta de seus payloads de API.
-- BASE: Construído a partir da versão estável 10.24.
-- NOVO: Gera 'data_streams_raw_dump.json' e 'calculated_insights_raw_dump.json'
-  com a resposta bruta da API para análise.
-- NOTA: O CSV de saída ainda terá dados incorretos para DS e CI. O foco desta
-  versão é a coleta de dados para a correção final.
+Versão: 10.24 (Ajustes Finais de Saída para DMOs)
+- AJUSTE FINAL: Refinadas as colunas de saída para DMOs para otimizar o
+  processo de exclusão subsequente.
+- A coluna 'ID_OR_API_NAME' para DMOs agora contém o Id do objeto da Tooling
+  API (ex: 0gj...).
+- A coluna 'DELETION_IDENTIFIER' para DMOs contém o nome completo da API com o
+  sufixo __dlm (ex: MeuObjeto__dlm), que é o identificador correto para
+  operações de delete.
+- Mantém a correção de lógica da v10.23.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
-Gera JSON de debug: data_streams_raw_dump.json
-Gera JSON de debug: calculated_insights_raw_dump.json
 """
 
 import os
@@ -279,23 +278,6 @@ async def main():
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
         dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions, contact_point_usages = final_results
         
-        # <<< INÍCIO DO DUMP DE DEBUG (V10.31) >>>
-        try:
-            ds_dump_path = "data_streams_raw_dump.json"
-            logging.info(f"DUMP DE DEBUG: Salvando o conteúdo bruto de 'data_streams' em '{ds_dump_path}'...")
-            with open(ds_dump_path, 'w', encoding='utf-8') as f:
-                json.dump(data_streams, f, indent=4, ensure_ascii=False)
-            logging.info(f"DUMP DE DEBUG: Arquivo '{ds_dump_path}' salvo com sucesso.")
-
-            ci_dump_path = "calculated_insights_raw_dump.json"
-            logging.info(f"DUMP DE DEBUG: Salvando o conteúdo bruto de 'calculated_insights' em '{ci_dump_path}'...")
-            with open(ci_dump_path, 'w', encoding='utf-8') as f:
-                json.dump(calculated_insights, f, indent=4, ensure_ascii=False)
-            logging.info(f"DUMP DE DEBUG: Arquivo '{ci_dump_path}' salvo com sucesso.")
-        except Exception as e:
-            logging.error(f"DUMP DE DEBUG: Falha ao salvar arquivos de dump: {e}")
-        # <<< FIM DO DUMP DE DEBUG (V10.31) >>>
-
         dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
         logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
@@ -407,10 +389,6 @@ async def main():
             lookup_key = normalize_api_name(dmo_name)
             dmo_details = dmo_info_map.get(lookup_key, {})
 
-            # Filtra DMOs "fantasmas"
-            if not dmo_details:
-                continue
-
             created_date = parse_sf_date(dmo_details.get('CreatedDate'))
             
             if not created_date or created_date < ninety_days_ago:
@@ -419,8 +397,11 @@ async def main():
                     days_created = days_since(created_date)
                     reason = "Órfão (não utilizado em nenhum objeto e criado > 90d)"
                     display_name = get_dmo_display_name(dmo)
-                    deletion_id = dmo_name
+                    
+                    # <<< INÍCIO DO AJUSTE FINAL (V10.24) >>>
+                    deletion_id = dmo_name # Garante que o identificador de exclusão tem o sufixo __dlm
                     dmo_tooling_id = dmo_details.get('Id', 'ID não encontrado')
+                    # <<< FIM DO AJUSTE FINAL (V10.24) >>>
                     
                     creator_id = dmo_details.get('CreatedById') or dmo_details.get('createdbyid')
                     
@@ -431,6 +412,7 @@ async def main():
 
                     audit_results.append({
                         'DELETAR': 'NAO', 
+                        # <<< INÍCIO DO AJUSTE FINAL (V10.24) >>>
                         'ID_OR_API_NAME': dmo_tooling_id, 
                         'DISPLAY_NAME': display_name, 
                         'OBJECT_TYPE': 'DMO', 
@@ -440,6 +422,7 @@ async def main():
                         'DIAS_ATIVIDADE': days_created if days_created is not None else '>90', 
                         'CREATED_BY_NAME': creator_name, 
                         'DELETION_IDENTIFIER': deletion_id
+                        # <<< FIM DO AJUSTE FINAL (V10.24) >>>
                     })
         
         logging.info("Auditando Data Streams...")
@@ -449,14 +432,12 @@ async def main():
                 days_inactive = days_since(last_updated)
                 ds_name = ds.get('name'); ds_id = ds.get('id')
                 creator_name = user_id_to_name_map.get(ds.get('createdById'), 'Desconhecido')
-                has_mappings = bool(ds.get('mappings'))
-                
-                if not has_mappings:
+                if not ds.get('mappings'):
                     reason = "Inativo (sem ingestão > 30d e sem mapeamentos)"
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_id, 'DISPLAY_NAME': ds_name, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_id})
                 else:
                     reason = "Inativo (sem ingestão > 30d, mas possui mapeamentos)"
-                
-                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_name, 'DISPLAY_NAME': ds_name, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_id})
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_id, 'DISPLAY_NAME': ds_name, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_id})
         
         logging.info("Auditando Calculated Insights...")
         for ci in calculated_insights:
@@ -464,9 +445,8 @@ async def main():
             if not last_processed or last_processed < ninety_days_ago:
                 days_inactive = days_since(last_processed)
                 ci_name = ci.get('name')
-                creator_name = user_id_to_name_map.get(ci.get('createdById'), 'Desconhecido')
-
                 reason = "Inativo (último processamento bem-sucedido > 90d)"
+                creator_name = user_id_to_name_map.get(ci.get('createdById'), 'Desconhecido')
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ci_name, 'DISPLAY_NAME': ci.get('displayName'), 'OBJECT_TYPE': 'CALCULATED_INSIGHT', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Último Processamento', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ci_name})
 
         if audit_results:
