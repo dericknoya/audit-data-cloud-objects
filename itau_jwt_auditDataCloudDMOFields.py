@@ -3,13 +3,63 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 30.1 (Versão Final Estável com Ajustes)
-- BASE: Código baseado na versão 30.0, confirmada como funcional.
-- AJUSTE DE LOG: Removido o 'warning' do terminal para DMOs que não possuem
-  mapeamento (erro 404), limpando a saída do console.
-- AJUSTE DE SAÍDA: O valor padrão no CSV para mapeamentos inexistentes foi
-  alterado de 'N/A' para 'Não possuí mapeamento'.
-- Nenhuma outra lógica funcional foi alterada para garantir a estabilidade.
+Versão: 29.0 (Versão Final de Produção)
+- CORREÇÃO: O nome da coluna esperado no arquivo 'ativacoes_campos.csv' foi 
+  ajustado de 'FIELD_API_NAME' para 'Fieldname' para corresponder ao arquivo real.
+- MELHORIA: O nome da coluna do CSV foi movido para a classe 'Config' para
+  facilitar futuras manutenções.
+- MANTÉM: Todas as funcionalidades e correções de robustez da versão 23.0.
+
+================================================================================
+REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
+================================================================================
+
+Este script gera dois relatórios para fornecer uma visão completa do uso dos 
+campos de DMOs customizados. As regras abaixo definem como um campo é 
+classificado em cada relatório.
+
+--------------------------------------------------------------------------------
+REGRAS PARA UM CAMPO SER CONSIDERADO "UTILIZADO"
+--------------------------------------------------------------------------------
+Um campo é listado no relatório 'audit_campos_dmo_utilizados.csv' se UMA OU MAIS 
+das seguintes condições for verdadeira:
+
+1.  É encontrado nos critérios de pelo menos um **Segmento**.
+2.  É encontrado em qualquer parte da configuração de pelo menos uma **Ativação (via API)**.
+3.  É encontrado em qualquer parte da definição de pelo menos um **Calculated Insight**.
+4.  É encontrado na definição de um **Ponto de Contato de Ativação**.
+5.  Seu DMO pai foi criado **nos últimos 90 dias**.
+6.  É encontrado no arquivo de mapeamento manual **ativacoes_campos.csv**.
+
+--------------------------------------------------------------------------------
+REGRAS PARA UM CAMPO SER CONSIDERADO "NÃO UTILIZADO"
+--------------------------------------------------------------------------------
+Um campo é listado no relatório 'audit_campos_dmo_nao_utilizados.csv' SOMENTE 
+SE TODAS as seguintes condições forem verdadeiras:
+
+1.  **NÃO é encontrado** em nenhum Segmento, Ativação, Calculated Insight, 
+    Ponto de Contato de Ativação ou no CSV de ativações.
+2.  Seu DMO pai foi criado **há mais de 90 dias**.
+3.  O campo e seu DMO **não são** objetos de sistema do Salesforce (o script 
+    ignora nomes com prefixos como 'ssot__', 'unified__', 'aa_', 'aal_', etc.).
+
+================================================================================
+"""
+# -*- coding: utf-8 -*-
+"""
+Este script audita uma instância do Salesforce Data Cloud para identificar 
+campos de DMOs (Data Model Objects) utilizados e não utilizados.
+
+Versão: 30.0 (Inclusão de IDs de Mapeamento)
+- BASE: Código baseado na versão estável e funcional 29.0.
+- EVOLUÇÃO: Adicionada uma nova etapa que, para os campos não utilizados,
+  busca os mapeamentos de DMO -> DLO via API. A lógica suporta múltiplos
+  mapeamentos por DMO.
+- NOVAS COLUNAS: O relatório 'audit_campos_dmo_nao_utilizados.csv' agora
+  inclui 'OBJECT_MAPPING_ID' e 'FIELD_MAPPING_ID', contendo os developerNames
+  necessários para a exclusão dos mapeamentos.
+- MELHORIA: Logs de terminal limpos, sem warnings para DMOs sem mapeamento,
+  e valor de saída ajustado para "Não possuí mapeamento".
 
 """
 import os
@@ -159,13 +209,16 @@ class SalesforceClient:
                     return all_records
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     if attempt < self.config.MAX_RETRIES - 1:
+                        logging.warning(f" Tentativa {attempt + 1} para {relative_url[:60]} falhou: {e}. Tentando novamente em {self.config.RETRY_DELAY_SECONDS}s...")
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
                     else:
                         if hasattr(e, 'status') and e.status == 404:
+                            # Silencia o log de 'Não encontrado', pois é esperado para DMOs sem mapeamento
                             return None
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para {relative_url[:60]} falharam."); raise e
     
     async def fetch_dmo_mappings(self, dmo_api_name):
+        """Busca os mapeamentos para um DMO específico."""
         endpoint = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings"
         params = {"dataspace": "default", "dmoDeveloperName": dmo_api_name}
         url = f"{endpoint}?{urlencode(params)}"
@@ -200,6 +253,7 @@ class SalesforceClient:
                         return list(csv.DictReader(lines)) if len(lines) > 1 else []
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     if attempt < self.config.MAX_RETRIES - 1:
+                        logging.warning(f" Tentativa {attempt + 1} do job de query '{query[:50]}...' falhou: {e}. Tentando novamente em {self.config.RETRY_DELAY_SECONDS}s...")
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
                     else:
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para o job de query '{query[:50]}...' falharam."); raise e
