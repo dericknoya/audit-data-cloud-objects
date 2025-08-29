@@ -3,17 +3,9 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 29.5-final-payload-fix (Estável com Correções de Nomenclatura e Mapeamento)
-- BASE: Código a partir da versão 29.4.
-- CORREÇÃO MAPEAMENTO: A chamada à API 'fetch_dmo_mappings' utiliza
-  'normalize_api_name' para enviar o nome do DMO no formato correto.
-- CORREÇÃO DELETION_IDENTIFIER: A busca no 'field_id_map' agora usa o nome do
-  campo sem o sufixo '__c', alinhando com o formato retornado pela Tooling API.
-- CORREÇÃO PAYLOAD MAPEAMENTO: A lógica para processar o payload da API de
-  mapeamentos foi reescrita para lidar corretamente com múltiplas fontes e usar
-  'targetFieldDeveloperName' como a chave de busca, normalizando os nomes
-  para garantir a correspondência.
-- ESTABILIDADE: Versão consolidada com todas as correções validadas pelos payloads.
+Versão: 29.6-debug (Versão de depuração para análise de mapeamentos)
+- Adicionados logs de depuração na seção de busca de mapeamentos para
+  inspecionar as chaves de dicionário e os resultados da busca.
 
 """
 import os
@@ -373,70 +365,86 @@ async def main():
         used_field_results, unused_field_results = classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_id_to_name_map, field_id_map)
 
         # ==============================================================================
-        # --- INÍCIO DA SEÇÃO DE CÓDIGO ATUALIZADA ---
+        # --- INÍCIO DA SEÇÃO DE DEBUG ---
         # ==============================================================================
         if unused_field_results:
             logging.info("--- FASE BÔNUS: Buscando IDs de mapeamento para campos não utilizados ---")
             
             unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_field_results}))
             
-            # A chamada à API usa o nome normalizado do DMO (sem __dlm) para maior compatibilidade.
             mapping_tasks = [client.fetch_dmo_mappings(normalize_api_name(dmo_name)) for dmo_name in unused_dmos]
-            all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos de DMOs")
+            all_mapping_data = await tqdm.gather(*tasks, desc="Buscando Mapeamentos de DMOs")
 
-            # Estrutura para lidar com múltiplos mapeamentos por campo: DMO -> Campo -> Lista de Mapeamentos
             mappings_lookup = defaultdict(lambda: defaultdict(list))
-
-            # Itera sobre os resultados da API para cada DMO
+            print("\n--- DEBUG: CONSTRUINDO DICIONÁRIO DE MAPEAMENTOS ---")
+            
             for dmo_name, mapping_data in zip(unused_dmos, all_mapping_data):
                 if not mapping_data or 'objectSourceTargetMaps' not in mapping_data:
                     continue
                 
-                # Itera sobre cada mapeamento de objeto (cada Data Stream fonte)
                 for obj_map in mapping_data['objectSourceTargetMaps']:
                     object_mapping_id = obj_map.get('developerName')
                     if not object_mapping_id:
                         continue
                     
-                    # Itera sobre cada mapeamento de campo dentro do mapeamento do objeto
                     for field_map in obj_map.get('fieldMappings', []):
                         field_mapping_id = field_map.get('developerName')
-                        
-                        # Usa o targetFieldDeveloperName como a chave para encontrar o campo no DMO
                         target_field = field_map.get('targetFieldDeveloperName')
                         
                         if target_field and field_mapping_id:
-                            # Normaliza a chave removendo '__c' para corresponder a outras fontes (como a Tooling API)
                             normalized_target_field = target_field.removesuffix('__c')
                             
-                            # Armazena os IDs. Um campo pode ter múltiplos mapeamentos.
+                            # DEBUG LOG 1: Mostra a chave exata que está sendo usada para construir o dicionário
+                            print(f"[DEBUG-BUILD] Chave: '{dmo_name}.{normalized_target_field}' -> Adicionando mapeamento.")
+                            
                             mappings_lookup[dmo_name][normalized_target_field].append({
                                 'OBJECT_MAPPING_ID': object_mapping_id,
                                 'FIELD_MAPPING_ID': field_mapping_id
                             })
-
-            # Adiciona os IDs de mapeamento aos resultados dos campos não utilizados
+            
+            # DEBUG LOG 2: Verifica se o dicionário foi populado
+            print(f"\n--- DEBUG: DICIONÁRIO CONSTRUÍDO ---")
+            if not mappings_lookup:
+                print("[DEBUG-RESULT] O dicionário 'mappings_lookup' está VAZIO.")
+            else:
+                print(f"[DEBUG-RESULT] O dicionário 'mappings_lookup' contém {len(mappings_lookup)} DMOs mapeados.")
+                # Imprime uma amostra de 5 chaves para verificação
+                sample_keys = list(mappings_lookup.keys())[:5]
+                print(f"[DEBUG-RESULT] Amostra de chaves de DMOs no dicionário: {sample_keys}")
+            
+            print("\n--- DEBUG: BUSCANDO MAPEAMENTOS PARA CAMPOS NÃO UTILIZADOS ---")
+            
+            # Adiciona um contador para mostrar o log apenas para os primeiros 5 campos
+            debug_count = 0
             for row in unused_field_results:
-                # Normaliza o nome do campo da lista principal (que vem com __c da Metadata API) para a busca
                 field_name_for_lookup = row['FIELD_API_NAME'].removesuffix('__c')
                 
-                # Obtém a lista de mapeamentos para o DMO e campo específicos
+                if debug_count < 5:
+                    # DEBUG LOG 3: Mostra a chave que estamos usando para a busca
+                    print(f"\n[DEBUG-SEARCH] Tentando buscar com a chave: '{row['DMO_API_NAME']}.{field_name_for_lookup}'")
+                
                 mapping_infos = mappings_lookup.get(row['DMO_API_NAME'], {}).get(field_name_for_lookup, [])
                 
+                if debug_count < 5:
+                    # DEBUG LOG 4: Mostra o resultado da busca
+                    if mapping_infos:
+                        print(f"[DEBUG-FOUND] SUCESSO! Encontrado(s) {len(mapping_infos)} mapeamento(s).")
+                    else:
+                        print(f"[DEBUG-NOT-FOUND] FALHA! Nenhum mapeamento encontrado para esta chave.")
+                    debug_count += 1
+
                 if mapping_infos:
-                    # Se houver múltiplos mapeamentos, concatenamos os IDs para exibição no CSV
                     row['OBJECT_MAPPING_ID'] = ", ".join(info['OBJECT_MAPPING_ID'] for info in mapping_infos)
                     row['FIELD_MAPPING_ID'] = ", ".join(info['FIELD_MAPPING_ID'] for info in mapping_infos)
                 else:
-                    # Se não encontrar nenhum mapeamento, usa o valor padrão
                     row['OBJECT_MAPPING_ID'] = 'Não possuí mapeamento'
                     row['FIELD_MAPPING_ID'] = 'Não possuí mapeamento'
             
             logging.info("✅ IDs de mapeamento adicionados ao relatório.")
         # ==============================================================================
-        # --- FIM DA SEÇÃO DE CÓDIGO ATUALIZADA ---
+        # --- FIM DA SEÇÃO DE DEBUG ---
         # ==============================================================================
-
+        
         logging.info("--- FASE 4/4: Gerando relatórios... ---")
         header_unused = ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME', 'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER']
         write_csv_report(config.UNUSED_FIELDS_CSV, unused_field_results, header_unused)
