@@ -3,11 +3,11 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 30.4 (Correção Definitiva do DELETION_IDENTIFIER)
+Versão: 30.5 (Correção de Atributo Faltando)
 - BASE: Código baseado na versão estável anterior.
-- CORREÇÃO CRÍTICA: A busca pelo ID técnico do campo foi corrigida para usar o
-  objeto correto da Tooling API: 'MktDataModelField'. Isso resolve o erro '400
-  Bad Request' e garante que o 'DELETION_IDENTIFIER' seja o ID correto.
+- CORREÇÃO CRÍTICA: Corrigido o erro fatal "'SalesforceClient' object has no
+  attribute 'fetch_dmo_mappings'". A função que busca os mapeamentos foi
+  corretamente adicionada à classe do cliente de API.
 - Nenhuma outra lógica funcional foi alterada para garantir a estabilidade.
 
 """
@@ -164,7 +164,7 @@ class SalesforceClient:
                             logging.warning(f"⚠️ Recurso não encontrado (404) para {relative_url[:120]}. Isso é esperado para DMOs sem mapeamento.")
                             return None
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para {relative_url[:60]} falharam."); raise e
-    
+
     async def execute_query_job(self, query):
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
@@ -198,6 +198,15 @@ class SalesforceClient:
                     else:
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para o job de query '{query[:50]}...' falharam."); raise e
     
+    # <<< INÍCIO DA CORREÇÃO (V30.5) >>>
+    async def fetch_dmo_mappings(self, dmo_api_name):
+        """Busca os mapeamentos para um DMO específico."""
+        endpoint = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings"
+        params = {"dataspace": "default", "dmoDeveloperName": dmo_api_name}
+        url = f"{endpoint}?{urlencode(params)}"
+        return await self.fetch_api_data(url)
+    # <<< FIM DA CORREÇÃO (V30.5) >>>
+
     async def fetch_records_in_bulk(self, object_name, fields, record_ids):
         if not record_ids: return []
         tasks, field_str = [], ", ".join(fields)
@@ -294,9 +303,7 @@ async def main():
     async with SalesforceClient(config, auth_data) as client:
         logging.info("--- FASE 1/4: Coletando metadados e objetos... ---")
         
-        # <<< INÍCIO DA ADIÇÃO (V30.4) >>>
         tooling_query_fields = "SELECT Id, DeveloperName, MktDataModelObjectId FROM MktDataModelField"
-        # <<< FIM DA ADIÇÃO (V30.4) >>>
         
         tasks_to_run = {
             "dmo_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': 'SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject'})}", 'records'),
@@ -320,10 +327,8 @@ async def main():
         
         dmo_creation_info = {rec['DeveloperName']: rec for rec in data['dmo_tooling']}
         
-        # <<< INÍCIO DA ADIÇÃO (V30.4) >>>
         field_id_map = {f"{rec['MktDataModelObjectId']}.{rec['DeveloperName']}": rec['Id'] for rec in data.get('dmo_fields_tooling', [])}
         logging.info(f"✅ {len(field_id_map)} IDs técnicos de campos de DMOs foram mapeados.")
-        # <<< FIM DA ADIÇÃO (V30.4) >>>
 
         segment_ids = [rec['Id'] for rec in data['segments'] if rec.get('Id')]
         
