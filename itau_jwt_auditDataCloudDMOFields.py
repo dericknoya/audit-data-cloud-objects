@@ -284,8 +284,6 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
                 continue
             
             dmo_id = dmo_details.get('Id')
-            # O nome do campo da Tooling API ('DeveloperName') vem sem o sufixo __c.
-            # Portanto, removemos o sufixo do nome do campo da Metadata API para a busca.
             field_name_for_lookup = field_api_name.removesuffix('__c')
             deletion_id = field_id_map.get(f"{dmo_id}.{field_name_for_lookup}", 'ID não encontrado') if dmo_id else 'ID do DMO não encontrado'
 
@@ -393,7 +391,7 @@ async def main():
         used_field_results, unused_field_results = classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_id_to_name_map, field_id_map)
 
         # ==============================================================================
-        # --- INÍCIO DA SEÇÃO DE DEBUG ---
+        # --- INÍCIO DA SEÇÃO DE MAPEAMENTO CORRIGIDA ---
         # ==============================================================================
         if unused_field_results:
             logging.info("--- FASE BÔNUS: Buscando IDs de mapeamento para campos não utilizados ---")
@@ -425,7 +423,6 @@ async def main():
                         if target_field and field_mapping_id:
                             normalized_target_field = target_field.removesuffix('__c')
                             
-                            # DEBUG LOG 1: Escreve no arquivo de log a chave que está sendo construída
                             debug_logger.debug(f"[DEBUG-BUILD] Chave: '{dmo_name}.{normalized_target_field}' -> Adicionando mapeamento.")
                             
                             mappings_lookup[dmo_name][normalized_target_field].append({
@@ -433,7 +430,6 @@ async def main():
                                 'FIELD_MAPPING_ID': field_mapping_id
                             })
             
-            # DEBUG LOG 2: Verifica se o dicionário foi populado
             debug_logger.debug("\n--- DEBUG: DICIONÁRIO CONSTRUÍDO ---")
             if not mappings_lookup:
                 debug_logger.debug("[DEBUG-RESULT] O dicionário 'mappings_lookup' está VAZIO.")
@@ -448,7 +444,7 @@ async def main():
             for row in unused_field_results:
                 field_name_for_lookup = row['FIELD_API_NAME'].removesuffix('__c')
                 
-                if debug_count < 20: # Aumentado para 20 para ter mais amostras
+                if debug_count < 20: 
                     debug_logger.debug(f"\n[DEBUG-SEARCH] Tentando buscar com a chave: '{row['DMO_API_NAME']}.{field_name_for_lookup}'")
                 
                 mapping_infos = mappings_lookup.get(row['DMO_API_NAME'], {}).get(field_name_for_lookup, [])
@@ -469,7 +465,7 @@ async def main():
             
             logging.info("✅ IDs de mapeamento adicionados ao relatório.")
         # ==============================================================================
-        # --- FIM DA SEÇÃO DE DEBUG ---
+        # --- FIM DA SEÇÃO DE MAPEAMENTO ---
         # ==============================================================================
         
         logging.info("--- FASE 4/4: Gerando relatórios... ---")
