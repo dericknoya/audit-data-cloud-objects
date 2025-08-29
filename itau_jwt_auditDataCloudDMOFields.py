@@ -3,11 +3,13 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 29.1-diag (Diagnóstico de Mapeamentos)
+Versão: 29.1-diag-d (Diagnóstico com Correção de Log)
 - BASE: Código baseado na versão estável 29.1-final-d.
-- DIAGNÓSTICO: Adicionada a geração de múltiplos arquivos de log para
-  rastrear o fluxo de dados do mapeamento e identificar a causa da falha.
-- Nenhuma outra lógica funcional foi alterada.
+- CORREÇÃO: Movida a inicialização do logging.basicConfig para dentro do
+  bloco de execução principal para garantir que os logs sempre apareçam
+  no terminal.
+- DIAGNÓSTICO: Mantida a geração de múltiplos arquivos de log para
+  rastrear o fluxo de dados do ID técnico do campo e dos mapeamentos.
 
 """
 import os
@@ -57,20 +59,19 @@ class Config:
     ACTIVATION_FIELDS_CSV_COLUMN = 'Fieldname' 
     FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
 
-# Configuração do Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
 # ==============================================================================
 # --- 헬 Helpers & Funções Auxiliares ---
 # ==============================================================================
 def dump_to_json(data, filename):
     logging.info(f"🔍 Gerando arquivo de depuração: {filename}")
-    if isinstance(data, set): data = list(data)
+    if isinstance(data, set):
+        data = list(data)
     try:
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
     except TypeError:
-        with open(filename, 'w', encoding='utf-8') as f: f.write(str(data))
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(str(data))
 
 def get_access_token():
     logging.info("🔑 Autenticando com o Salesforce via JWT (método robusto)...")
@@ -253,6 +254,7 @@ def write_csv_report(filename, data, headers):
 def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_map, field_id_map):
     logging.info("--- FASE 3/4: Classificando campos... ---")
     used_results, unused_results = [], []
+    trace_log_lines = []
     for dmo_name, dmo_info in dmo_creation_info.items():
         created_date = parse_sf_date(dmo_info.get('CreatedDate'))
         if created_date and days_since(created_date) <= Config.GRACE_PERIOD_DAYS:
@@ -274,7 +276,9 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
             
             dmo_id = dmo_details.get('Id')
             field_name_for_lookup = field_api_name.removesuffix('__c')
-            deletion_id = field_id_map.get(f"{dmo_id}.{field_name_for_lookup}", 'ID não encontrado') if dmo_id else 'ID do DMO não encontrado'
+            lookup_key = f"{dmo_id}.{field_name_for_lookup}" if dmo_id else None
+            deletion_id = field_id_map.get(lookup_key, 'ID não encontrado') if lookup_key else 'ID do DMO não encontrado'
+            trace_log_lines.append(f"DMO: {dmo_name}, Campo: {field_api_name}, ID do DMO: {dmo_id}, Chave de Busca (ID Campo): {lookup_key}, ID Encontrado: {deletion_id}")
 
             common_data = {
                 'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name,
@@ -295,6 +299,13 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
                     'DELETAR': 'NAO',
                     'REASON': 'Não utilizado e DMO com mais de 90 dias'
                 })
+    
+    try:
+        with open('debug_classification_trace.txt', 'w', encoding='utf-8') as f: f.write('\n'.join(trace_log_lines))
+        logging.info("🔍 Arquivo de rastreamento 'debug_classification_trace.txt' gerado.")
+    except IOError as e:
+        logging.error(f"❌ Não foi possível escrever o arquivo de rastreamento: {e}")
+
     logging.info(f"📊 Classificação concluída: {len(used_results)} campos utilizados, {len(unused_results)} campos não utilizados.")
     return used_results, unused_results
 
@@ -330,9 +341,13 @@ async def main():
             else: data[task_name] = result
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
         
+        dump_to_json(data['dmo_tooling'], 'debug_dmo_tooling_data.json')
+        dump_to_json(data['dmo_fields_tooling'], 'debug_field_tooling_data.json')
+        
         dmo_creation_info = {rec['DeveloperName']: rec for rec in data['dmo_tooling']}
         
         field_id_map = {f"{rec['MktDataModelObjectId']}.{rec['DeveloperName']}": rec['Id'] for rec in data.get('dmo_fields_tooling', [])}
+        dump_to_json(field_id_map, 'debug_field_id_map.json')
         logging.info(f"✅ {len(field_id_map)} IDs técnicos de campos de DMOs foram mapeados.")
 
         segment_ids = [rec['Id'] for rec in data['segments'] if rec.get('Id')]
@@ -382,9 +397,12 @@ async def main():
             logging.info("--- FASE BÔNUS: Buscando IDs de mapeamento para campos não utilizados ---")
             
             unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_field_results}))
+            dump_to_json(unused_dmos, 'debug_1_unused_dmos.json')
             
             mapping_tasks = [client.fetch_dmo_mappings(dmo_name) for dmo_name in unused_dmos]
             all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos de DMOs")
+
+            dump_to_json(dict(zip(unused_dmos, all_mapping_data)), 'debug_2_mapping_responses.json')
 
             mappings_lookup = defaultdict(dict)
             for dmo_name, mapping_data in zip(unused_dmos, all_mapping_data):
@@ -397,11 +415,22 @@ async def main():
                         if target_field:
                             mappings_lookup[dmo_name][target_field] = {'OBJECT_MAPPING_ID': obj_map_id, 'FIELD_MAPPING_ID': field_map_id}
             
+            dump_to_json(mappings_lookup, 'debug_3_mappings_lookup.json')
+            
+            trace_mapping_lines = []
             for row in unused_field_results:
                 field_name_for_lookup = row['FIELD_API_NAME'].removesuffix('__c')
                 mapping_info = mappings_lookup.get(row['DMO_API_NAME'], {}).get(field_name_for_lookup, {})
+                trace_mapping_lines.append(f"DMO: {row['DMO_API_NAME']}, Campo para Busca: {field_name_for_lookup}, Info Encontrada: {mapping_info}")
                 row['OBJECT_MAPPING_ID'] = mapping_info.get('OBJECT_MAPPING_ID', 'Não possuí mapeamento')
                 row['FIELD_MAPPING_ID'] = mapping_info.get('FIELD_MAPPING_ID', 'Não possuí mapeamento')
+            
+            try:
+                with open('debug_4_mapping_trace.txt', 'w', encoding='utf-8') as f: f.write('\n'.join(trace_mapping_lines))
+                logging.info("🔍 Arquivo de rastreamento 'debug_4_mapping_trace.txt' gerado.")
+            except IOError as e:
+                logging.error(f"❌ Não foi possível escrever o arquivo de rastreamento: {e}")
+
             logging.info("✅ IDs de mapeamento adicionados ao relatório.")
 
         logging.info("--- FASE 4/4: Gerando relatórios... ---")
@@ -413,7 +442,6 @@ async def main():
 
 if __name__ == "__main__":
     start_time = time.time()
-    # Adicionado para garantir que o logging funcione
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     try: asyncio.run(main())
     except Exception as e: logging.critical(f"❌ Ocorreu um erro fatal e o script foi interrompido: {e}", exc_info=True)
