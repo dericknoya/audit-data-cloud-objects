@@ -53,11 +53,13 @@ campos de DMOs (Data Model Objects) utilizados e não utilizados.
 Versão: 30.0 (Inclusão de IDs de Mapeamento)
 - BASE: Código baseado na versão estável e funcional 29.0.
 - EVOLUÇÃO: Adicionada uma nova etapa que, para os campos não utilizados,
-  busca os mapeamentos de DMO -> DLO via API.
+  busca os mapeamentos de DMO -> DLO via API. A lógica suporta múltiplos
+  mapeamentos por DMO.
 - NOVAS COLUNAS: O relatório 'audit_campos_dmo_nao_utilizados.csv' agora
   inclui 'OBJECT_MAPPING_ID' e 'FIELD_MAPPING_ID', contendo os developerNames
   necessários para a exclusão dos mapeamentos.
-- Nenhuma outra lógica funcional foi alterada.
+- MELHORIA: Logs de terminal limpos, sem warnings para DMOs sem mapeamento,
+  e valor de saída ajustado para "Não possuí mapeamento".
 
 """
 import os
@@ -210,21 +212,17 @@ class SalesforceClient:
                         logging.warning(f" Tentativa {attempt + 1} para {relative_url[:60]} falhou: {e}. Tentando novamente em {self.config.RETRY_DELAY_SECONDS}s...")
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
                     else:
-                        # Para erros 404 (Not Found), não levante exceção, apenas retorne vazio.
                         if hasattr(e, 'status') and e.status == 404:
-                            logging.warning(f"⚠️ Recurso não encontrado (404) para {relative_url[:60]}. Continuando...")
+                            # Silencia o log de 'Não encontrado', pois é esperado para DMOs sem mapeamento
                             return None
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para {relative_url[:60]} falharam."); raise e
     
-    # <<< INÍCIO DA ADIÇÃO (V30.0) >>>
     async def fetch_dmo_mappings(self, dmo_api_name):
         """Busca os mapeamentos para um DMO específico."""
         endpoint = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings"
         params = {"dataspace": "default", "dmoDeveloperName": dmo_api_name}
         url = f"{endpoint}?{urlencode(params)}"
-        # Este endpoint retorna o payload diretamente, sem uma chave principal como 'records'.
         return await self.fetch_api_data(url)
-    # <<< FIM DA ADIÇÃO (V30.0) >>>
 
     async def execute_query_job(self, query):
         async with self.semaphore:
@@ -401,18 +399,14 @@ async def main():
 
         used_field_results, unused_field_results = classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_id_to_name_map)
 
-        # <<< INÍCIO DA ADIÇÃO (V30.0) >>>
         if unused_field_results:
             logging.info("--- FASE BÔNUS: Buscando IDs de mapeamento para campos não utilizados ---")
             
-            # 1. Obter DMOs únicos da lista de campos não utilizados
             unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_field_results}))
             
-            # 2. Buscar todos os mapeamentos em paralelo
             mapping_tasks = [client.fetch_dmo_mappings(dmo_name) for dmo_name in unused_dmos]
             all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos de DMOs")
 
-            # 3. Processar os resultados em um dicionário de busca otimizado
             mappings_lookup = defaultdict(dict)
             for dmo_name, mapping_data in zip(unused_dmos, all_mapping_data):
                 if not mapping_data or 'objectSourceTargetMaps' not in mapping_data:
@@ -421,7 +415,6 @@ async def main():
                     obj_map_id = obj_map.get('developerName')
                     for field_map in obj_map.get('fieldMappings', []):
                         field_map_id = field_map.get('developerName')
-                        # O campo no DMO é o 'target' do mapeamento
                         target_field = field_map.get('targetFieldDeveloperName')
                         if target_field:
                             mappings_lookup[dmo_name][target_field] = {
@@ -429,13 +422,11 @@ async def main():
                                 'FIELD_MAPPING_ID': field_map_id
                             }
             
-            # 4. Enriquecer o resultado final com os IDs de mapeamento
             for row in unused_field_results:
                 mapping_info = mappings_lookup.get(row['DMO_API_NAME'], {}).get(row['FIELD_API_NAME'], {})
-                row['OBJECT_MAPPING_ID'] = mapping_info.get('OBJECT_MAPPING_ID', 'N/A')
-                row['FIELD_MAPPING_ID'] = mapping_info.get('FIELD_MAPPING_ID', 'N/A')
+                row['OBJECT_MAPPING_ID'] = mapping_info.get('OBJECT_MAPPING_ID', 'Não possuí mapeamento')
+                row['FIELD_MAPPING_ID'] = mapping_info.get('FIELD_MAPPING_ID', 'Não possuí mapeamento')
             logging.info("✅ IDs de mapeamento adicionados ao relatório.")
-        # <<< FIM DA ADIÇÃO (V30.0) >>>
 
         logging.info("--- FASE 4/4: Gerando relatórios... ---")
         header_unused = ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME', 'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID']
