@@ -3,7 +3,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 30.1 (Versão Final Estável com Ajustes)
+Versão: 29.1 (Versão Final Estável com Mapeamento)
 - CORREÇÃO: O nome da coluna esperado no arquivo 'ativacoes_campos.csv' foi 
   ajustado de 'FIELD_API_NAME' para 'Fieldname' para corresponder ao arquivo real.
 - MELHORIA: O nome da coluna do CSV foi movido para a classe 'Config' para
