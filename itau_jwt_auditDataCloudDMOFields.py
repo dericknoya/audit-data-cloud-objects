@@ -3,7 +3,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 29.1-final (Estável com DELETION_IDENTIFIER)
+Versão: 29.1-final-b (Estável com DELETION_IDENTIFIER)
 - BASE: Código restaurado a partir da versão estável 29.1, que lida
   corretamente com a busca de mapeamentos.
 - FUNCIONALIDADE: Re-implementada de forma segura a busca pelo ID técnico
