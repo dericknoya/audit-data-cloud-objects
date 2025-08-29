@@ -3,11 +3,11 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 30.3 (Correção de Sintaxe na Query de CustomField)
+Versão: 30.4 (Correção Definitiva do DELETION_IDENTIFIER)
 - BASE: Código baseado na versão estável anterior.
-- CORREÇÃO CRÍTICA: Corrigido o erro '400 Bad Request' na query da Tooling API
-  que busca os IDs técnicos dos campos. A cláusula 'LIKE' agora tem o valor
-  corretamente formatado com aspas simples ('%__dlm%').
+- CORREÇÃO CRÍTICA: A busca pelo ID técnico do campo foi corrigida para usar o
+  objeto correto da Tooling API: 'MktDataModelField'. Isso resolve o erro '400
+  Bad Request' e garante que o 'DELETION_IDENTIFIER' seja o ID correto.
 - Nenhuma outra lógica funcional foi alterada para garantir a estabilidade.
 
 """
@@ -259,8 +259,8 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
             if any(field_api_name.startswith(p) for p in Config.FIELD_PREFIXES_TO_EXCLUDE) or field_api_name in Config.SPECIFIC_FIELDS_TO_EXCLUDE:
                 continue
             
-            full_field_api_name = f"{dmo_name}.{field_api_name}"
-            deletion_id = field_id_map.get(full_field_api_name, 'ID não encontrado')
+            dmo_id = dmo_details.get('Id')
+            deletion_id = field_id_map.get(f"{dmo_id}.{field_api_name}", 'ID não encontrado') if dmo_id else 'ID do DMO não encontrado'
 
             common_data = {
                 'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name,
@@ -294,13 +294,13 @@ async def main():
     async with SalesforceClient(config, auth_data) as client:
         logging.info("--- FASE 1/4: Coletando metadados e objetos... ---")
         
-        # <<< INÍCIO DA CORREÇÃO (V30.3) >>>
-        tooling_query_fields = "SELECT Id, DeveloperName, TableEnumOrId FROM CustomField WHERE TableEnumOrId LIKE '%__dlm%'"
-        # <<< FIM DA CORREÇÃO (V30.3) >>>
+        # <<< INÍCIO DA ADIÇÃO (V30.4) >>>
+        tooling_query_fields = "SELECT Id, DeveloperName, MktDataModelObjectId FROM MktDataModelField"
+        # <<< FIM DA ADIÇÃO (V30.4) >>>
         
         tasks_to_run = {
-            "dmo_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': 'SELECT DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject'})}", 'records'),
-            "custom_fields": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': tooling_query_fields})}", 'records'),
+            "dmo_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': 'SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject'})}", 'records'),
+            "dmo_fields_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': tooling_query_fields})}", 'records'),
             "dmo_metadata": client.fetch_api_data(f"/services/data/{config.API_VERSION}/ssot/metadata?entityType=DataModelObject", 'metadata'),
             "segments": client.execute_query_job("SELECT Id FROM MarketSegment"),
             "activations": client.execute_query_job("SELECT QueryPath, Name, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute"),
@@ -318,10 +318,13 @@ async def main():
             else: data[task_name] = result
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
         
-        field_id_map = {f"{rec['TableEnumOrId']}.{rec['DeveloperName']}": rec['Id'] for rec in data.get('custom_fields', [])}
-        logging.info(f"✅ {len(field_id_map)} IDs técnicos de campos customizados foram mapeados.")
-
         dmo_creation_info = {rec['DeveloperName']: rec for rec in data['dmo_tooling']}
+        
+        # <<< INÍCIO DA ADIÇÃO (V30.4) >>>
+        field_id_map = {f"{rec['MktDataModelObjectId']}.{rec['DeveloperName']}": rec['Id'] for rec in data.get('dmo_fields_tooling', [])}
+        logging.info(f"✅ {len(field_id_map)} IDs técnicos de campos de DMOs foram mapeados.")
+        # <<< FIM DA ADIÇÃO (V30.4) >>>
+
         segment_ids = [rec['Id'] for rec in data['segments'] if rec.get('Id')]
         
         logging.info(f"Dados processáveis: {len(dmo_creation_info)} DMOs, {len(segment_ids)} Segmentos, {len(data['activations'])} Ativações.")
