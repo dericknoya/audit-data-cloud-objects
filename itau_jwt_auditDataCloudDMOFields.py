@@ -50,12 +50,14 @@ SE TODAS as seguintes condições forem verdadeiras:
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 30.1 (Versão Final Estável com Ajustes)
-- BASE: Código baseado na versão 30.0, confirmada como funcional.
+Versão: 29.1 (Versão Final Estável com Mapeamento)
+- BASE: Código baseado na versão estável e funcional 29.0.
+- FUNCIONALIDADE: Reintroduzida a busca por IDs de mapeamento para campos não
+  utilizados, como na versão 30.0.
 - AJUSTE DE LOG: Removido o 'warning' do terminal para DMOs que não possuem
   mapeamento (erro 404), limpando a saída do console.
 - AJUSTE DE SAÍDA: O valor padrão no CSV para mapeamentos inexistentes foi
-  alterado de 'N/A' para 'Não possuí mapeamento'.
+  alterado para 'Não possuí mapeamento'.
 - Nenhuma outra lógica funcional foi alterada para garantir a estabilidade.
 
 """
