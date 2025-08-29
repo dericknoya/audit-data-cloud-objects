@@ -5,9 +5,10 @@ campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
 Versão: 29.1-final-c (Estável com Correção Definitiva do DELETION_IDENTIFIER)
 - BASE: Código restaurado a partir da versão estável 29.1.
-- CORREÇÃO FINAL: Corrigida a lógica de busca do DELETION_IDENTIFIER. O script
-  agora usa o ID técnico do DMO (em vez do nome) para construir a chave de
-  busca do ID técnico do campo, garantindo que o mapeamento funcione.
+- CORREÇÃO FINAL: Implementada a lógica correta para buscar o DELETION_IDENTIFIER.
+  O script agora cruza o ID técnico do DMO (MktDataModelObject) com o
+  MktDataModelObjectId do campo (MktDataModelField) para encontrar o ID técnico
+  exato de cada campo, conforme a lógica detalhada.
 - ESTABILIDADE: Nenhuma outra lógica funcional foi alterada.
 
 """
