@@ -3,9 +3,9 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 29.6-debug (Versão de depuração para análise de mapeamentos)
-- Adicionados logs de depuração na seção de busca de mapeamentos para
-  inspecionar as chaves de dicionário e os resultados da busca.
+Versão: 29.7-debug-fix (Correção de NameError na versão de depuração)
+- Corrigido o NameError 'tasks is not defined' na seção de depuração.
+- Mantidos os logs para análise do processo de mapeamento.
 
 """
 import os
@@ -372,8 +372,11 @@ async def main():
             
             unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_field_results}))
             
+            # CORREÇÃO: O nome da variável é 'mapping_tasks'
             mapping_tasks = [client.fetch_dmo_mappings(normalize_api_name(dmo_name)) for dmo_name in unused_dmos]
-            all_mapping_data = await tqdm.gather(*tasks, desc="Buscando Mapeamentos de DMOs")
+            
+            # CORREÇÃO: Usar *mapping_tasks para desempacotar a lista de tarefas
+            all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos de DMOs")
 
             mappings_lookup = defaultdict(lambda: defaultdict(list))
             print("\n--- DEBUG: CONSTRUINDO DICIONÁRIO DE MAPEAMENTOS ---")
@@ -408,25 +411,21 @@ async def main():
                 print("[DEBUG-RESULT] O dicionário 'mappings_lookup' está VAZIO.")
             else:
                 print(f"[DEBUG-RESULT] O dicionário 'mappings_lookup' contém {len(mappings_lookup)} DMOs mapeados.")
-                # Imprime uma amostra de 5 chaves para verificação
                 sample_keys = list(mappings_lookup.keys())[:5]
                 print(f"[DEBUG-RESULT] Amostra de chaves de DMOs no dicionário: {sample_keys}")
             
             print("\n--- DEBUG: BUSCANDO MAPEAMENTOS PARA CAMPOS NÃO UTILIZADOS ---")
             
-            # Adiciona um contador para mostrar o log apenas para os primeiros 5 campos
             debug_count = 0
             for row in unused_field_results:
                 field_name_for_lookup = row['FIELD_API_NAME'].removesuffix('__c')
                 
                 if debug_count < 5:
-                    # DEBUG LOG 3: Mostra a chave que estamos usando para a busca
                     print(f"\n[DEBUG-SEARCH] Tentando buscar com a chave: '{row['DMO_API_NAME']}.{field_name_for_lookup}'")
                 
                 mapping_infos = mappings_lookup.get(row['DMO_API_NAME'], {}).get(field_name_for_lookup, [])
                 
                 if debug_count < 5:
-                    # DEBUG LOG 4: Mostra o resultado da busca
                     if mapping_infos:
                         print(f"[DEBUG-FOUND] SUCESSO! Encontrado(s) {len(mapping_infos)} mapeamento(s).")
                     else:
