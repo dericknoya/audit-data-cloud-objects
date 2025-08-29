@@ -3,13 +3,13 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 29.1-diag-d (Diagnóstico com Correção de Log)
-- BASE: Código baseado na versão estável 29.1-final-d.
-- CORREÇÃO: Movida a inicialização do logging.basicConfig para dentro do
-  bloco de execução principal para garantir que os logs sempre apareçam
-  no terminal.
-- DIAGNÓSTICO: Mantida a geração de múltiplos arquivos de log para
-  rastrear o fluxo de dados do ID técnico do campo e dos mapeamentos.
+Versão: 29.2-fix-mapeamento (Estável com Correção de Mapeamento)
+- BASE: Código a partir da versão estável 29.1-final-d.
+- CORREÇÃO MAPEAMENTO: Corrigida a chamada à API 'fetch_dmo_mappings', que
+  agora utiliza a função 'normalize_api_name' para remover o sufixo '__dlm'
+  do nome do DMO. Isso garante que a API receba o 'developerName' no formato
+  esperado, retornando os dados de mapeamento corretamente.
+- ESTABILIDADE: Nenhuma outra lógica funcional foi alterada.
 
 """
 import os
@@ -59,21 +59,14 @@ class Config:
     ACTIVATION_FIELDS_CSV_COLUMN = 'Fieldname' 
     FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
 
+# Configuração do Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 # ==============================================================================
 # --- 헬 Helpers & Funções Auxiliares ---
 # ==============================================================================
-def dump_to_json(data, filename):
-    logging.info(f"🔍 Gerando arquivo de depuração: {filename}")
-    if isinstance(data, set):
-        data = list(data)
-    try:
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-    except TypeError:
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(str(data))
-
 def get_access_token():
+    # ... (Função inalterada)
     logging.info("🔑 Autenticando com o Salesforce via JWT (método robusto)...")
     config = Config()
     if not all([config.SF_CLIENT_ID, config.SF_USERNAME, config.SF_AUDIENCE, config.SF_LOGIN_URL]):
@@ -96,6 +89,7 @@ def get_access_token():
         logging.error(f"❌ Erro na autenticação: {e.response.text if e.response else e}"); raise
 
 def read_activation_fields_from_csv(config):
+    # ... (Função inalterada)
     used_fields = set()
     file_path = config.ACTIVATION_FIELDS_CSV
     field_column_name = config.ACTIVATION_FIELDS_CSV_COLUMN
@@ -116,15 +110,18 @@ def read_activation_fields_from_csv(config):
     return used_fields
 
 def parse_sf_date(date_str):
+    # ... (Função inalterada)
     if not date_str: return None
     try: return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
     except (ValueError, TypeError): return None
 
 def days_since(date_obj):
+    # ... (Função inalterada)
     if not date_obj: return None
     return (datetime.now(timezone.utc) - date_obj).days
 
 def normalize_api_name(name):
+    # ... (Função inalterada)
     if not isinstance(name, str): return ""
     return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
 
@@ -132,6 +129,7 @@ def normalize_api_name(name):
 # ---  Classe Salesforce API Client ---
 # ==============================================================================
 class SalesforceClient:
+    # ... (Classe inalterada)
     def __init__(self, config, auth_data):
         self.config = config
         self.access_token = auth_data['access_token']
@@ -144,7 +142,6 @@ class SalesforceClient:
         return self
     async def __aexit__(self, exc_type, exc, tb):
         if self.session and not self.session.closed: await self.session.close()
-
     async def fetch_api_data(self, relative_url, key_name=None):
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
@@ -172,13 +169,11 @@ class SalesforceClient:
                         if hasattr(e, 'status') and e.status == 404:
                             return None
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para {relative_url[:60]} falharam."); raise e
-    
     async def fetch_dmo_mappings(self, dmo_api_name):
         endpoint = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings"
         params = {"dataspace": "default", "dmoDeveloperName": dmo_api_name}
         url = f"{endpoint}?{urlencode(params)}"
         return await self.fetch_api_data(url)
-
     async def execute_query_job(self, query):
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
@@ -211,7 +206,6 @@ class SalesforceClient:
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
                     else:
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para o job de query '{query[:50]}...' falharam."); raise e
-    
     async def fetch_records_in_bulk(self, object_name, fields, record_ids):
         if not record_ids: return []
         tasks, field_str = [], ", ".join(fields)
@@ -222,7 +216,6 @@ class SalesforceClient:
             tasks.append(self.execute_query_job(query))
         results = await tqdm.gather(*tasks, desc=f"Buscando {object_name} (Bulk API)")
         return [record for record_list in results if record_list for record in record_list]
-    
     async def fetch_users_by_id(self, user_ids):
         if not user_ids: return {}
         users = await self.fetch_records_in_bulk('User', ['Id', 'Name'], list(user_ids))
@@ -232,6 +225,7 @@ class SalesforceClient:
 # --- 📊 FUNÇÕES DE ANÁLISE E PROCESSAMENTO ---
 # ==============================================================================
 def find_fields_in_content(content_string, usage_type, object_name, object_api_name, used_fields_details):
+    # ... (Função inalterada)
     if not content_string: return
     for match in Config.FIELD_NAME_PATTERN.finditer(html.unescape(str(content_string))):
         field_name = match.group(1)
@@ -239,6 +233,7 @@ def find_fields_in_content(content_string, usage_type, object_name, object_api_n
         used_fields_details[field_name].append(usage_context)
 
 def write_csv_report(filename, data, headers):
+    # ... (Função inalterada)
     if not data:
         logging.info(f"ℹ️ Nenhum dado para gerar o relatório '{filename}'.")
         return
@@ -254,7 +249,6 @@ def write_csv_report(filename, data, headers):
 def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_map, field_id_map):
     logging.info("--- FASE 3/4: Classificando campos... ---")
     used_results, unused_results = [], []
-    trace_log_lines = []
     for dmo_name, dmo_info in dmo_creation_info.items():
         created_date = parse_sf_date(dmo_info.get('CreatedDate'))
         if created_date and days_since(created_date) <= Config.GRACE_PERIOD_DAYS:
@@ -275,10 +269,9 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
                 continue
             
             dmo_id = dmo_details.get('Id')
+            # O nome do campo da Tooling API não tem o sufixo __c
             field_name_for_lookup = field_api_name.removesuffix('__c')
-            lookup_key = f"{dmo_id}.{field_name_for_lookup}" if dmo_id else None
-            deletion_id = field_id_map.get(lookup_key, 'ID não encontrado') if lookup_key else 'ID do DMO não encontrado'
-            trace_log_lines.append(f"DMO: {dmo_name}, Campo: {field_api_name}, ID do DMO: {dmo_id}, Chave de Busca (ID Campo): {lookup_key}, ID Encontrado: {deletion_id}")
+            deletion_id = field_id_map.get(f"{dmo_id}.{field_name_for_lookup}", 'ID não encontrado') if dmo_id else 'ID do DMO não encontrado'
 
             common_data = {
                 'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name,
@@ -299,13 +292,6 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
                     'DELETAR': 'NAO',
                     'REASON': 'Não utilizado e DMO com mais de 90 dias'
                 })
-    
-    try:
-        with open('debug_classification_trace.txt', 'w', encoding='utf-8') as f: f.write('\n'.join(trace_log_lines))
-        logging.info("🔍 Arquivo de rastreamento 'debug_classification_trace.txt' gerado.")
-    except IOError as e:
-        logging.error(f"❌ Não foi possível escrever o arquivo de rastreamento: {e}")
-
     logging.info(f"📊 Classificação concluída: {len(used_results)} campos utilizados, {len(unused_results)} campos não utilizados.")
     return used_results, unused_results
 
@@ -341,13 +327,9 @@ async def main():
             else: data[task_name] = result
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
         
-        dump_to_json(data['dmo_tooling'], 'debug_dmo_tooling_data.json')
-        dump_to_json(data['dmo_fields_tooling'], 'debug_field_tooling_data.json')
-        
         dmo_creation_info = {rec['DeveloperName']: rec for rec in data['dmo_tooling']}
         
         field_id_map = {f"{rec['MktDataModelObjectId']}.{rec['DeveloperName']}": rec['Id'] for rec in data.get('dmo_fields_tooling', [])}
-        dump_to_json(field_id_map, 'debug_field_id_map.json')
         logging.info(f"✅ {len(field_id_map)} IDs técnicos de campos de DMOs foram mapeados.")
 
         segment_ids = [rec['Id'] for rec in data['segments'] if rec.get('Id')]
@@ -397,12 +379,13 @@ async def main():
             logging.info("--- FASE BÔNUS: Buscando IDs de mapeamento para campos não utilizados ---")
             
             unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_field_results}))
-            dump_to_json(unused_dmos, 'debug_1_unused_dmos.json')
             
-            mapping_tasks = [client.fetch_dmo_mappings(dmo_name) for dmo_name in unused_dmos]
+            # <<< INÍCIO DA CORREÇÃO (29.2-fix-mapeamento) >>>
+            # A API de mapeamento espera o nome do DMO sem o sufixo __dlm.
+            # Usamos a função normalize_api_name para formatar o nome corretamente.
+            mapping_tasks = [client.fetch_dmo_mappings(normalize_api_name(dmo_name)) for dmo_name in unused_dmos]
+            # <<< FIM DA CORREÇÃO (29.2-fix-mapeamento) >>>
             all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos de DMOs")
-
-            dump_to_json(dict(zip(unused_dmos, all_mapping_data)), 'debug_2_mapping_responses.json')
 
             mappings_lookup = defaultdict(dict)
             for dmo_name, mapping_data in zip(unused_dmos, all_mapping_data):
@@ -411,26 +394,17 @@ async def main():
                     obj_map_id = obj_map.get('developerName')
                     for field_map in obj_map.get('fieldMappings', []):
                         field_map_id = field_map.get('developerName')
+                        # O campo targetFieldDeveloperName vem sem o sufixo __c
                         target_field = field_map.get('targetFieldDeveloperName')
                         if target_field:
                             mappings_lookup[dmo_name][target_field] = {'OBJECT_MAPPING_ID': obj_map_id, 'FIELD_MAPPING_ID': field_map_id}
             
-            dump_to_json(mappings_lookup, 'debug_3_mappings_lookup.json')
-            
-            trace_mapping_lines = []
             for row in unused_field_results:
+                # Normaliza o nome do campo para a busca, removendo __c
                 field_name_for_lookup = row['FIELD_API_NAME'].removesuffix('__c')
                 mapping_info = mappings_lookup.get(row['DMO_API_NAME'], {}).get(field_name_for_lookup, {})
-                trace_mapping_lines.append(f"DMO: {row['DMO_API_NAME']}, Campo para Busca: {field_name_for_lookup}, Info Encontrada: {mapping_info}")
                 row['OBJECT_MAPPING_ID'] = mapping_info.get('OBJECT_MAPPING_ID', 'Não possuí mapeamento')
                 row['FIELD_MAPPING_ID'] = mapping_info.get('FIELD_MAPPING_ID', 'Não possuí mapeamento')
-            
-            try:
-                with open('debug_4_mapping_trace.txt', 'w', encoding='utf-8') as f: f.write('\n'.join(trace_mapping_lines))
-                logging.info("🔍 Arquivo de rastreamento 'debug_4_mapping_trace.txt' gerado.")
-            except IOError as e:
-                logging.error(f"❌ Não foi possível escrever o arquivo de rastreamento: {e}")
-
             logging.info("✅ IDs de mapeamento adicionados ao relatório.")
 
         logging.info("--- FASE 4/4: Gerando relatórios... ---")
@@ -442,6 +416,7 @@ async def main():
 
 if __name__ == "__main__":
     start_time = time.time()
+    # Adicionado para garantir que o logging funcione
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     try: asyncio.run(main())
     except Exception as e: logging.critical(f"❌ Ocorreu um erro fatal e o script foi interrompido: {e}", exc_info=True)
