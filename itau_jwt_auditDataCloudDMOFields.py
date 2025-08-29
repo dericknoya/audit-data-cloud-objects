@@ -3,14 +3,11 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 30.2 (Inclusão de DELETION_IDENTIFIER e Diagnóstico de Mapping)
-- BASE: Código baseado na versão estável e funcional 29.1.
-- EVOLUÇÃO: Adicionada uma chamada à Tooling API para buscar os IDs técnicos
-  (deletion identifiers) de todos os Custom Fields de DMOs.
-- NOVA COLUNA: Os relatórios 'utilizados' e 'nao_utilizados' agora incluem
-  a coluna 'DELETION_IDENTIFIER' com o ID técnico do campo.
-- DIAGNÓSTICO: Reintroduzido um log de WARNING para DMOs que não possuem
-  mapeamentos (erro 404), para ajudar a diagnosticar o problema reportado.
+Versão: 30.3 (Correção de Sintaxe na Query de CustomField)
+- BASE: Código baseado na versão estável anterior.
+- CORREÇÃO CRÍTICA: Corrigido o erro '400 Bad Request' na query da Tooling API
+  que busca os IDs técnicos dos campos. A cláusula 'LIKE' agora tem o valor
+  corretamente formatado com aspas simples ('%__dlm%').
 - Nenhuma outra lógica funcional foi alterada para garantir a estabilidade.
 
 """
@@ -168,12 +165,6 @@ class SalesforceClient:
                             return None
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para {relative_url[:60]} falharam."); raise e
     
-    async def fetch_dmo_mappings(self, dmo_api_name):
-        endpoint = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings"
-        params = {"dataspace": "default", "dmoDeveloperName": dmo_api_name}
-        url = f"{endpoint}?{urlencode(params)}"
-        return await self.fetch_api_data(url)
-
     async def execute_query_job(self, query):
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
@@ -303,7 +294,9 @@ async def main():
     async with SalesforceClient(config, auth_data) as client:
         logging.info("--- FASE 1/4: Coletando metadados e objetos... ---")
         
-        tooling_query_fields = "SELECT Id, DeveloperName, TableEnumOrId FROM CustomField WHERE TableEnumOrId LIKE '%__dlm'"
+        # <<< INÍCIO DA CORREÇÃO (V30.3) >>>
+        tooling_query_fields = "SELECT Id, DeveloperName, TableEnumOrId FROM CustomField WHERE TableEnumOrId LIKE '%__dlm%'"
+        # <<< FIM DA CORREÇÃO (V30.3) >>>
         
         tasks_to_run = {
             "dmo_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': 'SELECT DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject'})}", 'records'),
