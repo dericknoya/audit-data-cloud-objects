@@ -3,12 +3,14 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 30.5 (Correção de Atributo Faltando)
-- BASE: Código baseado na versão estável anterior.
-- CORREÇÃO CRÍTICA: Corrigido o erro fatal "'SalesforceClient' object has no
-  attribute 'fetch_dmo_mappings'". A função que busca os mapeamentos foi
-  corretamente adicionada à classe do cliente de API.
-- Nenhuma outra lógica funcional foi alterada para garantir a estabilidade.
+Versão: 29.1-final (Estável com DELETION_IDENTIFIER)
+- BASE: Código restaurado a partir da versão estável 29.1, que lida
+  corretamente com a busca de mapeamentos.
+- FUNCIONALIDADE: Re-implementada de forma segura a busca pelo ID técnico
+  (DELETION_IDENTIFIER) de cada campo via Tooling API, usando o objeto
+  correto 'MktDataModelField'.
+- ESTABILIDADE: Nenhuma outra lógica funcional ou sintaxe de queries foi
+  alterada para garantir a estabilidade e evitar regressões.
 
 """
 import os
@@ -161,9 +163,14 @@ class SalesforceClient:
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
                     else:
                         if hasattr(e, 'status') and e.status == 404:
-                            logging.warning(f"⚠️ Recurso não encontrado (404) para {relative_url[:120]}. Isso é esperado para DMOs sem mapeamento.")
                             return None
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para {relative_url[:60]} falharam."); raise e
+    
+    async def fetch_dmo_mappings(self, dmo_api_name):
+        endpoint = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings"
+        params = {"dataspace": "default", "dmoDeveloperName": dmo_api_name}
+        url = f"{endpoint}?{urlencode(params)}"
+        return await self.fetch_api_data(url)
 
     async def execute_query_job(self, query):
         async with self.semaphore:
@@ -198,15 +205,6 @@ class SalesforceClient:
                     else:
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para o job de query '{query[:50]}...' falharam."); raise e
     
-    # <<< INÍCIO DA CORREÇÃO (V30.5) >>>
-    async def fetch_dmo_mappings(self, dmo_api_name):
-        """Busca os mapeamentos para um DMO específico."""
-        endpoint = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings"
-        params = {"dataspace": "default", "dmoDeveloperName": dmo_api_name}
-        url = f"{endpoint}?{urlencode(params)}"
-        return await self.fetch_api_data(url)
-    # <<< FIM DA CORREÇÃO (V30.5) >>>
-
     async def fetch_records_in_bulk(self, object_name, fields, record_ids):
         if not record_ids: return []
         tasks, field_str = [], ", ".join(fields)
