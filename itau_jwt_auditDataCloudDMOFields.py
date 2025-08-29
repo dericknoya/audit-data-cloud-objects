@@ -3,13 +3,17 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 29.2-fix-mapeamento (Estável com Correção de Mapeamento)
-- BASE: Código a partir da versão estável 29.1-final-d.
-- CORREÇÃO MAPEAMENTO: Corrigida a chamada à API 'fetch_dmo_mappings', que
-  agora utiliza a função 'normalize_api_name' para remover o sufixo '__dlm'
-  do nome do DMO. Isso garante que a API receba o 'developerName' no formato
-  esperado, retornando os dados de mapeamento corretamente.
-- ESTABILIDADE: Nenhuma outra lógica funcional foi alterada.
+Versão: 29.5-final-payload-fix (Estável com Correções de Nomenclatura e Mapeamento)
+- BASE: Código a partir da versão 29.4.
+- CORREÇÃO MAPEAMENTO: A chamada à API 'fetch_dmo_mappings' utiliza
+  'normalize_api_name' para enviar o nome do DMO no formato correto.
+- CORREÇÃO DELETION_IDENTIFIER: A busca no 'field_id_map' agora usa o nome do
+  campo sem o sufixo '__c', alinhando com o formato retornado pela Tooling API.
+- CORREÇÃO PAYLOAD MAPEAMENTO: A lógica para processar o payload da API de
+  mapeamentos foi reescrita para lidar corretamente com múltiplas fontes e usar
+  'targetFieldDeveloperName' como a chave de busca, normalizando os nomes
+  para garantir a correspondência.
+- ESTABILIDADE: Versão consolidada com todas as correções validadas pelos payloads.
 
 """
 import os
@@ -66,7 +70,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- 헬 Helpers & Funções Auxiliares ---
 # ==============================================================================
 def get_access_token():
-    # ... (Função inalterada)
     logging.info("🔑 Autenticando com o Salesforce via JWT (método robusto)...")
     config = Config()
     if not all([config.SF_CLIENT_ID, config.SF_USERNAME, config.SF_AUDIENCE, config.SF_LOGIN_URL]):
@@ -89,7 +92,6 @@ def get_access_token():
         logging.error(f"❌ Erro na autenticação: {e.response.text if e.response else e}"); raise
 
 def read_activation_fields_from_csv(config):
-    # ... (Função inalterada)
     used_fields = set()
     file_path = config.ACTIVATION_FIELDS_CSV
     field_column_name = config.ACTIVATION_FIELDS_CSV_COLUMN
@@ -110,18 +112,15 @@ def read_activation_fields_from_csv(config):
     return used_fields
 
 def parse_sf_date(date_str):
-    # ... (Função inalterada)
     if not date_str: return None
     try: return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
     except (ValueError, TypeError): return None
 
 def days_since(date_obj):
-    # ... (Função inalterada)
     if not date_obj: return None
     return (datetime.now(timezone.utc) - date_obj).days
 
 def normalize_api_name(name):
-    # ... (Função inalterada)
     if not isinstance(name, str): return ""
     return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
 
@@ -129,7 +128,6 @@ def normalize_api_name(name):
 # ---  Classe Salesforce API Client ---
 # ==============================================================================
 class SalesforceClient:
-    # ... (Classe inalterada)
     def __init__(self, config, auth_data):
         self.config = config
         self.access_token = auth_data['access_token']
@@ -225,7 +223,6 @@ class SalesforceClient:
 # --- 📊 FUNÇÕES DE ANÁLISE E PROCESSAMENTO ---
 # ==============================================================================
 def find_fields_in_content(content_string, usage_type, object_name, object_api_name, used_fields_details):
-    # ... (Função inalterada)
     if not content_string: return
     for match in Config.FIELD_NAME_PATTERN.finditer(html.unescape(str(content_string))):
         field_name = match.group(1)
@@ -233,7 +230,6 @@ def find_fields_in_content(content_string, usage_type, object_name, object_api_n
         used_fields_details[field_name].append(usage_context)
 
 def write_csv_report(filename, data, headers):
-    # ... (Função inalterada)
     if not data:
         logging.info(f"ℹ️ Nenhum dado para gerar o relatório '{filename}'.")
         return
@@ -269,7 +265,8 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
                 continue
             
             dmo_id = dmo_details.get('Id')
-            # O nome do campo da Tooling API não tem o sufixo __c
+            # O nome do campo da Tooling API ('DeveloperName') vem sem o sufixo __c.
+            # Portanto, removemos o sufixo do nome do campo da Metadata API para a busca.
             field_name_for_lookup = field_api_name.removesuffix('__c')
             deletion_id = field_id_map.get(f"{dmo_id}.{field_name_for_lookup}", 'ID não encontrado') if dmo_id else 'ID do DMO não encontrado'
 
@@ -375,37 +372,70 @@ async def main():
 
         used_field_results, unused_field_results = classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_id_to_name_map, field_id_map)
 
+        # ==============================================================================
+        # --- INÍCIO DA SEÇÃO DE CÓDIGO ATUALIZADA ---
+        # ==============================================================================
         if unused_field_results:
             logging.info("--- FASE BÔNUS: Buscando IDs de mapeamento para campos não utilizados ---")
             
             unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_field_results}))
             
-            # <<< INÍCIO DA CORREÇÃO (29.2-fix-mapeamento) >>>
-            # A API de mapeamento espera o nome do DMO sem o sufixo __dlm.
-            # Usamos a função normalize_api_name para formatar o nome corretamente.
+            # A chamada à API usa o nome normalizado do DMO (sem __dlm) para maior compatibilidade.
             mapping_tasks = [client.fetch_dmo_mappings(normalize_api_name(dmo_name)) for dmo_name in unused_dmos]
-            # <<< FIM DA CORREÇÃO (29.2-fix-mapeamento) >>>
             all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos de DMOs")
 
-            mappings_lookup = defaultdict(dict)
+            # Estrutura para lidar com múltiplos mapeamentos por campo: DMO -> Campo -> Lista de Mapeamentos
+            mappings_lookup = defaultdict(lambda: defaultdict(list))
+
+            # Itera sobre os resultados da API para cada DMO
             for dmo_name, mapping_data in zip(unused_dmos, all_mapping_data):
-                if not mapping_data or 'objectSourceTargetMaps' not in mapping_data: continue
+                if not mapping_data or 'objectSourceTargetMaps' not in mapping_data:
+                    continue
+                
+                # Itera sobre cada mapeamento de objeto (cada Data Stream fonte)
                 for obj_map in mapping_data['objectSourceTargetMaps']:
-                    obj_map_id = obj_map.get('developerName')
+                    object_mapping_id = obj_map.get('developerName')
+                    if not object_mapping_id:
+                        continue
+                    
+                    # Itera sobre cada mapeamento de campo dentro do mapeamento do objeto
                     for field_map in obj_map.get('fieldMappings', []):
-                        field_map_id = field_map.get('developerName')
-                        # O campo targetFieldDeveloperName vem sem o sufixo __c
+                        field_mapping_id = field_map.get('developerName')
+                        
+                        # Usa o targetFieldDeveloperName como a chave para encontrar o campo no DMO
                         target_field = field_map.get('targetFieldDeveloperName')
-                        if target_field:
-                            mappings_lookup[dmo_name][target_field] = {'OBJECT_MAPPING_ID': obj_map_id, 'FIELD_MAPPING_ID': field_map_id}
-            
+                        
+                        if target_field and field_mapping_id:
+                            # Normaliza a chave removendo '__c' para corresponder a outras fontes (como a Tooling API)
+                            normalized_target_field = target_field.removesuffix('__c')
+                            
+                            # Armazena os IDs. Um campo pode ter múltiplos mapeamentos.
+                            mappings_lookup[dmo_name][normalized_target_field].append({
+                                'OBJECT_MAPPING_ID': object_mapping_id,
+                                'FIELD_MAPPING_ID': field_mapping_id
+                            })
+
+            # Adiciona os IDs de mapeamento aos resultados dos campos não utilizados
             for row in unused_field_results:
-                # Normaliza o nome do campo para a busca, removendo __c
+                # Normaliza o nome do campo da lista principal (que vem com __c da Metadata API) para a busca
                 field_name_for_lookup = row['FIELD_API_NAME'].removesuffix('__c')
-                mapping_info = mappings_lookup.get(row['DMO_API_NAME'], {}).get(field_name_for_lookup, {})
-                row['OBJECT_MAPPING_ID'] = mapping_info.get('OBJECT_MAPPING_ID', 'Não possuí mapeamento')
-                row['FIELD_MAPPING_ID'] = mapping_info.get('FIELD_MAPPING_ID', 'Não possuí mapeamento')
+                
+                # Obtém a lista de mapeamentos para o DMO e campo específicos
+                mapping_infos = mappings_lookup.get(row['DMO_API_NAME'], {}).get(field_name_for_lookup, [])
+                
+                if mapping_infos:
+                    # Se houver múltiplos mapeamentos, concatenamos os IDs para exibição no CSV
+                    row['OBJECT_MAPPING_ID'] = ", ".join(info['OBJECT_MAPPING_ID'] for info in mapping_infos)
+                    row['FIELD_MAPPING_ID'] = ", ".join(info['FIELD_MAPPING_ID'] for info in mapping_infos)
+                else:
+                    # Se não encontrar nenhum mapeamento, usa o valor padrão
+                    row['OBJECT_MAPPING_ID'] = 'Não possuí mapeamento'
+                    row['FIELD_MAPPING_ID'] = 'Não possuí mapeamento'
+            
             logging.info("✅ IDs de mapeamento adicionados ao relatório.")
+        # ==============================================================================
+        # --- FIM DA SEÇÃO DE CÓDIGO ATUALIZADA ---
+        # ==============================================================================
 
         logging.info("--- FASE 4/4: Gerando relatórios... ---")
         header_unused = ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME', 'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER']
