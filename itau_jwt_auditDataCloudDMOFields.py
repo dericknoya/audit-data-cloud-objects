@@ -50,11 +50,13 @@ SE TODAS as seguintes condições forem verdadeiras:
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 29.0 (Versão Final de Produção)
-- BASE: Código baseado na versão estável e funcional 26.0-final-b.
-- LIMPEZA: Removida toda a lógica de criação do arquivo de depuração
-  'debug_dados_de_uso.csv', conforme solicitado, para finalizar o script
-  para uso em produção.
+Versão: 30.0 (Inclusão de IDs de Mapeamento)
+- BASE: Código baseado na versão estável e funcional 29.0.
+- EVOLUÇÃO: Adicionada uma nova etapa que, para os campos não utilizados,
+  busca os mapeamentos de DMO -> DLO via API.
+- NOVAS COLUNAS: O relatório 'audit_campos_dmo_nao_utilizados.csv' agora
+  inclui 'OBJECT_MAPPING_ID' e 'FIELD_MAPPING_ID', contendo os developerNames
+  necessários para a exclusão dos mapeamentos.
 - Nenhuma outra lógica funcional foi alterada.
 
 """
@@ -182,6 +184,7 @@ class SalesforceClient:
         return self
     async def __aexit__(self, exc_type, exc, tb):
         if self.session and not self.session.closed: await self.session.close()
+
     async def fetch_api_data(self, relative_url, key_name=None):
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
@@ -207,7 +210,22 @@ class SalesforceClient:
                         logging.warning(f" Tentativa {attempt + 1} para {relative_url[:60]} falhou: {e}. Tentando novamente em {self.config.RETRY_DELAY_SECONDS}s...")
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
                     else:
+                        # Para erros 404 (Not Found), não levante exceção, apenas retorne vazio.
+                        if hasattr(e, 'status') and e.status == 404:
+                            logging.warning(f"⚠️ Recurso não encontrado (404) para {relative_url[:60]}. Continuando...")
+                            return None
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para {relative_url[:60]} falharam."); raise e
+    
+    # <<< INÍCIO DA ADIÇÃO (V30.0) >>>
+    async def fetch_dmo_mappings(self, dmo_api_name):
+        """Busca os mapeamentos para um DMO específico."""
+        endpoint = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings"
+        params = {"dataspace": "default", "dmoDeveloperName": dmo_api_name}
+        url = f"{endpoint}?{urlencode(params)}"
+        # Este endpoint retorna o payload diretamente, sem uma chave principal como 'records'.
+        return await self.fetch_api_data(url)
+    # <<< FIM DA ADIÇÃO (V30.0) >>>
+
     async def execute_query_job(self, query):
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
@@ -241,6 +259,7 @@ class SalesforceClient:
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
                     else:
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para o job de query '{query[:50]}...' falharam."); raise e
+    
     async def fetch_records_in_bulk(self, object_name, fields, record_ids):
         if not record_ids: return []
         tasks, field_str = [], ", ".join(fields)
@@ -251,6 +270,7 @@ class SalesforceClient:
             tasks.append(self.execute_query_job(query))
         results = await tqdm.gather(*tasks, desc=f"Buscando {object_name} (Bulk API)")
         return [record for record_list in results if record_list for record in record_list]
+    
     async def fetch_users_by_id(self, user_ids):
         if not user_ids: return {}
         users = await self.fetch_records_in_bulk('User', ['Id', 'Name'], list(user_ids))
@@ -381,9 +401,48 @@ async def main():
 
         used_field_results, unused_field_results = classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_id_to_name_map)
 
+        # <<< INÍCIO DA ADIÇÃO (V30.0) >>>
+        if unused_field_results:
+            logging.info("--- FASE BÔNUS: Buscando IDs de mapeamento para campos não utilizados ---")
+            
+            # 1. Obter DMOs únicos da lista de campos não utilizados
+            unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_field_results}))
+            
+            # 2. Buscar todos os mapeamentos em paralelo
+            mapping_tasks = [client.fetch_dmo_mappings(dmo_name) for dmo_name in unused_dmos]
+            all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos de DMOs")
+
+            # 3. Processar os resultados em um dicionário de busca otimizado
+            mappings_lookup = defaultdict(dict)
+            for dmo_name, mapping_data in zip(unused_dmos, all_mapping_data):
+                if not mapping_data or 'objectSourceTargetMaps' not in mapping_data:
+                    continue
+                for obj_map in mapping_data['objectSourceTargetMaps']:
+                    obj_map_id = obj_map.get('developerName')
+                    for field_map in obj_map.get('fieldMappings', []):
+                        field_map_id = field_map.get('developerName')
+                        # O campo no DMO é o 'target' do mapeamento
+                        target_field = field_map.get('targetFieldDeveloperName')
+                        if target_field:
+                            mappings_lookup[dmo_name][target_field] = {
+                                'OBJECT_MAPPING_ID': obj_map_id,
+                                'FIELD_MAPPING_ID': field_map_id
+                            }
+            
+            # 4. Enriquecer o resultado final com os IDs de mapeamento
+            for row in unused_field_results:
+                mapping_info = mappings_lookup.get(row['DMO_API_NAME'], {}).get(row['FIELD_API_NAME'], {})
+                row['OBJECT_MAPPING_ID'] = mapping_info.get('OBJECT_MAPPING_ID', 'N/A')
+                row['FIELD_MAPPING_ID'] = mapping_info.get('FIELD_MAPPING_ID', 'N/A')
+            logging.info("✅ IDs de mapeamento adicionados ao relatório.")
+        # <<< FIM DA ADIÇÃO (V30.0) >>>
+
         logging.info("--- FASE 4/4: Gerando relatórios... ---")
-        write_csv_report(config.UNUSED_FIELDS_CSV, unused_field_results, ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME'])
-        write_csv_report(config.USED_FIELDS_CSV, used_field_results, ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_COUNT', 'USAGE_TYPES', 'CREATED_BY_NAME'])
+        header_unused = ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME', 'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID']
+        write_csv_report(config.UNUSED_FIELDS_CSV, unused_field_results, header_unused)
+        
+        header_used = ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_COUNT', 'USAGE_TYPES', 'CREATED_BY_NAME']
+        write_csv_report(config.USED_FIELDS_CSV, used_field_results, header_used)
 
 if __name__ == "__main__":
     start_time = time.time()

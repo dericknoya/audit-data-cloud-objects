@@ -3,7 +3,7 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 26.0-final-b (Correção no Campo de Nome do Criador)
+Versão: 29.0 (Versão Final de Produção)
 - CORREÇÃO: O nome da coluna esperado no arquivo 'ativacoes_campos.csv' foi 
   ajustado de 'FIELD_API_NAME' para 'Fieldname' para corresponder ao arquivo real.
 - MELHORIA: O nome da coluna do CSV foi movido para a classe 'Config' para
@@ -50,11 +50,12 @@ SE TODAS as seguintes condições forem verdadeiras:
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 26.0-final-b (Correção no Campo de Nome do Criador)
-- BASE: Código baseado na versão estável e funcional 26.0-final.
-- CORREÇÃO: A query que busca os dados do criador foi alterada de 'Username'
-  para 'Name', garantindo que o nome de exibição do usuário seja exibido no
-  relatório em vez do email.
+Versão: 29.0 (Versão Final de Produção)
+- BASE: Código baseado na versão estável e funcional 26.0-final-b.
+- LIMPEZA: Removida toda a lógica de criação do arquivo de depuração
+  'debug_dados_de_uso.csv', conforme solicitado, para finalizar o script
+  para uso em produção.
+- Nenhuma outra lógica funcional foi alterada.
 
 """
 import os
@@ -100,7 +101,6 @@ class Config:
     SPECIFIC_FIELDS_TO_EXCLUDE = {'DataSource__c', 'DataSourceObject__c', 'InternalOrganization__c'}
     USED_FIELDS_CSV = 'audit_campos_dmo_utilizados.csv'
     UNUSED_FIELDS_CSV = 'audit_campos_dmo_nao_utilizados.csv'
-    DEBUG_CSV = 'debug_dados_de_uso.csv'
     ACTIVATION_FIELDS_CSV = 'ativacoes_campos.csv'
     ACTIVATION_FIELDS_CSV_COLUMN = 'Fieldname' 
     FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
@@ -251,22 +251,16 @@ class SalesforceClient:
             tasks.append(self.execute_query_job(query))
         results = await tqdm.gather(*tasks, desc=f"Buscando {object_name} (Bulk API)")
         return [record for record_list in results if record_list for record in record_list]
-    
-    # <<< INÍCIO DA CORREÇÃO (26.0-final-b) >>>
     async def fetch_users_by_id(self, user_ids):
         if not user_ids: return {}
-        # Alterado de 'Username' para 'Name' para buscar o nome de exibição.
         users = await self.fetch_records_in_bulk('User', ['Id', 'Name'], list(user_ids))
-        # Alterado de .get('Username',...) para .get('Name',...)
         return {user['Id']: user.get('Name', 'Nome não encontrado') for user in users}
-    # <<< FIM DA CORREÇÃO (26.0-final-b) >>>
 
 # ==============================================================================
 # --- 📊 FUNÇÕES DE ANÁLISE E PROCESSAMENTO ---
 # ==============================================================================
-def find_fields_in_content(content_string, usage_type, object_name, object_api_name, used_fields_details, debug_data):
+def find_fields_in_content(content_string, usage_type, object_name, object_api_name, used_fields_details):
     if not content_string: return
-    debug_data.append({'SOURCE_OBJECT_TYPE': usage_type, 'SOURCE_OBJECT_ID': object_api_name, 'SOURCE_OBJECT_NAME': object_name, 'RAW_CONTENT': content_string})
     for match in Config.FIELD_NAME_PATTERN.finditer(html.unescape(str(content_string))):
         field_name = match.group(1)
         usage_context = {"usage_type": usage_type, "object_name": object_name, "object_api_name": object_api_name}
@@ -361,7 +355,7 @@ async def main():
         logging.info(f"✅ Detalhes de {len(segments_list)} segmentos e {len(user_id_to_name_map)} usuários coletados.")
 
         logging.info("--- FASE 2/4: Analisando o uso dos campos... ---")
-        used_fields_details, debug_data = defaultdict(list), []
+        used_fields_details = defaultdict(list)
 
         fields_from_activation_csv = read_activation_fields_from_csv(config)
         for field_name in tqdm(fields_from_activation_csv, desc="Analisando campos do CSV de Ativações"):
@@ -369,13 +363,13 @@ async def main():
             used_fields_details[field_name].append(usage_context)
 
         for seg in tqdm(segments_list, desc="Analisando Segmentos"):
-            find_fields_in_content(seg.get('IncludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'), used_fields_details, debug_data)
-            find_fields_in_content(seg.get('ExcludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'), used_fields_details, debug_data)
-        for attr in tqdm(data['activations'], desc="Analisando Ativações"): find_fields_in_content(attr.get('QueryPath'), "Ativação", attr.get('Name'), attr.get('MarketSegmentActivationId'), used_fields_details, debug_data)
-        for ci in tqdm(data['calculated_insights'], desc="Analisando CIs"): find_fields_in_content(json.dumps(ci), "Calculated Insight", ci.get('displayName'), ci.get('name'), used_fields_details, debug_data)
+            find_fields_in_content(seg.get('IncludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'), used_fields_details)
+            find_fields_in_content(seg.get('ExcludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'), used_fields_details)
+        for attr in tqdm(data['activations'], desc="Analisando Ativações"): find_fields_in_content(attr.get('QueryPath'), "Ativação", attr.get('Name'), attr.get('MarketSegmentActivationId'), used_fields_details)
+        for ci in tqdm(data['calculated_insights'], desc="Analisando CIs"): find_fields_in_content(json.dumps(ci), "Calculated Insight", ci.get('displayName'), ci.get('name'), used_fields_details)
         for cp in tqdm(data['contact_points'], desc="Analisando Pontos de Contato"):
-            find_fields_in_content(cp.get('ContactPointPath'), "Ponto de Contato", cp.get('Name'), cp.get('Id'), used_fields_details, debug_data)
-            find_fields_in_content(cp.get('ContactPointFilterExpression'), "Ponto de Contato", cp.get('Name'), cp.get('Id'), used_fields_details, debug_data)
+            find_fields_in_content(cp.get('ContactPointPath'), "Ponto de Contato", cp.get('Name'), cp.get('Id'), used_fields_details)
+            find_fields_in_content(cp.get('ContactPointFilterExpression'), "Ponto de Contato", cp.get('Name'), cp.get('Id'), used_fields_details)
 
         all_dmo_fields = defaultdict(lambda: {'fields': {}, 'displayName': ''})
         for dmo in data['dmo_metadata']:
@@ -390,7 +384,6 @@ async def main():
         logging.info("--- FASE 4/4: Gerando relatórios... ---")
         write_csv_report(config.UNUSED_FIELDS_CSV, unused_field_results, ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME'])
         write_csv_report(config.USED_FIELDS_CSV, used_field_results, ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_COUNT', 'USAGE_TYPES', 'CREATED_BY_NAME'])
-        write_csv_report(config.DEBUG_CSV, debug_data, ['SOURCE_OBJECT_TYPE', 'SOURCE_OBJECT_ID', 'SOURCE_OBJECT_NAME', 'RAW_CONTENT'])
 
 if __name__ == "__main__":
     start_time = time.time()
