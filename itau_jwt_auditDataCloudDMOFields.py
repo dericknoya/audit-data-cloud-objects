@@ -3,12 +3,12 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 31.1-diag (Diagnóstico Avançado de Mapeamentos)
+Versão: 31.0 (Estável com Correção de Log)
 - BASE: Código baseado na versão estável 31.0.
-- DIAGNÓSTICO: Adicionada a geração de múltiplos arquivos de log para
-  rastrear o fluxo de dados do mapeamento, desde a lista de DMOs consultada
-  até a resposta bruta da API e o dicionário de busca final.
-- O objetivo é identificar por que os mapeamentos não estão sendo encontrados.
+- CORREÇÃO: Movida a inicialização do logging.basicConfig para dentro do
+  bloco de execução principal para garantir que os logs sempre apareçam
+  no terminal.
+- Nenhuma outra lógica funcional foi alterada.
 
 """
 import os
@@ -58,26 +58,9 @@ class Config:
     ACTIVATION_FIELDS_CSV_COLUMN = 'Fieldname' 
     FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
 
-# Configuração do Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
 # ==============================================================================
 # --- 헬 Helpers & Funções Auxiliares ---
 # ==============================================================================
-def dump_to_json(data, filename):
-    """Salva uma variável em um arquivo JSON formatado para depuração."""
-    logging.info(f"🔍 Gerando arquivo de depuração: {filename}")
-    if isinstance(data, set):
-        data = list(data)
-    try:
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-    except TypeError:
-        # Fallback for complex objects that are not directly serializable
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(str(data))
-
-
 def get_access_token():
     logging.info("🔑 Autenticando com o Salesforce via JWT (método robusto)...")
     config = Config()
