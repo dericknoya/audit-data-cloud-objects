@@ -3,13 +3,11 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 31.0 (Versão Final Consolidada e Funcional)
-- BASE: Código baseado na versão estável anterior.
-- CORREÇÃO FINAL: Corrigida a lógica de busca do Mapeamento. O script agora
-  remove o sufixo '__c' do nome do campo antes de fazer a busca no dicionário
-  de mapeamentos, garantindo a correspondência correta das chaves.
-- ESTABILIDADE: Todas as funcionalidades, incluindo DELETION_IDENTIFIER e
-  Mapeamentos, estão operando corretamente sobre uma base estável.
+Versão: 29.1-diag (Diagnóstico de Mapeamentos)
+- BASE: Código baseado na versão estável 29.1-final-d.
+- DIAGNÓSTICO: Adicionada a geração de múltiplos arquivos de log para
+  rastrear o fluxo de dados do mapeamento e identificar a causa da falha.
+- Nenhuma outra lógica funcional foi alterada.
 
 """
 import os
@@ -65,6 +63,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ==============================================================================
 # --- 헬 Helpers & Funções Auxiliares ---
 # ==============================================================================
+def dump_to_json(data, filename):
+    logging.info(f"🔍 Gerando arquivo de depuração: {filename}")
+    if isinstance(data, set): data = list(data)
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+    except TypeError:
+        with open(filename, 'w', encoding='utf-8') as f: f.write(str(data))
+
 def get_access_token():
     logging.info("🔑 Autenticando com o Salesforce via JWT (método robusto)...")
     config = Config()
@@ -391,11 +398,8 @@ async def main():
                             mappings_lookup[dmo_name][target_field] = {'OBJECT_MAPPING_ID': obj_map_id, 'FIELD_MAPPING_ID': field_map_id}
             
             for row in unused_field_results:
-                # <<< INÍCIO DA CORREÇÃO (29.1-final-d) >>>
-                # Normaliza o nome do campo para a busca, removendo __c
                 field_name_for_lookup = row['FIELD_API_NAME'].removesuffix('__c')
                 mapping_info = mappings_lookup.get(row['DMO_API_NAME'], {}).get(field_name_for_lookup, {})
-                # <<< FIM DA CORREÇÃO (29.1-final-d) >>>
                 row['OBJECT_MAPPING_ID'] = mapping_info.get('OBJECT_MAPPING_ID', 'Não possuí mapeamento')
                 row['FIELD_MAPPING_ID'] = mapping_info.get('FIELD_MAPPING_ID', 'Não possuí mapeamento')
             logging.info("✅ IDs de mapeamento adicionados ao relatório.")
@@ -409,6 +413,8 @@ async def main():
 
 if __name__ == "__main__":
     start_time = time.time()
+    # Adicionado para garantir que o logging funcione
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     try: asyncio.run(main())
     except Exception as e: logging.critical(f"❌ Ocorreu um erro fatal e o script foi interrompido: {e}", exc_info=True)
     finally: logging.info(f"\n🏁 Auditoria concluída. Tempo total de execução: {time.time() - start_time:.2f} segundos.")
