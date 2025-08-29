@@ -3,14 +3,12 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 29.1-final-b (Estável com DELETION_IDENTIFIER)
-- BASE: Código restaurado a partir da versão estável 29.1, que lida
-  corretamente com a busca de mapeamentos.
-- FUNCIONALIDADE: Re-implementada de forma segura a busca pelo ID técnico
-  (DELETION_IDENTIFIER) de cada campo via Tooling API, usando o objeto
-  correto 'MktDataModelField'.
-- ESTABILIDADE: Nenhuma outra lógica funcional ou sintaxe de queries foi
-  alterada para garantir a estabilidade e evitar regressões.
+Versão: 29.1-diag (Diagnóstico de DELETION_IDENTIFIER e Mapeamento)
+- BASE: Código restaurado a partir da versão estável 29.1.
+- FUNCIONALIDADE: Reintroduzida a busca pelo DELETION_IDENTIFIER.
+- DIAGNÓSTICO: Adicionada a geração de múltiplos arquivos de log para
+  rastrear o fluxo de dados do ID técnico do campo, desde a coleta até a
+  classificação final, para identificar por que o mapeamento e o ID falham.
 
 """
 import os
@@ -66,6 +64,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ==============================================================================
 # --- 헬 Helpers & Funções Auxiliares ---
 # ==============================================================================
+def dump_to_json(data, filename):
+    logging.info(f"🔍 Gerando arquivo de depuração: {filename}")
+    if isinstance(data, set):
+        data = list(data)
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
 def get_access_token():
     logging.info("🔑 Autenticando com o Salesforce via JWT (método robusto)...")
     config = Config()
@@ -247,6 +252,8 @@ def write_csv_report(filename, data, headers):
 def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_map, field_id_map):
     logging.info("--- FASE 3/4: Classificando campos... ---")
     used_results, unused_results = [], []
+    trace_log_lines = []
+    
     for dmo_name, dmo_info in dmo_creation_info.items():
         created_date = parse_sf_date(dmo_info.get('CreatedDate'))
         if created_date and days_since(created_date) <= Config.GRACE_PERIOD_DAYS:
@@ -267,7 +274,10 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
                 continue
             
             dmo_id = dmo_details.get('Id')
-            deletion_id = field_id_map.get(f"{dmo_id}.{field_api_name}", 'ID não encontrado') if dmo_id else 'ID do DMO não encontrado'
+            lookup_key = f"{dmo_id}.{field_api_name}" if dmo_id else None
+            deletion_id = field_id_map.get(lookup_key, 'ID não encontrado') if lookup_key else 'ID do DMO não encontrado'
+
+            trace_log_lines.append(f"DMO: {dmo_name}, Campo: {field_api_name}, ID do DMO: {dmo_id}, Chave de Busca: {lookup_key}, ID Encontrado: {deletion_id}")
 
             common_data = {
                 'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_name,
@@ -277,17 +287,16 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
 
             if field_api_name in used_fields_details:
                 usages = used_fields_details[field_api_name]
-                used_results.append({
-                    **common_data,
-                    'USAGE_COUNT': len(usages),
-                    'USAGE_TYPES': ", ".join(sorted(list(set(u['usage_type'] for u in usages))))
-                })
+                used_results.append({**common_data, 'USAGE_COUNT': len(usages), 'USAGE_TYPES': ", ".join(sorted(list(set(u['usage_type'] for u in usages))))})
             else:
-                unused_results.append({
-                    **common_data,
-                    'DELETAR': 'NAO',
-                    'REASON': 'Não utilizado e DMO com mais de 90 dias'
-                })
+                unused_results.append({**common_data, 'DELETAR': 'NAO', 'REASON': 'Não utilizado e DMO com mais de 90 dias'})
+    
+    try:
+        with open('debug_classification_trace.txt', 'w', encoding='utf-8') as f: f.write('\n'.join(trace_log_lines))
+        logging.info("🔍 Arquivo de rastreamento 'debug_classification_trace.txt' gerado.")
+    except IOError as e:
+        logging.error(f"❌ Não foi possível escrever o arquivo de rastreamento: {e}")
+
     logging.info(f"📊 Classificação concluída: {len(used_results)} campos utilizados, {len(unused_results)} campos não utilizados.")
     return used_results, unused_results
 
@@ -323,9 +332,13 @@ async def main():
             else: data[task_name] = result
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
         
+        dump_to_json(data['dmo_tooling'], 'debug_dmo_tooling_data.json')
+        dump_to_json(data['dmo_fields_tooling'], 'debug_field_tooling_data.json')
+        
         dmo_creation_info = {rec['DeveloperName']: rec for rec in data['dmo_tooling']}
         
         field_id_map = {f"{rec['MktDataModelObjectId']}.{rec['DeveloperName']}": rec['Id'] for rec in data.get('dmo_fields_tooling', [])}
+        dump_to_json(field_id_map, 'debug_field_id_map.json')
         logging.info(f"✅ {len(field_id_map)} IDs técnicos de campos de DMOs foram mapeados.")
 
         segment_ids = [rec['Id'] for rec in data['segments'] if rec.get('Id')]
