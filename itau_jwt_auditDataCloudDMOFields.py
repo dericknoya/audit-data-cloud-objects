@@ -3,61 +3,12 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 29.1 (Versão Final Estável com Mapeamento)
-- CORREÇÃO: O nome da coluna esperado no arquivo 'ativacoes_campos.csv' foi 
-  ajustado de 'FIELD_API_NAME' para 'Fieldname' para corresponder ao arquivo real.
-- MELHORIA: O nome da coluna do CSV foi movido para a classe 'Config' para
-  facilitar futuras manutenções.
-- MANTÉM: Todas as funcionalidades e correções de robustez da versão 23.0.
-
-================================================================================
-REGRAS DE NEGÓCIO PARA CLASSIFICAÇÃO DE CAMPOS
-================================================================================
-
-Este script gera dois relatórios para fornecer uma visão completa do uso dos 
-campos de DMOs customizados. As regras abaixo definem como um campo é 
-classificado em cada relatório.
-
---------------------------------------------------------------------------------
-REGRAS PARA UM CAMPO SER CONSIDERADO "UTILIZADO"
---------------------------------------------------------------------------------
-Um campo é listado no relatório 'audit_campos_dmo_utilizados.csv' se UMA OU MAIS 
-das seguintes condições for verdadeira:
-
-1.  É encontrado nos critérios de pelo menos um **Segmento**.
-2.  É encontrado em qualquer parte da configuração de pelo menos uma **Ativação (via API)**.
-3.  É encontrado em qualquer parte da definição de pelo menos um **Calculated Insight**.
-4.  É encontrado na definição de um **Ponto de Contato de Ativação**.
-5.  Seu DMO pai foi criado **nos últimos 90 dias**.
-6.  É encontrado no arquivo de mapeamento manual **ativacoes_campos.csv**.
-
---------------------------------------------------------------------------------
-REGRAS PARA UM CAMPO SER CONSIDERADO "NÃO UTILIZADO"
---------------------------------------------------------------------------------
-Um campo é listado no relatório 'audit_campos_dmo_nao_utilizados.csv' SOMENTE 
-SE TODAS as seguintes condições forem verdadeiras:
-
-1.  **NÃO é encontrado** em nenhum Segmento, Ativação, Calculated Insight, 
-    Ponto de Contato de Ativação ou no CSV de ativações.
-2.  Seu DMO pai foi criado **há mais de 90 dias**.
-3.  O campo e seu DMO **não são** objetos de sistema do Salesforce (o script 
-    ignora nomes com prefixos como 'ssot__', 'unified__', 'aa_', 'aal_', etc.).
-
-================================================================================
-"""
-# -*- coding: utf-8 -*-
-"""
-Este script audita uma instância do Salesforce Data Cloud para identificar 
-campos de DMOs (Data Model Objects) utilizados e não utilizados.
-
-Versão: 29.1 (Versão Final Estável com Mapeamento)
-- BASE: Código baseado na versão estável e funcional 29.0.
-- FUNCIONALIDADE: Reintroduzida a busca por IDs de mapeamento para campos não
-  utilizados, como na versão 30.0.
+Versão: 30.1 (Versão Final Estável com Ajustes)
+- BASE: Código baseado na versão 30.0, confirmada como funcional.
 - AJUSTE DE LOG: Removido o 'warning' do terminal para DMOs que não possuem
   mapeamento (erro 404), limpando a saída do console.
 - AJUSTE DE SAÍDA: O valor padrão no CSV para mapeamentos inexistentes foi
-  alterado para 'Não possuí mapeamento'.
+  alterado de 'N/A' para 'Não possuí mapeamento'.
 - Nenhuma outra lógica funcional foi alterada para garantir a estabilidade.
 
 """
