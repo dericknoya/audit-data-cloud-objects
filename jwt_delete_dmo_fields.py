@@ -3,12 +3,13 @@
 Este script realiza a exclusão em massa de campos de DMOs (Data Model Objects)
 baseado em um arquivo CSV de auditoria.
 
-Versão: 2.0 - Deleção em Massa com Remoção de Mapeamento e Suporte a Proxy
+Versão: 2.1 - Correção de leitura de CSV (BOM) e ajuste na variável de proxy.
 
 Metodologia:
 - Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
-- Suporta o uso de proxies (HTTP_PROXY, HTTPS_PROXY) definidos em variáveis de ambiente.
-- Lê um arquivo CSV (padrão: 'audit_campos_dmo_nao_utilizados.csv').
+- Suporta o uso de proxy através da variável de ambiente 'PROXY_URL'.
+- Lê um arquivo CSV (padrão: 'audit_campos_dmo_nao_utilizados.csv') usando a codificação 'utf-8-sig'
+  para evitar problemas com BOM (Byte Order Mark).
 - Filtra as linhas onde a coluna 'DELETAR' está marcada como 'SIM'.
 - Para cada campo a ser excluído:
   - Verifica se existe um mapeamento associado nas colunas 'OBJECT_MAPPING_ID' e 'FIELD_MAPPING_ID'.
@@ -48,13 +49,12 @@ def get_access_token():
     sf_audience = os.getenv("SF_AUDIENCE")
     sf_login_url = os.getenv("SF_LOGIN_URL")
 
-    # Suporte a Proxy para a chamada de autenticação
-    http_proxy = os.getenv("HTTP_PROXY")
-    https_proxy = os.getenv("HTTPS_PROXY")
-    proxies = {"http": http_proxy, "https": https_proxy} if http_proxy and https_proxy else None
+    # AJUSTE: Suporte a Proxy via variável de ambiente PROXY_URL
+    proxy_url = os.getenv("PROXY_URL")
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     
     if proxies:
-        print(f"🌍 Usando proxy para autenticação: {https_proxy}")
+        print(f"🌍 Usando proxy para autenticação: {proxy_url}")
 
     if not all([sf_client_id, sf_username, sf_audience, sf_login_url]):
         raise ValueError("Uma ou mais variáveis de ambiente para o fluxo JWT estão faltando.")
@@ -184,7 +184,8 @@ async def mass_delete_fields(file_path, dry_run):
     """Orquestra o processo de leitura, confirmação e exclusão de campos."""
     
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        # AJUSTE: Mudar a codificação para 'utf-8-sig' para lidar com o BOM (Byte Order Mark)
+        with open(file_path, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             # Validar cabeçalhos necessários
             required_cols = ['DELETAR', 'DMO_DISPLAY_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 
@@ -229,9 +230,8 @@ async def mass_delete_fields(file_path, dry_run):
     instance_url = auth_data['instance_url']
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
     
-    # Configuração de proxy para as chamadas de API
-    https_proxy = os.getenv("HTTPS_PROXY")
-    proxy_url = https_proxy if https_proxy else None
+    # AJUSTE: Configuração de proxy via variável de ambiente PROXY_URL
+    proxy_url = os.getenv("PROXY_URL")
     if proxy_url:
         print(f"🌍 Usando proxy para chamadas de API: {proxy_url}")
 
