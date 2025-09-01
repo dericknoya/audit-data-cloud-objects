@@ -3,16 +3,10 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 32.0-stable-context-aware (Análise de Contexto e Mapeamento Direto)
-- ANÁLISE DE USO CONTEXTUAL: O script agora também procura por menções ao NOME DO DMO
-  dentro de Segmentos/CIs. Se um DMO é encontrado, todos os seus campos são
-  considerados em uso, e a origem é citada no relatório.
-- CORREÇÃO DE MAPEAMENTO: A lógica de busca de mapeamentos foi refatorada para
-  realizar uma comparação direta e explícita, normalizando ambos os nomes de
-  campo (o do DMO e o da API) no momento da verificação, resolvendo a falha
-  de correspondência.
-- ANÁLISE COMPLETA: O 'Modo Estrito' foi removido para garantir que a análise
-  sempre seja abrangente.
+Versão: 34.1-stable-hotfix (Lógica de Mapeamento Direcionado Restaurada)
+- LÓGICA RESTAURADA: Esta versão utiliza a lógica de análise por chave composta
+  (DMO+Campo) e busca os mapeamentos APENAS para os DMOs que contêm campos
+  classificados como não utilizados, conforme o requisito original.
 """
 import os
 import time
@@ -61,21 +55,15 @@ class Config:
     ACTIVATION_DMO_COLUMN = 'entityname'
     ACTIVATION_FIELD_COLUMN = 'fieldname'
     FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
-    
-    DEBUG_FOLDER = 'debug_logs'
-    DEBUG_USAGE_CSV = 'debug_usage_classification.csv'
-    DEBUG_MAPPING_CSV = 'debug_mapping_lookup.csv'
-    DEBUG_RAW_MAPPING_FOLDER = 'debug_raw_mappings'
 
 # Configuração do Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ==============================================================================
-# --- 헬 Helpers & Funções Auxiliares (sem alterações) ---
-# ... (o código das funções auxiliares e da classe SalesforceClient permanece o mesmo) ...
+# --- 헬 Helpers & Funções Auxiliares ---
 # ==============================================================================
 def get_access_token():
-    logging.info("🔑 Autenticando com o Salesforce via JWT (método robusto)...")
+    logging.info("🔑 Autenticando com o Salesforce via JWT...")
     config = Config()
     if not all([config.SF_CLIENT_ID, config.SF_USERNAME, config.SF_AUDIENCE, config.SF_LOGIN_URL]):
         raise ValueError("Variáveis de ambiente de autenticação faltando no .env.")
@@ -228,14 +216,10 @@ class SalesforceClient:
         if not user_ids: return {}
         users = await self.fetch_records_in_bulk('User', ['Id', 'Name'], list(user_ids))
         return {user['Id']: user.get('Name', 'Nome não encontrado') for user in users}
+
 # ==============================================================================
 # --- 📊 FUNÇÕES DE ANÁLISE E PROCESSAMENTO ---
 # ==============================================================================
-def find_fields_in_content(content_string, used_fields_details):
-    if not content_string: return
-    for match in Config.FIELD_NAME_PATTERN.finditer(html.unescape(str(content_string))):
-        used_fields_details[match.group(1)].append(True) # Apenas registra que foi usado
-
 def write_csv_report(filename, data, headers):
     if not data:
         logging.info(f"ℹ️ Nenhum dado para gerar o relatório '{filename}'.")
@@ -249,57 +233,33 @@ def write_csv_report(filename, data, headers):
     except (IOError, OSError) as e:
         logging.error(f"❌ Erro ao escrever o arquivo {filename}: {e}")
         
-def classify_fields(all_dmo_fields, dmo_usage_locations, field_usage_locations, used_field_pairs_from_csv: set, dmo_creation_info, user_map, field_id_map, config: Config):
-    logging.info("--- FASE 3/4: Classificando campos... ---")
-    used_results, unused_results = [], []
-    
-    for dmo_api_name, data in all_dmo_fields.items():
-        dmo_dev_name = normalize_api_name(dmo_api_name)
-        dmo_details = dmo_creation_info.get(dmo_dev_name, {})
-        creator_id = dmo_details.get('CreatedById') or dmo_details.get('createdById')
-        creator_name = user_map.get(creator_id, 'Desconhecido')
-        
-        # Verifica se o DMO em si foi mencionado em algum lugar
-        dmo_level_usages = dmo_usage_locations.get(dmo_dev_name, [])
-        
-        for field_api_name, field_display_name in data['fields'].items():
-            if any(field_api_name.startswith(p) for p in Config.FIELD_PREFIXES_TO_EXCLUDE) or field_api_name in Config.SPECIFIC_FIELDS_TO_EXCLUDE:
-                continue
-            
-            all_usages = []
-            
-            # 1. Uso a nível de DMO (mais forte)
-            if dmo_level_usages:
-                all_usages.extend(dmo_level_usages)
+def build_usage_map(data, all_dmo_fields_map, used_field_pairs_from_csv):
+    """Constrói um mapa de uso preciso com a chave (DMO, Campo)."""
+    usage_map = defaultdict(list)
 
-            # 2. Uso a nível de campo (buscas de texto)
-            field_level_usages = field_usage_locations.get(field_api_name, [])
-            if field_level_usages:
-                all_usages.extend(field_level_usages)
+    for dmo_dev_name, field_api_name in used_field_pairs_from_csv:
+        usage_map[(dmo_dev_name, field_api_name)].append(f"Ativação (CSV Externo): {Config.ACTIVATION_FIELDS_CSV}")
 
-            # 3. Uso a nível de par (DMO, Campo) do CSV (mais preciso)
-            if (dmo_dev_name, field_api_name) in used_field_pairs_from_csv:
-                all_usages.append({"usage_type": "Ativação (CSV Externo)", "object_name": config.ACTIVATION_FIELDS_CSV})
-            
-            # 4. Período de carência
-            created_date = parse_sf_date(dmo_details.get('CreatedDate'))
-            if created_date and days_since(created_date) <= config.GRACE_PERIOD_DAYS:
-                if not all_usages: # Só adiciona se não houver outro uso
-                    all_usages.append({"usage_type": "N/A (DMO Recém-criado)", "object_name": "DMO criado < 90 dias"})
+    mentioned_fields = set()
+    sources = [
+        (data['segments'], "Segmento", lambda s: f"{s.get('IncludeCriteria', '')} {s.get('ExcludeCriteria', '')}", lambda s: s.get('Name')),
+        (data['activations'], "Ativação", lambda a: a.get('QueryPath', ''), lambda a: a.get('Name')),
+        (data['calculated_insights'], "Calculated Insight", json.dumps, lambda ci: ci.get('displayName'))
+    ]
+    for source_list, usage_type, content_extractor, name_extractor in sources:
+        for item in source_list:
+            content = content_extractor(item)
+            if not content: continue
+            for match in Config.FIELD_NAME_PATTERN.finditer(html.unescape(str(content))):
+                field_name = match.group(1)
+                mentioned_fields.add((field_name, f"{usage_type}: {name_extractor(item)}"))
 
-            dmo_id = dmo_details.get('Id')
-            field_name_for_id_lookup = field_api_name.removesuffix('__c')
-            deletion_id = field_id_map.get(f"{dmo_id}.{field_name_for_id_lookup}", 'ID não encontrado') if dmo_id else 'ID do DMO não encontrado'
-            common_data = {'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_api_name, 'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': deletion_id}
-
-            if all_usages:
-                usage_types = ", ".join(sorted(list(set(f"{u['usage_type']}: {u['object_name']}" for u in all_usages))))
-                used_results.append({**common_data, 'USAGE_COUNT': len(all_usages), 'USAGE_TYPES': usage_types})
-            else:
-                unused_results.append({**common_data, 'DELETAR': 'NAO', 'REASON': 'Não utilizado e DMO com mais de 90 dias'})
-    
-    logging.info(f"📊 Classificação concluída: {len(used_results)} campos utilizados, {len(unused_results)} campos não utilizados.")
-    return used_results, unused_results
+    for field_name, context in mentioned_fields:
+        if field_name in all_dmo_fields_map:
+            for dmo_dev_name in all_dmo_fields_map[field_name]:
+                usage_map[(dmo_dev_name, field_name)].append(context)
+                
+    return usage_map
 
 async def fetch_mappings_with_fallback(client, dmo_name):
     mappings = await client.fetch_dmo_mappings(dmo_name)
@@ -315,11 +275,6 @@ async def fetch_mappings_with_fallback(client, dmo_name):
 async def main():
     logging.info("🚀 Iniciando auditoria de campos de DMO...")
     config = Config()
-    
-    os.makedirs(config.DEBUG_FOLDER, exist_ok=True)
-    raw_mapping_path = os.path.join(config.DEBUG_FOLDER, config.DEBUG_RAW_MAPPING_FOLDER)
-    os.makedirs(raw_mapping_path, exist_ok=True)
-    
     auth_data = get_access_token()
     async with SalesforceClient(config, auth_data) as client:
         logging.info("--- FASE 1/4: Coletando metadados e objetos... ---")
@@ -333,81 +288,76 @@ async def main():
         dmo_creator_ids = {cr_id for d in dmo_creation_info.values() if (cr_id := d.get('CreatedById') or d.get('createdById'))}
         user_id_to_name_map = await client.fetch_users_by_id(dmo_creator_ids)
         
-        logging.info("--- FASE 2/4: Analisando o uso dos campos e DMOs... ---")
-        used_field_pairs_from_csv = read_used_field_pairs_from_csv(config)
+        logging.info("--- FASE 2/4: Construindo mapa de uso preciso (DMO+Campo)... ---")
         
-        dmo_usage_locations = defaultdict(list)
-        field_usage_locations = defaultdict(list)
-        
-        all_dmo_dev_names = dmo_creation_info.keys()
-
-        # Análise de uso contextual
-        for seg in tqdm(data['segments'], desc="Analisando Segmentos"):
-            content = f"{seg.get('IncludeCriteria', '')} {seg.get('ExcludeCriteria', '')}"
-            for name in all_dmo_dev_names:
-                if name in content: dmo_usage_locations[name].append({'usage_type': 'Segmento', 'object_name': seg.get('Name')})
-            for match in Config.FIELD_NAME_PATTERN.finditer(content):
-                field_usage_locations[match.group(1)].append({'usage_type': 'Segmento', 'object_name': seg.get('Name')})
-
-        for act in tqdm(data['activations'], desc="Analisando Ativações"):
-            content = act.get('QueryPath', '')
-            for name in all_dmo_dev_names:
-                if name in content: dmo_usage_locations[name].append({'usage_type': 'Ativação', 'object_name': act.get('Name')})
-            for match in Config.FIELD_NAME_PATTERN.finditer(content):
-                field_usage_locations[match.group(1)].append({'usage_type': 'Ativação', 'object_name': act.get('Name')})
-        
-        for ci in tqdm(data['calculated_insights'], desc="Analisando CIs"):
-            content = json.dumps(ci)
-            for name in all_dmo_dev_names:
-                if name in content: dmo_usage_locations[name].append({'usage_type': 'Calculated Insight', 'object_name': ci.get('displayName')})
-            for match in Config.FIELD_NAME_PATTERN.finditer(content):
-                field_usage_locations[match.group(1)].append({'usage_type': 'Calculated Insight', 'object_name': ci.get('displayName')})
-
+        all_dmo_fields_map = defaultdict(list)
         all_dmo_fields = defaultdict(lambda: {'fields': {}, 'displayName': ''})
         for dmo in data['dmo_metadata']:
-            dmo_name = dmo.get('name')
-            if dmo_name and dmo_name.endswith('__dlm') and not any(dmo_name.lower().startswith(p) for p in config.DMO_PREFIXES_TO_EXCLUDE):
-                all_dmo_fields[dmo_name]['displayName'] = dmo.get('displayName', dmo_name)
+            dmo_api_name = dmo.get('name')
+            if dmo_api_name and dmo_api_name.endswith('__dlm') and not any(dmo_api_name.lower().startswith(p) for p in config.DMO_PREFIXES_TO_EXCLUDE):
+                all_dmo_fields[dmo_api_name]['displayName'] = dmo.get('displayName', dmo_api_name)
+                dmo_dev_name = normalize_api_name(dmo_api_name)
                 for field in dmo.get('fields', []):
-                    if field_name := field.get('name'): all_dmo_fields[dmo_name]['fields'][field_name] = field.get('displayName', field_name)
+                    if field_name := field.get('name'):
+                        all_dmo_fields[dmo_api_name]['fields'][field_name] = field.get('displayName', field_name)
+                        all_dmo_fields_map[field_name].append(dmo_dev_name)
 
-        used_field_results, unused_field_results = classify_fields(all_dmo_fields, dmo_usage_locations, field_usage_locations, used_field_pairs_from_csv, dmo_creation_info, user_id_to_name_map, field_id_map, config)
+        used_field_pairs_from_csv = read_used_field_pairs_from_csv(config)
+        usage_map = build_usage_map(data, all_dmo_fields_map, used_field_pairs_from_csv)
+        logging.info(f"✅ Mapa de uso construído com {len(usage_map)} pares (DMO, Campo) únicos em uso.")
 
-        if unused_field_results:
-            logging.info("--- FASE BÔNUS: Buscando e Depurando Mapeamentos ---")
-            unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_field_results}))
+        logging.info("--- FASE 3/4: Classificando campos... ---")
+        used_results, unused_results = [], []
+        for dmo_api_name, dmo_data in all_dmo_fields.items():
+            dmo_dev_name = normalize_api_name(dmo_api_name)
+            dmo_details = dmo_creation_info.get(dmo_dev_name, {})
+            creator_name = user_id_to_name_map.get(dmo_details.get('CreatedById') or dmo_details.get('createdById'), 'Desconhecido')
+
+            for field_api_name, field_display_name in dmo_data['fields'].items():
+                if any(field_api_name.startswith(p) for p in config.FIELD_PREFIXES_TO_EXCLUDE) or field_api_name in config.SPECIFIC_FIELDS_TO_EXCLUDE: continue
+                
+                composite_key = (dmo_dev_name, field_api_name)
+                usages = usage_map.get(composite_key, [])
+                
+                is_in_grace_period = False
+                created_date = parse_sf_date(dmo_details.get('CreatedDate'))
+                if created_date and days_since(created_date) <= config.GRACE_PERIOD_DAYS:
+                    is_in_grace_period = True
+
+                dmo_id = dmo_details.get('Id')
+                field_name_for_id_lookup = field_api_name.removesuffix('__c')
+                deletion_id = field_id_map.get(f"{dmo_id}.{field_name_for_id_lookup}", 'ID não encontrado') if dmo_id else 'ID do DMO não encontrado'
+                common_data = {'DMO_DISPLAY_NAME': dmo_data['displayName'], 'DMO_API_NAME': dmo_api_name, 'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': deletion_id}
+
+                if usages or is_in_grace_period:
+                    if is_in_grace_period and not usages:
+                        usages.append("N/A (DMO Recém-criado): DMO criado < 90 dias")
+                    used_results.append({**common_data, 'USAGE_COUNT': len(usages), 'USAGE_TYPES': ", ".join(sorted(list(set(usages))))})
+                else:
+                    unused_results.append({**common_data, 'DELETAR': 'NAO', 'REASON': 'Não utilizado e DMO com mais de 90 dias'})
+        
+        if unused_results:
+            logging.info("--- FASE BÔNUS: Buscando Mapeamentos para campos não utilizados ---")
+            unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_results}))
             mapping_tasks = [fetch_mappings_with_fallback(client, dmo_name) for dmo_name in unused_dmos]
             all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos de DMOs")
-            
-            # Mapeia DMO API Name para seus dados de mapeamento brutos
             raw_mapping_by_dmo = dict(zip(unused_dmos, all_mapping_data))
 
-            for row in unused_field_results:
+            for row in unused_results:
                 dmo_api_name = row['DMO_API_NAME']
                 field_api_name = row['FIELD_API_NAME']
-                
-                # Chave de busca normalizada para o campo atual
                 target_key_to_find = normalize_field_name_for_mapping(field_api_name)
-                
                 found_mappings = []
-                
-                # Acessa os dados de mapeamento brutos para este DMO
                 mapping_data = raw_mapping_by_dmo.get(dmo_api_name)
+                
                 if mapping_data and 'objectSourceTargetMaps' in mapping_data:
                     for obj_map in mapping_data['objectSourceTargetMaps']:
                         for field_map in obj_map.get('fieldMappings', []):
                             api_target_field = field_map.get('targetFieldDeveloperName')
                             if not api_target_field: continue
-                            
-                            # Normaliza a chave disponível na API para comparação
                             available_key = normalize_field_name_for_mapping(api_target_field)
-                            
-                            # Comparação direta e explícita
                             if target_key_to_find == available_key:
-                                found_mappings.append({
-                                    'OBJECT_MAPPING_ID': obj_map.get('developerName', ''),
-                                    'FIELD_MAPPING_ID': field_map.get('developerName', '')
-                                })
+                                found_mappings.append({'OBJECT_MAPPING_ID': obj_map.get('developerName', ''), 'FIELD_MAPPING_ID': field_map.get('developerName', '')})
                 
                 if found_mappings:
                     row['OBJECT_MAPPING_ID'] = ", ".join(m['OBJECT_MAPPING_ID'] for m in found_mappings)
@@ -415,12 +365,11 @@ async def main():
                 else:
                     row['OBJECT_MAPPING_ID'] = 'Não possuí mapeamento'
                     row['FIELD_MAPPING_ID'] = 'Não possuí mapeamento'
-            
             logging.info("✅ IDs de mapeamento adicionados ao relatório.")
         
         logging.info("--- FASE 4/4: Gerando relatórios... ---")
-        write_csv_report(config.UNUSED_FIELDS_CSV, unused_field_results, ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME', 'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER'])
-        write_csv_report(config.USED_FIELDS_CSV, used_field_results, ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_COUNT', 'USAGE_TYPES', 'CREATED_BY_NAME', 'DELETION_IDENTIFIER'])
+        write_csv_report(config.UNUSED_FIELDS_CSV, unused_results, ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME', 'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER'])
+        write_csv_report(config.USED_FIELDS_CSV, used_results, ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_COUNT', 'USAGE_TYPES', 'CREATED_BY_NAME', 'DELETION_IDENTIFIER'])
 
 if __name__ == "__main__":
     start_time = time.time()
