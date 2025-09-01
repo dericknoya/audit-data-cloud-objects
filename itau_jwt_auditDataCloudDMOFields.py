@@ -3,14 +3,15 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 43.0-stable-bulk-segments (Retorno à Busca de Segmentos via Bulk)
-- ROBUSTEZ DE DADOS: Revertida a busca de segmentos para o método original de
-  query + busca em massa (Bulk). Isso remove a limitação de 2000 registros do
-  endpoint 'ssot/segments' e garante que todos os segmentos do ambiente sejam
-  processados.
+Versão: 44.0-stable-final-restored (Lógica de Mapeamento Restaurada)
+- CORREÇÃO: A 'FASE BÔNUS', responsável por buscar os IDs de mapeamento para
+  campos não utilizados, foi reintroduzida no script. Um erro na versão
+  anterior havia removido esta funcionalidade.
 - PRECISÃO MANTIDA: A lógica de análise de uso por chave composta (DMO, Campo)
-  e todas as correções anteriores (versão de API, headers, etc.) foram
-  mantidas.
+  está mantida, garantindo que a classificação de campos utilizados e não
+  utilizados seja precisa.
+- ROBUSTEZ: Todas as correções anteriores (versão de API, headers, tratamento
+  de erros 404, busca de segmentos via bulk) estão presentes.
 """
 import os
 import time
@@ -137,6 +138,11 @@ def normalize_api_name(name):
     if not isinstance(name, str): return ""
     return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
 
+def normalize_field_name_for_mapping(name: str) -> str:
+    if not isinstance(name, str): return ""
+    base_name = re.sub(r'(_[a-zA-Z])?__c$', '', name)
+    return base_name.lower()
+
 # ==============================================================================
 # ---  Classe Salesforce API Client ---
 # ==============================================================================
@@ -234,7 +240,6 @@ class SalesforceClient:
         if not user_ids: return {}
         users = await self.fetch_records_in_bulk('User', ['Id', 'Name'], list(user_ids))
         return {user['Id']: user.get('Name', 'Nome não encontrado') for user in users}
-
 # ==============================================================================
 # --- 📊 FUNÇÕES DE ANÁLISE E PROCESSAMENTO ---
 # ==============================================================================
@@ -297,17 +302,15 @@ async def main():
             "dmo_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': 'SELECT DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject'})}", 'records'),
             "dmo_metadata": client.fetch_api_data(f"/services/data/{config.API_VERSION}/ssot/metadata?entityType=DataModelObject", 'metadata'),
             "calculated_insights": client.fetch_api_data(f"/services/data/{config.API_VERSION}/ssot/metadata?entityType=CalculatedInsight", 'records'),
-            # --- VOLTANDO A USAR QUERY JOB PARA BUSCAR TODOS OS IDs DE SEGMENTOS ---
             "segment_ids": client.execute_query_job("SELECT Id FROM MarketSegment"),
             "activations": client.fetch_api_data(f"/services/data/{config.API_VERSION}/query?{urlencode({'q': 'SELECT Name, QueryPath FROM MktSgmntActvtnAudAttribute'})}", 'records'),
         }
         task_results = await asyncio.gather(*tasks_to_run.values(), return_exceptions=True)
         data = {task_name: res if not isinstance(res, Exception) else [] for task_name, res in zip(tasks_to_run.keys(), task_results)}
         
-        # --- BUSCA EM MASSA DOS DETALHES DOS SEGMENTOS ---
         segment_ids = [rec['Id'] for rec in data.get('segment_ids', [])]
         segments_list = await client.fetch_records_in_bulk("MarketSegment", ["Name", "IncludeCriteria", "ExcludeCriteria"], segment_ids)
-        data['segments'] = segments_list # Substitui a lista de IDs pela lista completa
+        data['segments'] = segments_list
         
         logging.info("✅ Coleta inicial de metadados concluída.")
         dmo_creation_info = {rec['DeveloperName']: rec for rec in data['dmo_tooling']}
@@ -356,6 +359,7 @@ async def main():
                 
                 composite_key = (dmo_dev_name, field_api_name)
                 usages = usage_map.get(composite_key, [])
+                
                 is_in_grace_period = False
                 created_date = parse_sf_date(dmo_details.get('CreatedDate'))
                 if created_date and days_since(created_date) <= config.GRACE_PERIOD_DAYS: is_in_grace_period = True
@@ -368,10 +372,38 @@ async def main():
                 else:
                     unused_results.append({**common_data, 'DELETAR': 'NAO', 'REASON': 'Não utilizado'})
         
-        # Como não buscamos mais os Mapeamentos, essa fase foi removida.
+        # --- LÓGICA DE MAPEAMENTO RESTAURADA ---
+        if unused_results:
+            logging.info("--- FASE BÔNUS: Buscando Mapeamentos para campos não utilizados ---")
+            unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_results}))
+            mapping_tasks = [client.fetch_api_data(f"/services/data/{config.API_VERSION}/ssot/data-model-object-mappings?dataspace=default&dmoDeveloperName={dmo}") for dmo in unused_dmos]
+            all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando mapeamentos")
+            
+            raw_mapping_by_dmo = dict(zip(unused_dmos, all_mapping_data))
+            for row in unused_results:
+                dmo_api_name = row['DMO_API_NAME']
+                field_api_name = row['FIELD_API_NAME']
+                target_key_to_find = normalize_field_name_for_mapping(field_api_name)
+                found_mappings = []
+                mapping_data = raw_mapping_by_dmo.get(dmo_api_name)
+                if mapping_data and 'objectSourceTargetMaps' in mapping_data:
+                    for obj_map in mapping_data['objectSourceTargetMaps']:
+                        for field_map in obj_map.get('fieldMappings', []):
+                            api_target_field = field_map.get('targetFieldDeveloperName')
+                            if not api_target_field: continue
+                            available_key = normalize_field_name_for_mapping(api_target_field)
+                            if target_key_to_find == available_key:
+                                found_mappings.append({'OBJECT_MAPPING_ID': obj_map.get('developerName', ''), 'FIELD_MAPPING_ID': field_map.get('developerName', '')})
+                if found_mappings:
+                    row['OBJECT_MAPPING_ID'] = ", ".join(m['OBJECT_MAPPING_ID'] for m in found_mappings)
+                    row['FIELD_MAPPING_ID'] = ", ".join(m['FIELD_MAPPING_ID'] for m in found_mappings)
+                else:
+                    row['OBJECT_MAPPING_ID'] = 'Não possuí mapeamento'
+                    row['FIELD_MAPPING_ID'] = 'Não possuí mapeamento'
+            logging.info("✅ IDs de mapeamento adicionados ao relatório.")
         
         logging.info("--- FASE 4/4: Gerando relatórios... ---")
-        write_csv_report(config.UNUSED_FIELDS_CSV, unused_results, ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME'])
+        write_csv_report(config.UNUSED_FIELDS_CSV, unused_results, ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME', 'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID'])
         write_csv_report(config.USED_FIELDS_CSV, used_results, ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_COUNT', 'USAGE_TYPES', 'CREATED_BY_NAME'])
 
 if __name__ == "__main__":
