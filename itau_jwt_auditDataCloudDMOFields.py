@@ -3,18 +3,15 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 40.0-stable-final (Versão Consolidada e Corrigida)
-- VERSÃO API CORRIGIDA: A versão da API foi atualizada para 'v64.0', resolvendo
-  a principal causa de falha na obtenção de mapeamentos.
-- ANÁLISE PRECISA: A lógica de uso é baseada estritamente na chave composta
-  (DMO, Campo), eliminando falsos positivos. O relatório de uso agora cita a
-  origem exata de cada utilização.
-- HEADER HTTP CORRIGIDO: Requisições GET agora são feitas sem o header
-  'Content-Type', replicando o comportamento de ferramentas como o Insomnia.
-- DUMP CONTROLADO: A geração do CSV de mapeamentos ocorre apenas para os DMOs
-  que contêm campos não utilizados.
-- BASE ESTÁVEL: Todas as alterações foram aplicadas sobre a versão estável 30.1
-  do usuário, preservando a lógica de query e a estrutura do cliente de API.
+Versão: 38.0-stable-robust-handling (Tratamento de Erro 404 e Uso Preciso)
+- PARTIDA: Baseado na versão estável 30.1 do usuário.
+- ROBUSTEZ: Aprimorado o tratamento de erros na chamada da API de mapeamentos.
+  Agora, erros '404 Not Found' são tratados como uma resposta esperada (indicando
+  ausência de mapeamento) e não interrompem mais o script.
+- PRECISÃO: Mantida a lógica de análise de uso por chave composta (DMO, Campo)
+  para eliminar falsos positivos.
+- DUMP CONTROLADO: Mantida a geração do dump de mapeamentos apenas para DMOs
+  não utilizados.
 """
 import os
 import time
@@ -44,7 +41,7 @@ class Config:
     USE_PROXY = os.getenv("USE_PROXY", "True").lower() == "true"
     PROXY_URL = os.getenv("PROXY_URL")
     VERIFY_SSL = os.getenv("VERIFY_SSL", "False").lower() == "true"
-    API_VERSION = "v64.0"  # <-- CORREÇÃO CRÍTICA
+    API_VERSION = "v60.0"
     SF_CLIENT_ID = os.getenv("SF_CLIENT_ID")
     SF_USERNAME = os.getenv("SF_USERNAME")
     SF_AUDIENCE = os.getenv("SF_AUDIENCE")
@@ -159,12 +156,13 @@ class SalesforceClient:
         self.session = None
         self.semaphore = asyncio.Semaphore(config.SEMAPHORE_LIMIT)
     async def __aenter__(self):
-        # Header 'Content-Type' removido para alinhar com o Insomnia em chamadas GET
         headers = {'Authorization': f'Bearer {self.access_token}', 'Accept': 'application/json'}
         self.session = aiohttp.ClientSession(base_url=self.instance_url, headers=headers, connector=aiohttp.TCPConnector(ssl=self.config.VERIFY_SSL))
         return self
     async def __aexit__(self, exc_type, exc, tb):
         if self.session and not self.session.closed: await self.session.close()
+    
+    # --- LÓGICA DE TRATAMENTO DE ERRO 404 APRIMORADA ---
     async def fetch_api_data(self, relative_url, key_name=None):
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
@@ -185,24 +183,32 @@ class SalesforceClient:
                                 else: current_url = None
                             else: return data
                     return all_records
+                except aiohttp.ClientResponseError as e:
+                    if e.status == 404:
+                        logging.warning(f"API retornou 404 Not Found para ...{relative_url[-80:]}. Isso é esperado para DMOs sem mapeamento. Continuando...")
+                        return None # Retorna None para ser tratado como "sem dados"
+                    if attempt < self.config.MAX_RETRIES - 1:
+                        logging.warning(f"Erro {e.status} ao buscar dados. Tentando novamente...")
+                        await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
+                    else:
+                        logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para {relative_url[:60]} falharam com erro {e.status}."); raise e
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     if attempt < self.config.MAX_RETRIES - 1:
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
                     else:
-                        if hasattr(e, 'status') and e.status == 404:
-                            return None
                         logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para {relative_url[:60]} falharam."); raise e
+
     async def fetch_dmo_mappings(self, dmo_api_name):
         endpoint = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings"
         params = {"dataspace": "default", "dmoDeveloperName": dmo_api_name}
         url = f"{endpoint}?{urlencode(params)}"
         return await self.fetch_api_data(url)
+        
     async def execute_query_job(self, query):
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
                 try:
                     job_url_path = f"/services/data/{self.config.API_VERSION}/jobs/query"
-                    # Usar `json=payload` para que o aiohttp defina o Content-Type corretamente
                     payload = {"operation": "query", "query": query, "contentType": "CSV"}
                     proxy = self.config.PROXY_URL if self.config.USE_PROXY else None
                     async with self.session.post(job_url_path, json=payload, proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
@@ -244,6 +250,7 @@ class SalesforceClient:
         if not user_ids: return {}
         users = await self.fetch_records_in_bulk('User', ['Id', 'Name'], list(user_ids))
         return {user['Id']: user.get('Name', 'Nome não encontrado') for user in users}
+
 # ==============================================================================
 # --- 📊 FUNÇÕES DE ANÁLISE E PROCESSAMENTO ---
 # ==============================================================================
@@ -261,11 +268,9 @@ def write_csv_report(filename, data, headers):
         logging.error(f"❌ Erro ao escrever o arquivo {filename}: {e}")
         
 def build_usage_map(data, all_dmo_fields_map, used_field_pairs_from_csv, config):
-    """Constrói um mapa de uso preciso com a chave (DMO, Campo)."""
     usage_map = defaultdict(list)
     for dmo_dev_name, field_api_name in used_field_pairs_from_csv:
         usage_map[(dmo_dev_name, field_api_name)].append(f"Ativação (CSV Externo): {config.ACTIVATION_FIELDS_CSV}")
-
     mentioned_fields = set()
     sources = [ (data['segments'], "Segmento", lambda s: f"{s.get('IncludeCriteria', '')} {s.get('ExcludeCriteria', '')}", lambda s: s.get('Name')), (data['activations'], "Ativação", lambda a: a.get('QueryPath', ''), lambda a: a.get('Name')), (data['calculated_insights'], "Calculated Insight", json.dumps, lambda ci: ci.get('displayName')) ]
     for source_list, usage_type, content_extractor, name_extractor in sources:
@@ -276,7 +281,6 @@ def build_usage_map(data, all_dmo_fields_map, used_field_pairs_from_csv, config)
                 field_name = match.group(1)
                 item_name = name_extractor(item) or "Nome Indisponível"
                 mentioned_fields.add((field_name, f"{usage_type}: {item_name}"))
-
     for field_name, context in mentioned_fields:
         if field_name in all_dmo_fields_map:
             for dmo_dev_name in all_dmo_fields_map[field_name]:
@@ -284,10 +288,12 @@ def build_usage_map(data, all_dmo_fields_map, used_field_pairs_from_csv, config)
     return usage_map
 
 async def fetch_mappings_with_fallback(client, dmo_name):
+    logging.info(f"Tentando buscar mapeamento para: '{dmo_name}' (nome completo)")
     mappings = await client.fetch_dmo_mappings(dmo_name)
     if not mappings or not mappings.get('objectSourceTargetMaps'):
         normalized_name = normalize_api_name(dmo_name)
         if normalized_name != dmo_name:
+            logging.warning(f"Busca inicial para '{dmo_name}' falhou. Tentando com nome normalizado: '{normalized_name}'")
             mappings = await client.fetch_dmo_mappings(normalized_name)
     return mappings
 
@@ -372,6 +378,7 @@ async def main():
         if unused_results:
             logging.info("--- FASE BÔNUS: Buscando Mapeamentos e Gerando Dump Controlado ---")
             unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_results}))
+            
             mapping_tasks = [fetch_mappings_with_fallback(client, dmo_name) for dmo_name in unused_dmos]
             all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando mapeamentos")
             
