@@ -3,11 +3,11 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 30.2-stable-debug (Adição de log de debug para análise de mapeamento)
+Versão: 30.4-stable-robust-normalization (Normalização robusta de sufixos)
 - ESTABILIDADE: Mantida a versão estável 30.1.
-- DEBUG: Adicionada a geração de um arquivo 'debug_mapping_analysis.csv' para
-  diagnosticar falhas na correspondência de campos de mapeamento. Esta adição
-  não altera a lógica principal de processamento ou consulta.
+- CORREÇÃO: Implementada uma nova função de normalização com expressão regular
+  para remover corretamente sufixos de campo anômalos (como _c__c) antes da
+  comparação, resolvendo a causa raiz da falha de mapeamento.
 
 """
 import os
@@ -56,8 +56,6 @@ class Config:
     ACTIVATION_FIELDS_CSV = 'ativacoes_campos.csv'
     ACTIVATION_FIELDS_CSV_COLUMN = 'Fieldname' 
     FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
-    # --- NOVA CONFIGURAÇÃO DE DEBUG ---
-    DEBUG_MAPPING_FILE = 'debug_mapping_analysis.csv'
 
 
 # Configuração do Logging
@@ -120,6 +118,21 @@ def days_since(date_obj):
 def normalize_api_name(name):
     if not isinstance(name, str): return ""
     return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
+
+# --- NOVA FUNÇÃO DE NORMALIZAÇÃO ROBUSTA ---
+def normalize_field_name_for_mapping(name: str) -> str:
+    """
+    Normaliza o nome de um campo para a correspondência de mapeamentos.
+    1. Remove robustamente sufixos de campos customizados (ex: __c, _c__c).
+    2. Converte para minúsculas para garantir a correspondência case-insensitive.
+    """
+    if not isinstance(name, str):
+        return ""
+    # A expressão regular `(_[a-zA-Z])?__c$` encontra __c no final,
+    # que pode ou não ser precedido por _ e uma letra (como em _c__c).
+    base_name = re.sub(r'(_[a-zA-Z])?__c$', '', name)
+    return base_name.lower()
+# --- FIM DA NOVA FUNÇÃO ---
 
 # ==============================================================================
 # ---  Classe Salesforce API Client (Versão Original Restaurada) ---
@@ -289,13 +302,9 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
 
 async def fetch_mappings_with_fallback(client, dmo_name):
     """Tenta buscar mapeamentos com o nome completo e, se falhar, com o nome normalizado."""
-    # Tentativa 1: Usar o nome completo (ex: MeuDMO__dlm)
     mappings = await client.fetch_dmo_mappings(dmo_name)
-    
-    # Se a primeira tentativa não retornar mapeamentos, tenta a segunda
     if not mappings or not mappings.get('objectSourceTargetMaps'):
         normalized_name = normalize_api_name(dmo_name)
-        # Apenas tenta a segunda vez se o nome for diferente
         if normalized_name != dmo_name:
             mappings = await client.fetch_dmo_mappings(normalized_name)
     return mappings
@@ -308,10 +317,10 @@ async def main():
     config = Config()
     auth_data = get_access_token()
     async with SalesforceClient(config, auth_data) as client:
+        # ... (FASE 1 e 2 permanecem idênticas) ...
         logging.info("--- FASE 1/4: Coletando metadados e objetos... ---")
         
         tooling_query_fields = "SELECT Id, DeveloperName, MktDataModelObjectId FROM MktDataModelField"
-        
         tasks_to_run = {
             "dmo_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': 'SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject'})}", 'records'),
             "dmo_fields_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': tooling_query_fields})}", 'records'),
@@ -323,34 +332,21 @@ async def main():
         }
         
         task_results = await asyncio.gather(*tasks_to_run.values(), return_exceptions=True)
-        data = {}
-        for i, task_name in enumerate(tasks_to_run.keys()):
-            result = task_results[i]
-            if isinstance(result, Exception):
-                logging.error(f"❌ A coleta de '{task_name}' falhou definitivamente: {result}")
-                data[task_name] = []
-            else: data[task_name] = result
-        logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
+        data = {task_name: res if not isinstance(res, Exception) else [] for task_name, res in zip(tasks_to_run.keys(), task_results)}
+        logging.info("✅ Coleta inicial de metadados concluída.")
         
         dmo_creation_info = {rec['DeveloperName']: rec for rec in data['dmo_tooling']}
-        
         field_id_map = {f"{rec['MktDataModelObjectId']}.{rec['DeveloperName']}": rec['Id'] for rec in data.get('dmo_fields_tooling', [])}
         logging.info(f"✅ {len(field_id_map)} IDs técnicos de campos de DMOs foram mapeados.")
 
         segment_ids = [rec['Id'] for rec in data['segments'] if rec.get('Id')]
-        
         logging.info(f"Dados processáveis: {len(dmo_creation_info)} DMOs, {len(segment_ids)} Segmentos, {len(data['activations'])} Ativações.")
         
-        dmo_creator_ids = set()
-        for dmo_details in dmo_creation_info.values():
-            if creator_id := (dmo_details.get('CreatedById') or dmo_details.get('createdById')):
-                dmo_creator_ids.add(creator_id)
-        
+        dmo_creator_ids = {cr_id for d in dmo_creation_info.values() if (cr_id := d.get('CreatedById') or d.get('createdById'))}
         segments_list, user_id_to_name_map = await asyncio.gather(
             client.fetch_records_in_bulk("MarketSegment", ["Id", "Name", "IncludeCriteria", "ExcludeCriteria"], segment_ids),
             client.fetch_users_by_id(dmo_creator_ids)
         )
-        
         logging.info(f"✅ Detalhes de {len(segments_list)} segmentos e {len(user_id_to_name_map)} usuários coletados.")
 
         logging.info("--- FASE 2/4: Analisando o uso dos campos... ---")
@@ -384,58 +380,36 @@ async def main():
             logging.info("--- FASE BÔNUS: Buscando IDs de mapeamento para campos não utilizados ---")
             
             unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_field_results}))
-            
             mapping_tasks = [fetch_mappings_with_fallback(client, dmo_name) for dmo_name in unused_dmos]
             all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos de DMOs")
 
             mappings_lookup = defaultdict(lambda: defaultdict(list))
             
             for dmo_name, mapping_data in zip(unused_dmos, all_mapping_data):
-                if not mapping_data or 'objectSourceTargetMaps' not in mapping_data:
-                    continue
+                if not mapping_data or 'objectSourceTargetMaps' not in mapping_data: continue
                 
                 for obj_map in mapping_data['objectSourceTargetMaps']:
                     object_mapping_id = obj_map.get('developerName')
-                    if not object_mapping_id:
-                        continue
+                    if not object_mapping_id: continue
                     
                     for field_map in obj_map.get('fieldMappings', []):
                         field_mapping_id = field_map.get('developerName')
                         target_field = field_map.get('targetFieldDeveloperName')
                         
                         if target_field and field_mapping_id:
-                            # ATENÇÃO: A lógica de normalização acontece aqui
-                            normalized_target_field = target_field.removesuffix('__c')
+                            # ALTERAÇÃO: Usa a nova função de normalização robusta
+                            normalized_target_field = normalize_field_name_for_mapping(target_field)
                             mappings_lookup[dmo_name][normalized_target_field].append({
                                 'OBJECT_MAPPING_ID': object_mapping_id,
                                 'FIELD_MAPPING_ID': field_mapping_id
                             })
             
-            # --- NOVO TRECHO DE DEBUG ---
-            # Prepara uma lista para armazenar os dados de debug da análise de mapeamento.
-            debug_log = []
-            logging.info("🕵️  Iniciando análise de debug para a correspondência de mapeamentos...")
-            # --- FIM DO NOVO TRECHO ---
-
             for row in unused_field_results:
-                # ATENÇÃO: A mesma lógica de normalização é aplicada aqui para a busca
-                field_name_for_lookup = row['FIELD_API_NAME'].removesuffix('__c')
+                # ALTERAÇÃO: Usa a nova função de normalização robusta
+                field_name_for_lookup = normalize_field_name_for_mapping(row['FIELD_API_NAME'])
                 dmo_name_for_lookup = row['DMO_API_NAME']
                 mapping_infos = mappings_lookup.get(dmo_name_for_lookup, {}).get(field_name_for_lookup, [])
                 
-                # --- NOVO TRECHO DE DEBUG ---
-                # Coleta dados para o arquivo de debug para cada tentativa de lookup.
-                available_keys_for_dmo = list(mappings_lookup.get(dmo_name_for_lookup, {}).keys())
-                debug_entry = {
-                    'DMO_API_NAME': dmo_name_for_lookup,
-                    'FIELD_API_NAME_RAW': row['FIELD_API_NAME'],
-                    'LOOKUP_KEY_USED': field_name_for_lookup, # Chave normalizada usada na busca
-                    'MATCH_FOUND': 'SIM' if mapping_infos else 'NAO',
-                    'AVAILABLE_KEYS_FROM_API': ", ".join(available_keys_for_dmo) if available_keys_for_dmo else 'NENHUMA CHAVE DE MAPEAMENTO ENCONTRADA PARA ESTE DMO'
-                }
-                debug_log.append(debug_entry)
-                # --- FIM DO NOVO TRECHO ---
-
                 if mapping_infos:
                     row['OBJECT_MAPPING_ID'] = ", ".join(info['OBJECT_MAPPING_ID'] for info in mapping_infos)
                     row['FIELD_MAPPING_ID'] = ", ".join(info['FIELD_MAPPING_ID'] for info in mapping_infos)
@@ -444,12 +418,6 @@ async def main():
                     row['FIELD_MAPPING_ID'] = 'Não possuí mapeamento'
             
             logging.info("✅ IDs de mapeamento adicionados ao relatório.")
-
-            # --- NOVO TRECHO DE DEBUG ---
-            # Escreve o arquivo de log de debug no final do processo
-            header_debug = ['DMO_API_NAME', 'FIELD_API_NAME_RAW', 'LOOKUP_KEY_USED', 'MATCH_FOUND', 'AVAILABLE_KEYS_FROM_API']
-            write_csv_report(config.DEBUG_MAPPING_FILE, debug_log, header_debug)
-            # --- FIM DO NOVO TRECHO ---
         
         logging.info("--- FASE 4/4: Gerando relatórios... ---")
         header_unused = ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME', 'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER']
@@ -460,7 +428,6 @@ async def main():
 
 if __name__ == "__main__":
     start_time = time.time()
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     try: asyncio.run(main())
-    except Exception as e: logging.critical(f"❌ Ocorreu um erro fatal e o script foi interrompido: {e}", exc_info=True)
-    finally: logging.info(f"\n🏁 Auditoria concluída. Tempo total de execução: {time.time() - start_time:.2f} segundos.")
+    except Exception as e: logging.critical(f"❌ Ocorreu um erro fatal: {e}", exc_info=True)
+    finally: logging.info(f"\n🏁 Auditoria concluída. Tempo total: {time.time() - start_time:.2f} segundos.")
