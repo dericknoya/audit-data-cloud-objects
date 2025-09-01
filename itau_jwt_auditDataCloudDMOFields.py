@@ -3,13 +3,16 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 45.2-stable-full-enrichment (Enriquecimento Completo de Mapeamentos)
-- MELHORIA: A lógica de busca por IDs de mapeamento, antes aplicada apenas aos
-  campos não utilizados, agora é aplicada também aos campos utilizados.
-- COMPLETUDE: Ambos os relatórios (.csv) de saída agora contêm as colunas
-  'OBJECT_MAPPING_ID' e 'FIELD_MAPPING_ID'.
-- ESTABILIDADE: Nenhuma alteração na lógica de classificação de uso ou nos
-  métodos de API já validados.
+Versão: 45.1-stable-core-restoration (Restaura Núcleo Estável + Correções)
+- NÚCLEO RESTAURADO: A classe SalesforceClient e seus métodos foram restaurados
+  para a versão original 30.1, garantindo máxima estabilidade e compatibilidade
+  com a Tooling API.
+- CORREÇÕES MANTIDAS: Os ajustes essenciais (versão da API v64.0, remoção de
+  header, tratamento de erro 404) foram reaplicados sobre a base estável.
+- DELETION IDENTIFIER RESTAURADO: A lógica para buscar e incluir o ID técnico
+  dos campos foi reintroduzida corretamente.
+- ANÁLISE PRECISA MANTIDA: A lógica de uso por chave composta (DMO, Campo)
+  permanece, garantindo a eliminação de falsos positivos.
 """
 import os
 import time
@@ -300,38 +303,6 @@ def find_explicit_pairs_in_text(content: str) -> set:
             found_pairs.add((dmo_dev_name, field_name))
     return found_pairs
 
-# --- NOVA FUNÇÃO HELPER PARA ENRIQUECIMENTO ---
-def enrich_results_with_mappings(results_list: list, raw_mapping_by_dmo: dict):
-    """Itera sobre uma lista de resultados e adiciona os IDs de mapeamento."""
-    logging.info(f"Enriquecendo {len(results_list)} registros com dados de mapeamento...")
-    for row in results_list:
-        dmo_api_name = row['DMO_API_NAME']
-        field_api_name = row['FIELD_API_NAME']
-        target_key_to_find = normalize_field_name_for_mapping(field_api_name)
-        
-        found_mappings = []
-        mapping_data = raw_mapping_by_dmo.get(dmo_api_name)
-        
-        if mapping_data and 'objectSourceTargetMaps' in mapping_data:
-            for obj_map in mapping_data['objectSourceTargetMaps']:
-                for field_map in obj_map.get('fieldMappings', []):
-                    api_target_field = field_map.get('targetFieldDeveloperName')
-                    if not api_target_field: continue
-                    
-                    available_key = normalize_field_name_for_mapping(api_target_field)
-                    if target_key_to_find == available_key:
-                        found_mappings.append({
-                            'OBJECT_MAPPING_ID': obj_map.get('developerName', ''),
-                            'FIELD_MAPPING_ID': field_map.get('developerName', '')
-                        })
-
-        if found_mappings:
-            row['OBJECT_MAPPING_ID'] = ", ".join(m['OBJECT_MAPPING_ID'] for m in found_mappings)
-            row['FIELD_MAPPING_ID'] = ", ".join(m['FIELD_MAPPING_ID'] for m in found_mappings)
-        else:
-            row['OBJECT_MAPPING_ID'] = 'Não possuí mapeamento'
-            row['FIELD_MAPPING_ID'] = 'Não possuí mapeamento'
-
 # ==============================================================================
 # --- 🚀 ORQUESTRADOR PRINCIPAL ---
 # ==============================================================================
@@ -343,7 +314,10 @@ async def main():
     auth_data = get_access_token()
     async with SalesforceClient(config, auth_data) as client:
         logging.info("--- FASE 1/4: Coletando metadados e objetos... ---")
+        
+        # Lógica para DELETION_IDENTIFIER restaurada
         tooling_query_fields = "SELECT Id, DeveloperName, MktDataModelObjectId FROM MktDataModelField"
+        
         tasks_to_run = {
             "dmo_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': 'SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject'})}", 'records'),
             "dmo_fields_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': tooling_query_fields})}", 'records'),
@@ -361,7 +335,11 @@ async def main():
         
         logging.info("✅ Coleta inicial de metadados concluída.")
         dmo_creation_info = {rec['DeveloperName']: rec for rec in data['dmo_tooling']}
+        
+        # Lógica para DELETION_IDENTIFIER restaurada
         field_id_map = {f"{rec['MktDataModelObjectId']}.{rec['DeveloperName']}": rec['Id'] for rec in data.get('dmo_fields_tooling', [])}
+        logging.info(f"✅ {len(field_id_map)} IDs técnicos de campos de DMOs foram mapeados.")
+
         dmo_creator_ids = {cr_id for d in dmo_creation_info.values() if (cr_id := d.get('CreatedById'))}
         user_id_to_name_map = await client.fetch_users_by_id(list(dmo_creator_ids))
         
@@ -409,6 +387,8 @@ async def main():
                 is_in_grace_period = False
                 created_date = parse_sf_date(dmo_details.get('CreatedDate'))
                 if created_date and days_since(created_date) <= config.GRACE_PERIOD_DAYS: is_in_grace_period = True
+                
+                # Lógica para DELETION_IDENTIFIER restaurada
                 dmo_id = dmo_details.get('Id')
                 field_name_for_id_lookup = field_api_name.removesuffix('__c')
                 deletion_id = field_id_map.get(f"{dmo_id}.{field_name_for_id_lookup}", 'ID não encontrado') if dmo_id else 'ID do DMO não encontrado'
@@ -421,31 +401,41 @@ async def main():
                 else:
                     unused_results.append({**common_data, 'DELETAR': 'NAO', 'REASON': 'Não utilizado'})
         
-        # --- LÓGICA DE MAPEAMENTO ATUALIZADA PARA AMBAS AS LISTAS ---
-        if unused_results or used_results:
-            logging.info("--- FASE BÔNUS: Buscando Mapeamentos para todos os campos dos relatórios ---")
-            
-            dmos_from_unused = {row['DMO_API_NAME'] for row in unused_results}
-            dmos_from_used = {row['DMO_API_NAME'] for row in used_results}
-            all_dmos_to_query = sorted(list(dmos_from_unused.union(dmos_from_used)))
-
-            mapping_tasks = [client.fetch_dmo_mappings(dmo_name) for dmo_name in all_dmos_to_query]
+        if unused_results:
+            logging.info("--- FASE BÔNUS: Buscando Mapeamentos para campos não utilizados ---")
+            unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_results}))
+            mapping_tasks = [client.fetch_dmo_mappings(dmo_name) for dmo_name in unused_dmos]
             all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando mapeamentos")
             
-            raw_mapping_by_dmo = dict(zip(all_dmos_to_query, all_mapping_data))
-            
-            # Enriquece ambas as listas
-            enrich_results_with_mappings(unused_results, raw_mapping_by_dmo)
-            enrich_results_with_mappings(used_results, raw_mapping_by_dmo)
-            
-            logging.info("✅ IDs de mapeamento adicionados a ambos os relatórios.")
+            raw_mapping_by_dmo = dict(zip(unused_dmos, all_mapping_data))
+            for row in unused_results:
+                dmo_api_name = row['DMO_API_NAME']
+                field_api_name = row['FIELD_API_NAME']
+                target_key_to_find = normalize_field_name_for_mapping(field_api_name)
+                found_mappings = []
+                mapping_data = raw_mapping_by_dmo.get(dmo_api_name)
+                if mapping_data and 'objectSourceTargetMaps' in mapping_data:
+                    for obj_map in mapping_data['objectSourceTargetMaps']:
+                        for field_map in obj_map.get('fieldMappings', []):
+                            api_target_field = field_map.get('targetFieldDeveloperName')
+                            if not api_target_field: continue
+                            available_key = normalize_field_name_for_mapping(api_target_field)
+                            if target_key_to_find == available_key:
+                                found_mappings.append({'OBJECT_MAPPING_ID': obj_map.get('developerName', ''), 'FIELD_MAPPING_ID': field_map.get('developerName', '')})
+                if found_mappings:
+                    row['OBJECT_MAPPING_ID'] = ", ".join(m['OBJECT_MAPPING_ID'] for m in found_mappings)
+                    row['FIELD_MAPPING_ID'] = ", ".join(m['FIELD_MAPPING_ID'] for m in found_mappings)
+                else:
+                    row['OBJECT_MAPPING_ID'] = 'Não possuí mapeamento'
+                    row['FIELD_MAPPING_ID'] = 'Não possuí mapeamento'
+            logging.info("✅ IDs de mapeamento adicionados ao relatório.")
         
         logging.info("--- FASE 4/4: Gerando relatórios... ---")
+        # Headers restaurados para incluir a coluna DELETION_IDENTIFIER
         header_unused = ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME', 'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER']
         write_csv_report(config.UNUSED_FIELDS_CSV, unused_results, header_unused)
         
-        # Header do relatório de utilizados atualizado
-        header_used = ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_COUNT', 'USAGE_TYPES', 'CREATED_BY_NAME', 'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER']
+        header_used = ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_COUNT', 'USAGE_TYPES', 'CREATED_BY_NAME', 'DELETION_IDENTIFIER']
         write_csv_report(config.USED_FIELDS_CSV, used_results, header_used)
 
 if __name__ == "__main__":
