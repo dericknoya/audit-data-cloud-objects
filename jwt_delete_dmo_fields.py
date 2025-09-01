@@ -3,23 +3,21 @@
 Este script realiza a exclusão em massa de campos de DMOs (Data Model Objects)
 baseado em um arquivo CSV de auditoria.
 
-Versão: 2.1 - Correção de leitura de CSV (BOM) e ajuste na variável de proxy.
+Versão: 3.0 - Leitura Direta do ID Técnico para Deleção.
 
 Metodologia:
 - Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
 - Suporta o uso de proxy através da variável de ambiente 'PROXY_URL'.
-- Lê um arquivo CSV (padrão: 'audit_campos_dmo_nao_utilizados.csv') usando a codificação 'utf-8-sig'
-  para evitar problemas com BOM (Byte Order Mark).
+- Lê um arquivo CSV (padrão: 'audit_campos_dmo_nao_utilizados.csv') usando a codificação 'utf-8-sig'.
 - Filtra as linhas onde a coluna 'DELETAR' está marcada como 'SIM'.
 - Para cada campo a ser excluído:
-  - Verifica se existe um mapeamento associado nas colunas 'OBJECT_MAPPING_ID' e 'FIELD_MAPPING_ID'.
-  - Se um mapeamento existir, realiza uma chamada DELETE para removê-lo primeiro.
-  - Se a remoção do mapeamento for bem-sucedida (ou se não houver mapeamento),
-    faz uma consulta SOQL na Tooling API para obter o ID técnico do campo.
-  - Realiza a chamada DELETE para excluir o campo.
+  - Verifica se existe um mapeamento associado e o remove primeiro.
+  - Lê o ID técnico do campo diretamente da coluna 'DELETION_IDENTIFIER' do CSV.
+  - Realiza a chamada DELETE para excluir o campo usando o ID fornecido.
+- A consulta SOQL para buscar o ID do campo foi REMOVIDA, tornando o script mais rápido e eficiente.
 - Pede uma confirmação explícita ao usuário antes de iniciar a exclusão.
-- Realiza todas as chamadas de API (mapeamento e campo) de forma assíncrona.
-- Suporta um modo de simulação ('--dry-run') para verificar a operação sem deletar.
+- Realiza as chamadas de API de forma assíncrona.
+- Suporta um modo de simulação ('--dry-run').
 
 !! ATENÇÃO !!
 !! ESTE SCRIPT É DESTRUTIVO E DELETA METADADOS PERMANENTEMENTE. !!
@@ -49,7 +47,6 @@ def get_access_token():
     sf_audience = os.getenv("SF_AUDIENCE")
     sf_login_url = os.getenv("SF_LOGIN_URL")
 
-    # AJUSTE: Suporte a Proxy via variável de ambiente PROXY_URL
     proxy_url = os.getenv("PROXY_URL")
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
     
@@ -103,19 +100,6 @@ async def delete_field_mapping(session, instance_url, obj_mapping_id, field_mapp
         print(f"❌ Erro de conexão ao remover mapeamento de {field_name_for_log}: {e}")
         return False, f"Erro de conexão: {e}"
 
-async def fetch_tooling_api_query(session, base_url, soql_query):
-    """Busca dados da Tooling API usando uma consulta SOQL."""
-    params = {'q': soql_query}
-    url = f"{base_url}/services/data/v64.0/tooling/query?{urlencode(params)}"
-    try:
-        async with session.get(url) as response:
-            response.raise_for_status()
-            data = await response.json()
-            return data.get('records', [])
-    except aiohttp.ClientError as e:
-        print(f"❌ Erro ao consultar a Tooling API {url}: {e}")
-        return []
-
 async def delete_dmo_field(session, instance_url, field_id, field_name_for_log, dry_run=False):
     """Deleta um único campo de DMO usando seu ID técnico."""
     delete_url = f"{instance_url}/services/data/v64.0/tooling/sobjects/MktDataModelField/{field_id}"
@@ -141,7 +125,7 @@ async def delete_dmo_field(session, instance_url, field_id, field_name_for_log, 
 
 async def process_single_field_deletion(session, instance_url, row_data, dry_run):
     """
-    Processa a exclusão de um único campo, incluindo a remoção do mapeamento, se houver.
+    Processa a exclusão de um único campo, lendo o ID diretamente do CSV.
     Retorna uma tupla (nome_do_campo, sucesso, mensagem).
     """
     field_log_name = f"{row_data['DMO_DISPLAY_NAME']}.{row_data['FIELD_DISPLAY_NAME']}"
@@ -158,20 +142,14 @@ async def process_single_field_deletion(session, instance_url, row_data, dry_run
         if not map_success:
             return field_log_name, False, f"Falha na remoção do mapeamento: {map_reason}"
     
-    # Etapa 2: Obter o ID técnico do campo
-    dmo_api_name = row_data['DMO_API_NAME']
-    field_api_name = row_data['FIELD_API_NAME']
-    
-    soql = f"SELECT Id FROM MktDataModelField WHERE DeveloperName = '{field_api_name}' AND MktDataModelObject.DeveloperName = '{dmo_api_name}'"
-    field_records = await fetch_tooling_api_query(session, instance_url, soql)
-    
-    if not field_records or len(field_records) == 0:
-        msg = "Não foi possível encontrar um ID técnico para o campo. Pode já ter sido deletado."
-        print(f"⚠️  Aviso: {msg} ({field_log_name})")
+    # Etapa 2: Ler o ID técnico diretamente da coluna do CSV
+    field_id = row_data.get('DELETION_IDENTIFIER')
+    if not field_id:
+        msg = "Coluna 'DELETION_IDENTIFIER' está vazia. Não é possível deletar o campo."
+        print(f"❌ Erro: {msg} ({field_log_name})")
         return field_log_name, False, msg
-
-    field_id = field_records[0]['Id']
-    print(f"   - ID técnico encontrado para {field_log_name}: {field_id}")
+    
+    print(f"   - ID técnico lido do arquivo para {field_log_name}: {field_id}")
     
     # Etapa 3: Deletar o campo
     delete_success, delete_reason = await delete_dmo_field(
@@ -184,12 +162,11 @@ async def mass_delete_fields(file_path, dry_run):
     """Orquestra o processo de leitura, confirmação e exclusão de campos."""
     
     try:
-        # AJUSTE: Mudar a codificação para 'utf-8-sig' para lidar com o BOM (Byte Order Mark)
         with open(file_path, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
-            # Validar cabeçalhos necessários
-            required_cols = ['DELETAR', 'DMO_DISPLAY_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 
-                             'DMO_API_NAME', 'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID']
+            # AJUSTE: Adicionar DELETION_IDENTIFIER às colunas obrigatórias
+            required_cols = ['DELETAR', 'DMO_DISPLAY_NAME', 'FIELD_DISPLAY_NAME', 
+                             'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER']
             if not all(col in reader.fieldnames for col in required_cols):
                 missing = [col for col in required_cols if col not in reader.fieldnames]
                 print(f"❌ Erro: O arquivo CSV '{file_path}' não contém as colunas necessárias: {', '.join(missing)}")
@@ -230,7 +207,6 @@ async def mass_delete_fields(file_path, dry_run):
     instance_url = auth_data['instance_url']
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
     
-    # AJUSTE: Configuração de proxy via variável de ambiente PROXY_URL
     proxy_url = os.getenv("PROXY_URL")
     if proxy_url:
         print(f"🌍 Usando proxy para chamadas de API: {proxy_url}")
