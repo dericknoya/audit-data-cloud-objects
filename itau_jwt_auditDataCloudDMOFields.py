@@ -3,15 +3,14 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 30.5-stable-precise-usage (Lógica de uso preciso por DMO+Campo)
-- CORREÇÃO CRÍTICA: A função de leitura do CSV de ativações foi reescrita para
-  ler um par de colunas (DMO e Campo), conforme especificado pelo usuário
-  ('entityname', 'fieldname').
-- PRECISÃO: A função `classify_fields` agora considera o DMO específico ao
-  verificar se um campo está em uso a partir do CSV, eliminando falsos
-  positivos.
-- ROBUSTEZ: Mantida a normalização avançada de nomes de campo para a busca de
-  mapeamentos. Adicionada normalização para o nome da entidade lido do CSV.
+Versão: 30.6-stable-intense-debug (Instrumentação para Debug Completo)
+- DEBUG DE USO: Adiciona a criação de 'debug_usage_classification.csv' para
+  rastrear a decisão de classificação de cada campo individualmente.
+- DEBUG DE MAPEAMENTO: Adiciona a criação de uma pasta 'debug_raw_mappings/' com
+  o JSON bruto da API para cada DMO, e um 'debug_mapping_lookup.csv' para
+  analisar as falhas de correspondência.
+- ESTABILIDADE: A lógica central da v30.5 é mantida, mas agora com visibilidade
+  total para diagnóstico.
 
 """
 import os
@@ -57,21 +56,23 @@ class Config:
     SPECIFIC_FIELDS_TO_EXCLUDE = {'DataSource__c', 'DataSourceObject__c', 'InternalOrganization__c'}
     USED_FIELDS_CSV = 'audit_campos_dmo_utilizados.csv'
     UNUSED_FIELDS_CSV = 'audit_campos_dmo_nao_utilizados.csv'
-    
-    # --- ATENÇÃO: ATUALIZE ESTAS VARIÁVEIS ---
-    # Altere para os nomes exatos das colunas no seu arquivo CSV
     ACTIVATION_FIELDS_CSV = 'ativacoes_campos.csv'
-    ACTIVATION_DMO_COLUMN = 'entityname'      # Coluna com o nome do DMO
-    ACTIVATION_FIELD_COLUMN = 'fieldname'     # Coluna com o nome do Campo
-    # --- FIM DA ATUALIZAÇÃO ---
-
+    ACTIVATION_DMO_COLUMN = 'entityname'
+    ACTIVATION_FIELD_COLUMN = 'fieldname'
     FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
+    
+    # --- NOVAS CONFIGURAÇÕES DE DEBUG ---
+    DEBUG_FOLDER = 'debug_logs'
+    DEBUG_USAGE_CSV = 'debug_usage_classification.csv'
+    DEBUG_MAPPING_CSV = 'debug_mapping_lookup.csv'
+    DEBUG_RAW_MAPPING_FOLDER = 'debug_raw_mappings'
 
 # Configuração do Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ==============================================================================
-# --- 헬 Helpers & Funções Auxiliares ---
+# --- 헬 Helpers & Funções Auxiliares (sem alterações) ---
+# ... (o código das funções auxiliares e da classe SalesforceClient permanece o mesmo) ...
 # ==============================================================================
 def get_access_token():
     logging.info("🔑 Autenticando com o Salesforce via JWT (método robusto)...")
@@ -95,39 +96,27 @@ def get_access_token():
     except requests.exceptions.RequestException as e:
         logging.error(f"❌ Erro na autenticação: {e.response.text if e.response else e}"); raise
 
-# --- FUNÇÃO ATUALIZADA PARA LER PAR (DMO, CAMPO) ---
 def read_used_field_pairs_from_csv(config: Config) -> set:
-    """
-    Lê um arquivo CSV e extrai pares de (DMO, Campo) que são considerados em uso.
-    Retorna um set de tuplas para verificação de uso preciso.
-    """
     used_field_pairs = set()
     file_path = config.ACTIVATION_FIELDS_CSV
-    dmo_col = config.ACTIVATION_DMO_COLUMN
-    field_col = config.ACTIVATION_FIELD_COLUMN
-
+    dmo_col, field_col = config.ACTIVATION_DMO_COLUMN, config.ACTIVATION_FIELD_COLUMN
     try:
         with open(file_path, mode='r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             headers = reader.fieldnames
             if not headers or (dmo_col not in headers or field_col not in headers):
-                 logging.warning(f"⚠️ Arquivo '{file_path}' encontrado, mas as colunas esperadas '{dmo_col}' e/ou '{field_col}' não existem. Pulando análise deste arquivo.")
+                 logging.warning(f"⚠️ Arquivo '{file_path}' encontrado, mas as colunas esperadas '{dmo_col}' e/ou '{field_col}' não existem. Pulando.")
                  return used_field_pairs
-            
             for row in reader:
-                dmo_name = row.get(dmo_col)
-                field_name = row.get(field_col)
-                
+                dmo_name, field_name = row.get(dmo_col), row.get(field_col)
                 if dmo_name and field_name:
-                    # Normaliza o nome do DMO para remover sufixos comuns e garantir a correspondência
                     normalized_dmo = dmo_name.strip().removesuffix('__dlm')
                     used_field_pairs.add((normalized_dmo, field_name.strip()))
-
-        logging.info(f"✅ Arquivo '{file_path}' lido. {len(used_field_pairs)} pares (DMO, Campo) únicos encontrados em uso.")
+        logging.info(f"✅ Arquivo '{file_path}' lido. {len(used_field_pairs)} pares (DMO, Campo) únicos encontrados.")
     except FileNotFoundError:
-        logging.warning(f"⚠️ Arquivo '{file_path}' não encontrado. A auditoria prosseguirá sem esta fonte de dados.")
+        logging.warning(f"⚠️ Arquivo '{file_path}' não encontrado.")
     except Exception as e:
-        logging.error(f"❌ Erro inesperado ao ler o arquivo '{file_path}': {e}")
+        logging.error(f"❌ Erro ao ler '{file_path}': {e}")
     return used_field_pairs
 
 def parse_sf_date(date_str):
@@ -148,9 +137,6 @@ def normalize_field_name_for_mapping(name: str) -> str:
     base_name = re.sub(r'(_[a-zA-Z])?__c$', '', name)
     return base_name.lower()
 
-# ==============================================================================
-# ---  Classe Salesforce API Client (Versão Original Restaurada) ---
-# ==============================================================================
 class SalesforceClient:
     def __init__(self, config, auth_data):
         self.config = config
@@ -266,31 +252,12 @@ def write_csv_report(filename, data, headers):
     except IOError as e:
         logging.error(f"❌ Erro ao escrever o arquivo {filename}: {e}")
         
-# --- FUNÇÃO ATUALIZADA PARA LÓGICA DE USO PRECISO ---
-def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_map, field_id_map, used_field_pairs_from_csv: set):
-    """
-    Classifica os campos em utilizados e não utilizados, agora considerando
-    o par (DMO, Campo) do CSV de ativações para uma análise precisa.
-    """
+def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_map, field_id_map, used_field_pairs_from_csv: set, config: Config):
     logging.info("--- FASE 3/4: Classificando campos... ---")
     used_results, unused_results = [], []
+    usage_debug_log = [] # DEBUG
 
-    # Lógica de período de carência (grace period) permanece a mesma
-    for dmo_dev_name, dmo_info in dmo_creation_info.items():
-        created_date = parse_sf_date(dmo_info.get('CreatedDate'))
-        if created_date and days_since(created_date) <= Config.GRACE_PERIOD_DAYS:
-            full_dmo_name = f"{dmo_dev_name}__dlm"
-            if full_dmo_name in all_dmo_fields:
-                for field_api_name in all_dmo_fields[full_dmo_name]['fields']:
-                    usage_context = {"usage_type": "N/A (DMO Recém-criado)", "object_name": "DMO criado < 90 dias", "object_api_name": full_dmo_name}
-                    if field_api_name not in used_fields_details:
-                        used_fields_details[field_api_name] = []
-                    if not any(u['usage_type'] == usage_context['usage_type'] for u in used_fields_details[field_api_name]):
-                        used_fields_details[field_api_name].append(usage_context)
-
-    # Loop principal de classificação
     for dmo_api_name, data in all_dmo_fields.items():
-        # dmo_api_name aqui é o nome completo (ex: MeuDMO__dlm)
         dmo_dev_name = normalize_api_name(dmo_api_name)
         dmo_details = dmo_creation_info.get(dmo_dev_name, {})
         creator_id = dmo_details.get('CreatedById') or dmo_details.get('createdById')
@@ -300,41 +267,45 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
             if any(field_api_name.startswith(p) for p in Config.FIELD_PREFIXES_TO_EXCLUDE) or field_api_name in Config.SPECIFIC_FIELDS_TO_EXCLUDE:
                 continue
             
-            # --- NOVA LÓGICA DE VERIFICAÇÃO DE USO ---
-            # 1. Verifica uso em Segmentos, CIs, etc. (análise global pelo nome do campo)
+            # --- LÓGICA DE DEBUG E CLASSIFICAÇÃO ---
             usages_from_analysis = used_fields_details.get(field_api_name, [])
-            
-            # 2. Verifica uso no CSV (análise precisa pelo par DMO + Campo)
             is_used_in_csv = (dmo_dev_name, field_api_name) in used_field_pairs_from_csv
+            
+            is_grace_period = False
+            created_date = parse_sf_date(dmo_details.get('CreatedDate'))
+            if created_date and days_since(created_date) <= config.GRACE_PERIOD_DAYS:
+                is_grace_period = True
+
+            final_classification = "UNUSED"
+            if usages_from_analysis or is_used_in_csv or is_grace_period:
+                final_classification = "USED"
+
+            # Log de debug para cada campo
+            usage_debug_log.append({
+                "DMO_API_NAME": dmo_api_name, "FIELD_API_NAME": field_api_name,
+                "IS_USED_IN_ANALYSIS": bool(usages_from_analysis),
+                "IS_USED_IN_CSV": is_used_in_csv,
+                "IS_IN_GRACE_PERIOD": is_grace_period,
+                "FINAL_CLASSIFICATION": final_classification
+            })
 
             dmo_id = dmo_details.get('Id')
             field_name_for_id_lookup = field_api_name.removesuffix('__c')
             deletion_id = field_id_map.get(f"{dmo_id}.{field_name_for_id_lookup}", 'ID não encontrado') if dmo_id else 'ID do DMO não encontrado'
+            common_data = {'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_api_name, 'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': deletion_id}
 
-            common_data = {
-                'DMO_DISPLAY_NAME': data['displayName'], 'DMO_API_NAME': dmo_api_name,
-                'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name,
-                'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': deletion_id
-            }
-
-            if usages_from_analysis or is_used_in_csv:
-                all_usages = usages_from_analysis[:] # Copia os usos existentes
-                if is_used_in_csv:
-                    # Adiciona o contexto de uso do CSV se aplicável
-                    csv_usage_context = {"usage_type": "Ativação (CSV Externo)", "object_name": Config.ACTIVATION_FIELDS_CSV, "object_api_name": dmo_api_name}
-                    all_usages.append(csv_usage_context)
-                
-                used_results.append({
-                    **common_data,
-                    'USAGE_COUNT': len(all_usages),
-                    'USAGE_TYPES': ", ".join(sorted(list(set(u['usage_type'] for u in all_usages))))
-                })
+            if final_classification == "USED":
+                all_usages = usages_from_analysis[:]
+                if is_used_in_csv: all_usages.append({"usage_type": "Ativação (CSV Externo)", "object_name": config.ACTIVATION_FIELDS_CSV, "object_api_name": dmo_api_name})
+                if is_grace_period and not all_usages: all_usages.append({"usage_type": "N/A (DMO Recém-criado)", "object_name": "DMO criado < 90 dias", "object_api_name": dmo_api_name})
+                used_results.append({**common_data, 'USAGE_COUNT': len(all_usages), 'USAGE_TYPES': ", ".join(sorted(list(set(u['usage_type'] for u in all_usages))))})
             else:
-                unused_results.append({
-                    **common_data,
-                    'DELETAR': 'NAO',
-                    'REASON': 'Não utilizado e DMO com mais de 90 dias'
-                })
+                unused_results.append({**common_data, 'DELETAR': 'NAO', 'REASON': 'Não utilizado e DMO com mais de 90 dias'})
+    
+    # Escreve o arquivo de debug de uso
+    debug_usage_path = os.path.join(config.DEBUG_FOLDER, config.DEBUG_USAGE_CSV)
+    write_csv_report(debug_usage_path, usage_debug_log, ["DMO_API_NAME", "FIELD_API_NAME", "IS_USED_IN_ANALYSIS", "IS_USED_IN_CSV", "IS_IN_GRACE_PERIOD", "FINAL_CLASSIFICATION"])
+    
     logging.info(f"📊 Classificação concluída: {len(used_results)} campos utilizados, {len(unused_results)} campos não utilizados.")
     return used_results, unused_results
 
@@ -352,8 +323,15 @@ async def fetch_mappings_with_fallback(client, dmo_name):
 async def main():
     logging.info("🚀 Iniciando auditoria de campos de DMO...")
     config = Config()
+    
+    # --- CRIAÇÃO DAS PASTAS DE DEBUG ---
+    os.makedirs(config.DEBUG_FOLDER, exist_ok=True)
+    raw_mapping_path = os.path.join(config.DEBUG_FOLDER, config.DEBUG_RAW_MAPPING_FOLDER)
+    os.makedirs(raw_mapping_path, exist_ok=True)
+    
     auth_data = get_access_token()
     async with SalesforceClient(config, auth_data) as client:
+        # ... Fases 1 e 2 permanecem iguais
         logging.info("--- FASE 1/4: Coletando metadados e objetos... ---")
         tooling_query_fields = "SELECT Id, DeveloperName, MktDataModelObjectId FROM MktDataModelField"
         tasks_to_run = {
@@ -368,25 +346,18 @@ async def main():
         task_results = await asyncio.gather(*tasks_to_run.values(), return_exceptions=True)
         data = {task_name: res if not isinstance(res, Exception) else [] for task_name, res in zip(tasks_to_run.keys(), task_results)}
         logging.info("✅ Coleta inicial de metadados concluída.")
-        
         dmo_creation_info = {rec['DeveloperName']: rec for rec in data['dmo_tooling']}
         field_id_map = {f"{rec['MktDataModelObjectId']}.{rec['DeveloperName']}": rec['Id'] for rec in data.get('dmo_fields_tooling', [])}
-        logging.info(f"✅ {len(field_id_map)} IDs técnicos de campos de DMOs foram mapeados.")
         segment_ids = [rec['Id'] for rec in data['segments'] if rec.get('Id')]
         dmo_creator_ids = {cr_id for d in dmo_creation_info.values() if (cr_id := d.get('CreatedById') or d.get('createdById'))}
         segments_list, user_id_to_name_map = await asyncio.gather(
             client.fetch_records_in_bulk("MarketSegment", ["Id", "Name", "IncludeCriteria", "ExcludeCriteria"], segment_ids),
             client.fetch_users_by_id(dmo_creator_ids)
         )
-        logging.info(f"✅ Detalhes de {len(segments_list)} segmentos e {len(user_id_to_name_map)} usuários coletados.")
-
+        
         logging.info("--- FASE 2/4: Analisando o uso dos campos... ---")
         used_fields_details = defaultdict(list)
-        
-        # --- LÓGICA DE LEITURA DO CSV ATUALIZADA ---
         used_field_pairs_from_csv = read_used_field_pairs_from_csv(config)
-
-        # A análise de Segmentos, CIs, etc., continua global por simplicidade
         for seg in tqdm(segments_list, desc="Analisando Segmentos"):
             find_fields_in_content(seg.get('IncludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'), used_fields_details)
             find_fields_in_content(seg.get('ExcludeCriteria'), "Segmento", seg.get('Name'), seg.get('Id'), used_fields_details)
@@ -404,43 +375,50 @@ async def main():
                 for field in dmo.get('fields', []):
                     if field_name := field.get('name'): all_dmo_fields[dmo_name]['fields'][field_name] = field.get('displayName', field_name)
 
-        # --- CHAMADA ATUALIZADA PARA A FUNÇÃO DE CLASSIFICAÇÃO ---
-        used_field_results, unused_field_results = classify_fields(
-            all_dmo_fields, used_fields_details, dmo_creation_info, 
-            user_id_to_name_map, field_id_map, used_field_pairs_from_csv
-        )
+        used_field_results, unused_field_results = classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_id_to_name_map, field_id_map, used_field_pairs_from_csv, config)
 
         if unused_field_results:
-            logging.info("--- FASE BÔNUS: Buscando IDs de mapeamento para campos não utilizados ---")
+            logging.info("--- FASE BÔNUS: Buscando e Depurando Mapeamentos ---")
             unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_field_results}))
             mapping_tasks = [fetch_mappings_with_fallback(client, dmo_name) for dmo_name in unused_dmos]
             all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos de DMOs")
 
             mappings_lookup = defaultdict(lambda: defaultdict(list))
-            
+            mapping_debug_log = []
+
             for dmo_name, mapping_data in zip(unused_dmos, all_mapping_data):
+                # DEBUG: Salva o JSON bruto da resposta da API
+                safe_dmo_name = re.sub(r'[^a-zA-Z0-9_-]', '_', dmo_name)
+                json_path = os.path.join(raw_mapping_path, f"{safe_dmo_name}.json")
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(mapping_data, f, indent=4, ensure_ascii=False)
+
                 if not mapping_data or 'objectSourceTargetMaps' not in mapping_data: continue
                 
                 for obj_map in mapping_data['objectSourceTargetMaps']:
                     object_mapping_id = obj_map.get('developerName')
                     if not object_mapping_id: continue
-                    
                     for field_map in obj_map.get('fieldMappings', []):
                         field_mapping_id = field_map.get('developerName')
                         target_field = field_map.get('targetFieldDeveloperName')
-                        
                         if target_field and field_mapping_id:
                             normalized_target_field = normalize_field_name_for_mapping(target_field)
-                            mappings_lookup[dmo_name][normalized_target_field].append({
-                                'OBJECT_MAPPING_ID': object_mapping_id,
-                                'FIELD_MAPPING_ID': field_mapping_id
-                            })
+                            mappings_lookup[dmo_name][normalized_target_field].append({'OBJECT_MAPPING_ID': object_mapping_id, 'FIELD_MAPPING_ID': field_mapping_id})
             
             for row in unused_field_results:
                 field_name_for_lookup = normalize_field_name_for_mapping(row['FIELD_API_NAME'])
                 dmo_name_for_lookup = row['DMO_API_NAME']
                 mapping_infos = mappings_lookup.get(dmo_name_for_lookup, {}).get(field_name_for_lookup, [])
-                
+
+                # DEBUG: Log para o CSV de debug de mapeamento
+                available_keys = mappings_lookup.get(dmo_name_for_lookup, {}).keys()
+                mapping_debug_log.append({
+                    "DMO_API_NAME": dmo_name_for_lookup, "FIELD_API_NAME": row['FIELD_API_NAME'],
+                    "NORMALIZED_LOOKUP_KEY": field_name_for_lookup,
+                    "MATCH_FOUND": bool(mapping_infos),
+                    "AVAILABLE_NORMALIZED_KEYS": ", ".join(available_keys)
+                })
+
                 if mapping_infos:
                     row['OBJECT_MAPPING_ID'] = ", ".join(info['OBJECT_MAPPING_ID'] for info in mapping_infos)
                     row['FIELD_MAPPING_ID'] = ", ".join(info['FIELD_MAPPING_ID'] for info in mapping_infos)
@@ -448,13 +426,13 @@ async def main():
                     row['OBJECT_MAPPING_ID'] = 'Não possuí mapeamento'
                     row['FIELD_MAPPING_ID'] = 'Não possuí mapeamento'
             
-            logging.info("✅ IDs de mapeamento adicionados ao relatório.")
-        
+            # Escreve o arquivo de debug de mapeamento
+            debug_mapping_path = os.path.join(config.DEBUG_FOLDER, config.DEBUG_MAPPING_CSV)
+            write_csv_report(debug_mapping_path, mapping_debug_log, ["DMO_API_NAME", "FIELD_API_NAME", "NORMALIZED_LOOKUP_KEY", "MATCH_FOUND", "AVAILABLE_NORMALIZED_KEYS"])
+
         logging.info("--- FASE 4/4: Gerando relatórios... ---")
-        header_unused = ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME', 'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER']
-        write_csv_report(config.UNUSED_FIELDS_CSV, unused_field_results, header_unused)
-        header_used = ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_COUNT', 'USAGE_TYPES', 'CREATED_BY_NAME', 'DELETION_IDENTIFIER']
-        write_csv_report(config.USED_FIELDS_CSV, used_field_results, header_used)
+        write_csv_report(config.UNUSED_FIELDS_CSV, unused_field_results, ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME', 'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER'])
+        write_csv_report(config.USED_FIELDS_CSV, used_field_results, ['DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'USAGE_COUNT', 'USAGE_TYPES', 'CREATED_BY_NAME', 'DELETION_IDENTIFIER'])
 
 if __name__ == "__main__":
     start_time = time.time()
