@@ -3,12 +3,12 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 36.2-stable-file-logging (Registra a saída detalhada em arquivo de log)
-- LOGGING: A saída do script (logs de info, warning, erro) agora é salva
-  automaticamente em um arquivo 'audit_script_run.log', além de ser exibida
-  no console. Isso facilita a análise post-mortem da execução.
-- LÓGICA MANTIDA: Nenhuma alteração na lógica de análise de uso ou de
-  mapeamentos. Baseado na v36.1.
+Versão: 36.3-stable-header-fix (Corrige Header HTTP para chamadas GET)
+- PARTIDA: Baseado na versão estável 30.1 + correções anteriores.
+- CORREÇÃO CRÍTICA: Removido o header 'Content-Type: application/json' das
+  requisições GET. Este header, embora muitas vezes inofensivo, pode causar
+  respostas vazias em alguns ambientes de rede/proxy, explicando a
+  discrepância de comportamento entre o script e ferramentas como o Insomnia.
 """
 import os
 import time
@@ -57,33 +57,22 @@ class Config:
     ACTIVATION_DMO_COLUMN = 'entityname'
     ACTIVATION_FIELD_COLUMN = 'fieldname'
     MAPPINGS_DUMP_CSV = 'unused_dmos_mappings_dump.csv'
-    FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
-    
-    # --- NOVO ARQUIVO DE LOG ---
     LOG_FILE = 'audit_script_run.log'
+    FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
 
 # ==============================================================================
 # --- 헬 Helpers & Funções Auxiliares ---
 # ==============================================================================
-# --- NOVA FUNÇÃO DE SETUP DE LOGGING ---
 def setup_logging(config: Config):
-    """Configura o logging para salvar em arquivo e exibir no console."""
     logger = logging.getLogger()
-    # Evita adicionar handlers duplicados em execuções repetidas (ex: notebooks)
     if logger.hasHandlers():
         logger.handlers.clear()
-        
     logger.setLevel(logging.INFO)
-    
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    
-    # Handler para o arquivo (sobrescreve a cada execução)
     file_handler = logging.FileHandler(config.LOG_FILE, mode='w', encoding='utf-8')
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-    
-    # Handler para o console
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
@@ -151,6 +140,7 @@ def normalize_field_name_for_mapping(name: str) -> str:
     if not isinstance(name, str): return ""
     base_name = re.sub(r'(_[a-zA-Z])?__c$', '', name)
     return base_name.lower()
+
 # ==============================================================================
 # ---  Classe Salesforce API Client (Versão Original Restaurada) ---
 # ==============================================================================
@@ -161,12 +151,20 @@ class SalesforceClient:
         self.instance_url = auth_data['instance_url']
         self.session = None
         self.semaphore = asyncio.Semaphore(config.SEMAPHORE_LIMIT)
+
     async def __aenter__(self):
-        headers = {'Authorization': f'Bearer {self.access_token}', 'Content-Type': 'application/json', 'Accept': 'application/json'}
+        # --- ALTERAÇÃO CRÍTICA: Removido 'Content-Type' dos headers padrão ---
+        # Este header é desnecessário para requisições GET e pode causar problemas.
+        headers = {
+            'Authorization': f'Bearer {self.access_token}',
+            'Accept': 'application/json'
+        }
         self.session = aiohttp.ClientSession(base_url=self.instance_url, headers=headers, connector=aiohttp.TCPConnector(ssl=self.config.VERIFY_SSL))
         return self
+
     async def __aexit__(self, exc_type, exc, tb):
         if self.session and not self.session.closed: await self.session.close()
+    
     async def fetch_api_data(self, relative_url, key_name=None):
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
@@ -207,9 +205,10 @@ class SalesforceClient:
             for attempt in range(self.config.MAX_RETRIES):
                 try:
                     job_url_path = f"/services/data/{self.config.API_VERSION}/jobs/query"
-                    payload = {"operation": "query", "query": query, "contentType": "CSV"}
+                    payload = {"operation": "query", "query": query}
                     proxy = self.config.PROXY_URL if self.config.USE_PROXY else None
-                    async with self.session.post(job_url_path, data=json.dumps(payload), proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
+                    # Para POST, o aiohttp adiciona o Content-Type: application/json automaticamente
+                    async with self.session.post(job_url_path, json=payload, proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
                         res.raise_for_status()
                         job_info = await res.json()
                         job_id = job_info.get('id')
@@ -248,7 +247,6 @@ class SalesforceClient:
         if not user_ids: return {}
         users = await self.fetch_records_in_bulk('User', ['Id', 'Name'], list(user_ids))
         return {user['Id']: user.get('Name', 'Nome não encontrado') for user in users}
-
 # ==============================================================================
 # --- 📊 FUNÇÕES DE ANÁLISE E PROCESSAMENTO ---
 # ==============================================================================
@@ -324,12 +322,11 @@ def generate_mappings_dump(all_mapping_data_responses, unused_dmos, config: Conf
 # ==============================================================================
 async def main():
     config = Config()
-    setup_logging(config)  # Configura o logging para arquivo e console
+    setup_logging(config)
     
     logging.info("🚀 Iniciando auditoria de campos de DMO...")
     auth_data = get_access_token()
     async with SalesforceClient(config, auth_data) as client:
-        # ... (Restante do código principal inalterado) ...
         logging.info("--- FASE 1/4: Coletando metadados e objetos... ---")
         tooling_query_fields = "SELECT Id, DeveloperName, MktDataModelObjectId FROM MktDataModelField"
         tasks_to_run = { "dmo_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': 'SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject'})}", 'records'), "dmo_fields_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': tooling_query_fields})}", 'records'), "dmo_metadata": client.fetch_api_data(f"/services/data/{config.API_VERSION}/ssot/metadata?entityType=DataModelObject", 'metadata'), "segments": client.execute_query_job("SELECT Id, Name, IncludeCriteria, ExcludeCriteria FROM MarketSegment"), "activations": client.execute_query_job("SELECT QueryPath, Name FROM MktSgmntActvtnAudAttribute"), "calculated_insights": client.fetch_api_data(f"/services/data/{config.API_VERSION}/ssot/metadata?entityType=CalculatedInsight", 'metadata'), }
@@ -383,12 +380,9 @@ async def main():
         if unused_results:
             logging.info("--- FASE BÔNUS: Buscando Mapeamentos e Gerando Dump Controlado ---")
             unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_results}))
-            
             mapping_tasks = [fetch_mappings_with_fallback(client, dmo_name) for dmo_name in unused_dmos]
             all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando mapeamentos")
-            
             generate_mappings_dump(all_mapping_data, unused_dmos, config)
-            
             raw_mapping_by_dmo = dict(zip(unused_dmos, all_mapping_data))
             for row in unused_results:
                 dmo_api_name = row['DMO_API_NAME']
@@ -418,7 +412,6 @@ async def main():
 
 if __name__ == "__main__":
     start_time = time.time()
-    # A configuração do logging agora é a primeira coisa a ser feita
     setup_logging(Config())
     try: asyncio.run(main())
     except Exception as e: logging.critical(f"❌ Ocorreu um erro fatal: {e}", exc_info=True)
