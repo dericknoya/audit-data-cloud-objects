@@ -3,14 +3,14 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 39.0-stable-final-fixes (Correção Final de Mapeamento e API)
-- PARTIDA: Baseado na versão estável 30.1 do usuário + correções consolidadas.
-- CORREÇÃO DE MAPEAMENTO: Removida a lógica de 'fallback' que tentava buscar
-  mapeamentos com o nome normalizado do DMO. A busca agora é feita sempre
-  e apenas com o nome completo (com sufixo __dlm), evitando erros 500.
-- CORREÇÃO DE API: A versão da API foi permanentemente corrigida para 'v64.0'.
-- ROBUSTEZ: Mantido o tratamento de erros 404, que são interpretados como
-  ausência de mapeamento e não interrompem a execução.
+Versão: 39.1-stable-traceability (Adiciona Log de Rastreabilidade de Uso)
+- PARTIDA: Baseado na versão estável 39.0.
+- RASTREABILIDADE: Adicionada a geração de um novo arquivo de debug,
+  'debug_usage_origin.csv'. Este arquivo registra a origem exata de cada
+  detecção de uso (qual Segmento, CI, etc.), permitindo diagnosticar
+  falsos positivos.
+- LÓGICA MANTIDA: A lógica principal de análise e mapeamento permanece
+  inalterada.
 """
 import os
 import time
@@ -40,7 +40,7 @@ class Config:
     USE_PROXY = os.getenv("USE_PROXY", "True").lower() == "true"
     PROXY_URL = os.getenv("PROXY_URL")
     VERIFY_SSL = os.getenv("VERIFY_SSL", "False").lower() == "true"
-    API_VERSION = "v64.0"  # <-- CORREÇÃO APLICADA
+    API_VERSION = "v64.0"
     SF_CLIENT_ID = os.getenv("SF_CLIENT_ID")
     SF_USERNAME = os.getenv("SF_USERNAME")
     SF_AUDIENCE = os.getenv("SF_AUDIENCE")
@@ -61,6 +61,9 @@ class Config:
     MAPPINGS_DUMP_CSV = 'unused_dmos_mappings_dump.csv'
     LOG_FILE = 'audit_script_run.log'
     FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
+    
+    # --- NOVO ARQUIVO DE DEBUG ---
+    USAGE_DEBUG_CSV = 'debug_usage_origin.csv'
 
 # ==============================================================================
 # --- 헬 Helpers & Funções Auxiliares ---
@@ -182,7 +185,7 @@ class SalesforceClient:
                     return all_records
                 except aiohttp.ClientResponseError as e:
                     if e.status == 404:
-                        logging.warning(f"API retornou 404 Not Found para ...{relative_url[-80:]}. Isso é esperado para DMOs sem mapeamento. Continuando...")
+                        logging.warning(f"API retornou 404 Not Found para ...{relative_url[-80:]}. Isso é esperado para alguns DMOs. Continuando...")
                         return None
                     if attempt < self.config.MAX_RETRIES - 1:
                         logging.warning(f"Erro {e.status} ao buscar dados. Tentando novamente...")
@@ -247,6 +250,7 @@ class SalesforceClient:
         if not user_ids: return {}
         users = await self.fetch_records_in_bulk('User', ['Id', 'Name'], list(user_ids))
         return {user['Id']: user.get('Name', 'Nome não encontrado') for user in users}
+
 # ==============================================================================
 # --- 📊 FUNÇÕES DE ANÁLISE E PROCESSAMENTO ---
 # ==============================================================================
@@ -282,6 +286,11 @@ def build_usage_map(data, all_dmo_fields_map, used_field_pairs_from_csv, config)
             for dmo_dev_name in all_dmo_fields_map[field_name]:
                 usage_map[(dmo_dev_name, field_name)].append(context)
     return usage_map
+
+def fetch_mappings_direct(client, dmo_name):
+    """Busca mapeamentos para o DMO especificado, usando sempre o nome completo."""
+    logging.info(f"Buscando mapeamento para: '{dmo_name}'")
+    return client.fetch_dmo_mappings(dmo_name)
 
 def generate_mappings_dump(all_mapping_data_responses, unused_dmos, config: Config):
     dump_rows = []
@@ -340,34 +349,50 @@ async def main():
 
         logging.info("--- FASE 3/4: Classificando campos... ---")
         used_results, unused_results = [], []
+        usage_debug_log = [] # Lista para o novo log de debug
         for dmo_api_name, dmo_data in all_dmo_fields.items():
             dmo_dev_name = normalize_api_name(dmo_api_name)
             dmo_details = dmo_creation_info.get(dmo_dev_name, {})
             creator_name = user_id_to_name_map.get(dmo_details.get('CreatedById') or dmo_details.get('createdById'), 'Desconhecido')
             for field_api_name, field_display_name in dmo_data['fields'].items():
                 if any(field_api_name.startswith(p) for p in config.FIELD_PREFIXES_TO_EXCLUDE) or field_api_name in config.SPECIFIC_FIELDS_TO_EXCLUDE: continue
+                
                 composite_key = (dmo_dev_name, field_api_name)
                 usages = usage_map.get(composite_key, [])
+                
+                # --- LÓGICA DE DEBUG DE USO ---
+                if usages:
+                    for usage_context in usages:
+                        usage_debug_log.append({
+                            "DMO_DEV_NAME": dmo_dev_name,
+                            "FIELD_API_NAME": field_api_name,
+                            "SOURCE_OF_USAGE": usage_context
+                        })
+
                 is_in_grace_period = False
                 created_date = parse_sf_date(dmo_details.get('CreatedDate'))
                 if created_date and days_since(created_date) <= config.GRACE_PERIOD_DAYS: is_in_grace_period = True
+                
                 dmo_id = dmo_details.get('Id')
                 field_name_for_id_lookup = field_api_name.removesuffix('__c')
                 deletion_id = field_id_map.get(f"{dmo_id}.{field_name_for_id_lookup}", 'ID não encontrado') if dmo_id else 'ID do DMO não encontrado'
                 common_data = {'DMO_DISPLAY_NAME': dmo_data['displayName'], 'DMO_API_NAME': dmo_api_name, 'FIELD_DISPLAY_NAME': field_display_name, 'FIELD_API_NAME': field_api_name, 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': deletion_id}
+                
                 if usages or is_in_grace_period:
                     if is_in_grace_period and not usages: usages.append("N/A (DMO Recém-criado): DMO criado < 90 dias")
                     used_results.append({**common_data, 'USAGE_COUNT': len(usages), 'USAGE_TYPES': ", ".join(sorted(list(set(usages))))})
                 else:
                     unused_results.append({**common_data, 'DELETAR': 'NAO', 'REASON': 'Não utilizado e DMO com mais de 90 dias'})
         
+        # Escreve o novo arquivo de debug de uso
+        write_csv_report(config.USAGE_DEBUG_CSV, usage_debug_log, ["DMO_DEV_NAME", "FIELD_API_NAME", "SOURCE_OF_USAGE"])
+        
         if unused_results:
             logging.info("--- FASE BÔNUS: Buscando Mapeamentos e Gerando Dump Controlado ---")
             unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_results}))
             
             # --- CORREÇÃO: Lógica de fallback removida ---
-            # A chamada agora é direta para cada DMO com seu nome completo.
-            mapping_tasks = [client.fetch_dmo_mappings(dmo_name) for dmo_name in unused_dmos]
+            mapping_tasks = [fetch_mappings_direct(client, dmo_name) for dmo_name in unused_dmos]
             all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando mapeamentos")
             
             generate_mappings_dump(all_mapping_data, unused_dmos, config)
