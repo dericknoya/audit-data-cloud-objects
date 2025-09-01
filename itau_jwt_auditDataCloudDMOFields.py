@@ -3,14 +3,16 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 45.0-stable-final-complete (Restaura ID Técnico para Exclusão)
-- FUNCIONALIDADE RESTAURADA: Reintroduzida a lógica para buscar o ID técnico de
-  cada campo (MktDataModelField.Id) e adicioná-lo à coluna 'DELETION_IDENTIFIER'
-  nos relatórios finais.
-- PRECISÃO MANTIDA: A lógica de análise de uso por chave composta (DMO, Campo)
-  está mantida.
-- ROBUSTEZ: Todas as correções anteriores (versão de API, headers, tratamento
-  de erros 404, etc.) estão presentes. Esta é a versão completa.
+Versão: 45.1-stable-core-restoration (Restaura Núcleo Estável + Correções)
+- NÚCLEO RESTAURADO: A classe SalesforceClient e seus métodos foram restaurados
+  para a versão original 30.1, garantindo máxima estabilidade e compatibilidade
+  com a Tooling API.
+- CORREÇÕES MANTIDAS: Os ajustes essenciais (versão da API v64.0, remoção de
+  header, tratamento de erro 404) foram reaplicados sobre a base estável.
+- DELETION IDENTIFIER RESTAURADO: A lógica para buscar e incluir o ID técnico
+  dos campos foi reintroduzida corretamente.
+- ANÁLISE PRECISA MANTIDA: A lógica de uso por chave composta (DMO, Campo)
+  permanece, garantindo a eliminação de falsos positivos.
 """
 import os
 import time
@@ -60,6 +62,7 @@ class Config:
     ACTIVATION_FIELD_COLUMN = 'fieldname'
     LOG_FILE = 'audit_script_run.log'
     DMO_FIELD_PATTERN = re.compile(r'([\w]+__dlm)\.([\w]+__c)')
+    FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
 
 # ==============================================================================
 # --- 헬 Helpers & Funções Auxiliares ---
@@ -143,7 +146,7 @@ def normalize_field_name_for_mapping(name: str) -> str:
     return base_name.lower()
 
 # ==============================================================================
-# ---  Classe Salesforce API Client ---
+# ---  Classe Salesforce API Client (Núcleo da v30.1 Restaurado com Ajustes) ---
 # ==============================================================================
 class SalesforceClient:
     def __init__(self, config, auth_data):
@@ -164,6 +167,7 @@ class SalesforceClient:
             for attempt in range(self.config.MAX_RETRIES):
                 try:
                     all_records, current_url = [], relative_url
+                    is_tooling_api = "/tooling" in current_url
                     while current_url:
                         kwargs = {'ssl': self.config.VERIFY_SSL}
                         if self.config.USE_PROXY: kwargs['proxy'] = self.config.PROXY_URL
@@ -172,13 +176,11 @@ class SalesforceClient:
                             data = await response.json()
                             if key_name:
                                 all_records.extend(data.get(key_name, []))
-                                next_page = data.get('nextRecordsUrl')
+                                next_page, query_locator = data.get('nextRecordsUrl'), data.get('queryLocator')
                                 if next_page:
-                                    # Corrige a URL para chamadas de Tooling API paginadas
-                                    if "/tooling/query/" in next_page:
-                                        current_url = next_page
-                                    else:
-                                        current_url = urljoin(str(self.session._base_url), next_page)
+                                    current_url = urljoin(str(self.session._base_url), next_page)
+                                elif is_tooling_api and query_locator and not data.get('done', True):
+                                    current_url = f"/services/data/{self.config.API_VERSION}/tooling/query/{query_locator}"
                                 else:
                                     current_url = None
                             else: return data
@@ -204,18 +206,55 @@ class SalesforceClient:
         url = f"{endpoint}?{urlencode(params)}"
         return await self.fetch_api_data(url)
 
+    async def execute_query_job(self, query):
+        async with self.semaphore:
+            for attempt in range(self.config.MAX_RETRIES):
+                try:
+                    job_url_path = f"/services/data/{self.config.API_VERSION}/jobs/query"
+                    payload = {"operation": "query", "query": query, "contentType": "CSV"}
+                    proxy = self.config.PROXY_URL if self.config.USE_PROXY else None
+                    async with self.session.post(job_url_path, json=payload, proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
+                        res.raise_for_status()
+                        job_info = await res.json()
+                        job_id = job_info.get('id')
+                        if not job_id: logging.error(f"❌ JobId não retornado para query: {query[:100]}..."); return []
+                    job_status_path = f"{job_url_path}/{job_id}"
+                    while True:
+                        await asyncio.sleep(5)
+                        async with self.session.get(job_status_path, proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
+                            res.raise_for_status(); status_info = await res.json()
+                            if status_info['state'] == 'JobComplete': break
+                            if status_info['state'] in ['Failed', 'Aborted']:
+                                logging.error(f"❌ Job {job_id} falhou: {status_info.get('errorMessage')}"); return []
+                    results_path = f"{job_status_path}/results"
+                    async with self.session.get(results_path, headers={'Accept-Encoding': 'gzip'}, proxy=proxy, ssl=self.config.VERIFY_SSL) as res:
+                        res.raise_for_status()
+                        content = await res.read()
+                        csv_text = (gzip.decompress(content) if res.headers.get('Content-Encoding') == 'gzip' else content).decode('utf-8')
+                        lines = csv_text.strip().splitlines()
+                        return list(csv.DictReader(lines)) if len(lines) > 1 else []
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    if attempt < self.config.MAX_RETRIES - 1:
+                        await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
+                    else:
+                        logging.error(f"❌ Todas as {self.config.MAX_RETRIES} tentativas para o job de query '{query[:50]}...' falharam."); raise e
+    
+    async def fetch_records_in_bulk(self, object_name, fields, record_ids):
+        if not record_ids: return []
+        tasks = []
+        field_str = ", ".join(fields)
+        for i in range(0, len(record_ids), self.config.BULK_CHUNK_SIZE):
+            chunk = record_ids[i:i + self.config.BULK_CHUNK_SIZE]
+            formatted_ids = "','".join(chunk)
+            query = f"SELECT {field_str} FROM {object_name} WHERE Id IN ('{formatted_ids}')"
+            tasks.append(self.execute_query_job(query))
+        results = await tqdm.gather(*tasks, desc=f"Buscando detalhes de {object_name}")
+        return [record for record_list in results if record_list for record in record_list]
+
     async def fetch_users_by_id(self, user_ids):
         if not user_ids: return {}
-        # Implementação simples para evitar dependência do Bulk API
-        tasks = [self.fetch_api_data(f"/services/data/{self.config.API_VERSION}/sobjects/User/{uid}?fields=Name") for uid in user_ids]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        user_map = {}
-        for uid, result in zip(user_ids, results):
-            if isinstance(result, Exception):
-                user_map[uid] = "Nome não encontrado (erro)"
-            else:
-                user_map[uid] = result.get("Name", "Nome não encontrado")
-        return user_map
+        users = await self.fetch_records_in_bulk('User', ['Id', 'Name'], list(user_ids))
+        return {user['Id']: user.get('Name', 'Nome não encontrado') for user in users}
 
 # ==============================================================================
 # --- 📊 FUNÇÕES DE ANÁLISE E PROCESSAMENTO ---
@@ -276,7 +315,7 @@ async def main():
     async with SalesforceClient(config, auth_data) as client:
         logging.info("--- FASE 1/4: Coletando metadados e objetos... ---")
         
-        # --- LÓGICA RESTAURADA: Query para buscar IDs técnicos dos campos ---
+        # Lógica para DELETION_IDENTIFIER restaurada
         tooling_query_fields = "SELECT Id, DeveloperName, MktDataModelObjectId FROM MktDataModelField"
         
         tasks_to_run = {
@@ -284,16 +323,20 @@ async def main():
             "dmo_fields_tooling": client.fetch_api_data(f"/services/data/{config.API_VERSION}/tooling/query?{urlencode({'q': tooling_query_fields})}", 'records'),
             "dmo_metadata": client.fetch_api_data(f"/services/data/{config.API_VERSION}/ssot/metadata?entityType=DataModelObject", 'metadata'),
             "calculated_insights": client.fetch_api_data(f"/services/data/{config.API_VERSION}/ssot/metadata?entityType=CalculatedInsight", 'records'),
-            "segments": client.fetch_api_data(f"/services/data/{config.API_VERSION}/query?{urlencode({'q': 'SELECT Name, IncludeCriteria, ExcludeCriteria FROM MarketSegment'})}", 'records'),
+            "segment_ids": client.execute_query_job("SELECT Id FROM MarketSegment"),
             "activations": client.fetch_api_data(f"/services/data/{config.API_VERSION}/query?{urlencode({'q': 'SELECT Name, QueryPath FROM MktSgmntActvtnAudAttribute'})}", 'records'),
         }
         task_results = await asyncio.gather(*tasks_to_run.values(), return_exceptions=True)
         data = {task_name: res if not isinstance(res, Exception) else [] for task_name, res in zip(tasks_to_run.keys(), task_results)}
         
+        segment_ids = [rec['Id'] for rec in data.get('segment_ids', [])]
+        segments_list = await client.fetch_records_in_bulk("MarketSegment", ["Name", "IncludeCriteria", "ExcludeCriteria"], segment_ids)
+        data['segments'] = segments_list
+        
         logging.info("✅ Coleta inicial de metadados concluída.")
         dmo_creation_info = {rec['DeveloperName']: rec for rec in data['dmo_tooling']}
         
-        # --- LÓGICA RESTAURADA: Criação do mapa de IDs técnicos ---
+        # Lógica para DELETION_IDENTIFIER restaurada
         field_id_map = {f"{rec['MktDataModelObjectId']}.{rec['DeveloperName']}": rec['Id'] for rec in data.get('dmo_fields_tooling', [])}
         logging.info(f"✅ {len(field_id_map)} IDs técnicos de campos de DMOs foram mapeados.")
 
@@ -341,12 +384,11 @@ async def main():
                 
                 composite_key = (dmo_dev_name, field_api_name)
                 usages = usage_map.get(composite_key, [])
-                
                 is_in_grace_period = False
                 created_date = parse_sf_date(dmo_details.get('CreatedDate'))
                 if created_date and days_since(created_date) <= config.GRACE_PERIOD_DAYS: is_in_grace_period = True
                 
-                # --- LÓGICA RESTAURADA: Busca do ID técnico ---
+                # Lógica para DELETION_IDENTIFIER restaurada
                 dmo_id = dmo_details.get('Id')
                 field_name_for_id_lookup = field_api_name.removesuffix('__c')
                 deletion_id = field_id_map.get(f"{dmo_id}.{field_name_for_id_lookup}", 'ID não encontrado') if dmo_id else 'ID do DMO não encontrado'
@@ -389,7 +431,7 @@ async def main():
             logging.info("✅ IDs de mapeamento adicionados ao relatório.")
         
         logging.info("--- FASE 4/4: Gerando relatórios... ---")
-        # --- LÓGICA RESTAURADA: Coluna 'DELETION_IDENTIFIER' de volta nos headers ---
+        # Headers restaurados para incluir a coluna DELETION_IDENTIFIER
         header_unused = ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME', 'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER']
         write_csv_report(config.UNUSED_FIELDS_CSV, unused_results, header_unused)
         
