@@ -3,13 +3,12 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 29.8-debug-final (Correção final da API de Mapeamento com log em arquivo)
-- CORREÇÃO FINAL API MAPEAMENTO: Removida a normalização do nome do DMO na
-  chamada à API 'fetch_dmo_mappings'. A API espera o nome completo com o
-  sufixo '__dlm', conforme validado pelos logs de depuração.
-- MELHORIA DE DEBUG: Os logs de depuração agora são salvos no arquivo
-  'debug_mappings.log' para facilitar a análise, em vez de serem impressos
-  no console.
+Versão: 30.1-stable-queries (Restauração da lógica de query e correção de mapeamento)
+- ESTABILIDADE: A classe SalesforceClient e seus métodos de execução de query
+  foram restaurados para a versão original e funcional para corrigir os erros
+  '400 Bad Request' que surgiram em versões anteriores.
+- CORREÇÃO MAPEAMENTO: Mantida a lógica de fallback na busca de mapeamentos,
+  que primeiro tenta o nome completo do DMO (__dlm) e depois o nome normalizado.
 
 """
 import os
@@ -58,7 +57,6 @@ class Config:
     ACTIVATION_FIELDS_CSV = 'ativacoes_campos.csv'
     ACTIVATION_FIELDS_CSV_COLUMN = 'Fieldname' 
     FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
-    DEBUG_LOG_FILE = 'debug_mappings.log'
 
 # Configuração do Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -66,28 +64,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ==============================================================================
 # --- 헬 Helpers & Funções Auxiliares ---
 # ==============================================================================
-def setup_debug_logger():
-    """Configura um logger separado para salvar os logs de depuração em um arquivo."""
-    debug_logger = logging.getLogger('debug_logger')
-    debug_logger.setLevel(logging.DEBUG)
-    # Evita que os logs de debug apareçam no console principal
-    debug_logger.propagate = False
-    
-    # Remove handlers antigos para evitar duplicação de logs
-    if debug_logger.hasHandlers():
-        debug_logger.handlers.clear()
-
-    # Cria o handler do arquivo
-    file_handler = logging.FileHandler(Config.DEBUG_LOG_FILE, mode='w', encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    
-    # Cria o formato do log
-    formatter = logging.Formatter('%(asctime)s - %(message)s')
-    file_handler.setFormatter(formatter)
-    
-    debug_logger.addHandler(file_handler)
-    return debug_logger
-
 def get_access_token():
     logging.info("🔑 Autenticando com o Salesforce via JWT (método robusto)...")
     config = Config()
@@ -144,7 +120,7 @@ def normalize_api_name(name):
     return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
 
 # ==============================================================================
-# ---  Classe Salesforce API Client ---
+# ---  Classe Salesforce API Client (Versão Original Restaurada) ---
 # ==============================================================================
 class SalesforceClient:
     def __init__(self, config, auth_data):
@@ -309,13 +285,25 @@ def classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user
     logging.info(f"📊 Classificação concluída: {len(used_results)} campos utilizados, {len(unused_results)} campos não utilizados.")
     return used_results, unused_results
 
+async def fetch_mappings_with_fallback(client, dmo_name):
+    """Tenta buscar mapeamentos com o nome completo e, se falhar, com o nome normalizado."""
+    # Tentativa 1: Usar o nome completo (ex: MeuDMO__dlm)
+    mappings = await client.fetch_dmo_mappings(dmo_name)
+    
+    # Se a primeira tentativa não retornar mapeamentos, tenta a segunda
+    if not mappings or not mappings.get('objectSourceTargetMaps'):
+        normalized_name = normalize_api_name(dmo_name)
+        # Apenas tenta a segunda vez se o nome for diferente
+        if normalized_name != dmo_name:
+            mappings = await client.fetch_dmo_mappings(normalized_name)
+    return mappings
+
 # ==============================================================================
 # --- 🚀 ORQUESTRADOR PRINCIPAL ---
 # ==============================================================================
 async def main():
     logging.info("🚀 Iniciando auditoria de campos de DMO...")
     config = Config()
-    debug_logger = setup_debug_logger()
     auth_data = get_access_token()
     async with SalesforceClient(config, auth_data) as client:
         logging.info("--- FASE 1/4: Coletando metadados e objetos... ---")
@@ -390,22 +378,16 @@ async def main():
 
         used_field_results, unused_field_results = classify_fields(all_dmo_fields, used_fields_details, dmo_creation_info, user_id_to_name_map, field_id_map)
 
-        # ==============================================================================
-        # --- INÍCIO DA SEÇÃO DE MAPEAMENTO CORRIGIDA ---
-        # ==============================================================================
         if unused_field_results:
             logging.info("--- FASE BÔNUS: Buscando IDs de mapeamento para campos não utilizados ---")
             
             unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_field_results}))
             
-            # <<< CORREÇÃO FINAL >>>: A API de mapeamento espera o nome completo do DMO com o sufixo __dlm.
-            # Não vamos mais normalizar o nome aqui.
-            mapping_tasks = [client.fetch_dmo_mappings(dmo_name) for dmo_name in unused_dmos]
-            
+            # Chama a nova função com lógica de fallback para cada DMO
+            mapping_tasks = [fetch_mappings_with_fallback(client, dmo_name) for dmo_name in unused_dmos]
             all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos de DMOs")
 
             mappings_lookup = defaultdict(lambda: defaultdict(list))
-            debug_logger.debug("--- DEBUG: CONSTRUINDO DICIONÁRIO DE MAPEAMENTOS ---")
             
             for dmo_name, mapping_data in zip(unused_dmos, all_mapping_data):
                 if not mapping_data or 'objectSourceTargetMaps' not in mapping_data:
@@ -422,40 +404,15 @@ async def main():
                         
                         if target_field and field_mapping_id:
                             normalized_target_field = target_field.removesuffix('__c')
-                            
-                            debug_logger.debug(f"[DEBUG-BUILD] Chave: '{dmo_name}.{normalized_target_field}' -> Adicionando mapeamento.")
-                            
                             mappings_lookup[dmo_name][normalized_target_field].append({
                                 'OBJECT_MAPPING_ID': object_mapping_id,
                                 'FIELD_MAPPING_ID': field_mapping_id
                             })
-            
-            debug_logger.debug("\n--- DEBUG: DICIONÁRIO CONSTRUÍDO ---")
-            if not mappings_lookup:
-                debug_logger.debug("[DEBUG-RESULT] O dicionário 'mappings_lookup' está VAZIO.")
-            else:
-                debug_logger.debug(f"[DEBUG-RESULT] O dicionário 'mappings_lookup' contém {len(mappings_lookup)} DMOs mapeados.")
-                sample_keys = list(mappings_lookup.keys())[:5]
-                debug_logger.debug(f"[DEBUG-RESULT] Amostra de chaves de DMOs no dicionário: {sample_keys}")
-            
-            debug_logger.debug("\n--- DEBUG: BUSCANDO MAPEAMENTOS PARA CAMPOS NÃO UTILIZADOS ---")
-            
-            debug_count = 0
+
             for row in unused_field_results:
                 field_name_for_lookup = row['FIELD_API_NAME'].removesuffix('__c')
-                
-                if debug_count < 20: 
-                    debug_logger.debug(f"\n[DEBUG-SEARCH] Tentando buscar com a chave: '{row['DMO_API_NAME']}.{field_name_for_lookup}'")
-                
                 mapping_infos = mappings_lookup.get(row['DMO_API_NAME'], {}).get(field_name_for_lookup, [])
                 
-                if debug_count < 20:
-                    if mapping_infos:
-                        debug_logger.debug(f"[DEBUG-FOUND] SUCESSO! Encontrado(s) {len(mapping_infos)} mapeamento(s).")
-                    else:
-                        debug_logger.debug(f"[DEBUG-NOT-FOUND] FALHA! Nenhum mapeamento encontrado para esta chave.")
-                    debug_count += 1
-
                 if mapping_infos:
                     row['OBJECT_MAPPING_ID'] = ", ".join(info['OBJECT_MAPPING_ID'] for info in mapping_infos)
                     row['FIELD_MAPPING_ID'] = ", ".join(info['FIELD_MAPPING_ID'] for info in mapping_infos)
@@ -464,9 +421,6 @@ async def main():
                     row['FIELD_MAPPING_ID'] = 'Não possuí mapeamento'
             
             logging.info("✅ IDs de mapeamento adicionados ao relatório.")
-        # ==============================================================================
-        # --- FIM DA SEÇÃO DE MAPEAMENTO ---
-        # ==============================================================================
         
         logging.info("--- FASE 4/4: Gerando relatórios... ---")
         header_unused = ['DELETAR', 'DMO_DISPLAY_NAME', 'DMO_API_NAME', 'FIELD_DISPLAY_NAME', 'FIELD_API_NAME', 'REASON', 'CREATED_BY_NAME', 'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER']
