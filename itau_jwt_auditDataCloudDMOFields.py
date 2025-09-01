@@ -3,10 +3,13 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 34.1-stable-hotfix (Lógica de Mapeamento Direcionado Restaurada)
-- LÓGICA RESTAURADA: Esta versão utiliza a lógica de análise por chave composta
-  (DMO+Campo) e busca os mapeamentos APENAS para os DMOs que contêm campos
-  classificados como não utilizados, conforme o requisito original.
+Versão: 36.0-stable-composite-key (Análise baseada em Chave Composta DMO+Campo)
+- PARTIDA: Baseado na versão estável 30.1 do usuário.
+- LÓGICA CENTRAL CORRIGIDA: A análise de uso foi refatorada para operar com
+  uma chave composta (DMO, Campo), resolvendo os falsos positivos de uso.
+- DUMP CONTROLADO: Adicionada a geração de um arquivo de dump de mapeamentos
+  ('unused_dmos_mappings_dump.csv') que opera APENAS sobre os DMOs
+  classificados como não utilizados.
 """
 import os
 import time
@@ -51,9 +54,14 @@ class Config:
     SPECIFIC_FIELDS_TO_EXCLUDE = {'DataSource__c', 'DataSourceObject__c', 'InternalOrganization__c'}
     USED_FIELDS_CSV = 'audit_campos_dmo_utilizados.csv'
     UNUSED_FIELDS_CSV = 'audit_campos_dmo_nao_utilizados.csv'
+    # --- AJUSTADO PARA LER AMBAS AS COLUNAS ---
     ACTIVATION_FIELDS_CSV = 'ativacoes_campos.csv'
     ACTIVATION_DMO_COLUMN = 'entityname'
     ACTIVATION_FIELD_COLUMN = 'fieldname'
+    
+    # --- NOVO ARQUIVO DE DUMP CONTROLADO ---
+    MAPPINGS_DUMP_CSV = 'unused_dmos_mappings_dump.csv'
+    
     FIELD_NAME_PATTERN = re.compile(r'["\'](?:fieldApiName|fieldName|attributeName|developerName)["\']\s*:\s*["\']([^"\']+)["\']')
 
 # Configuração do Logging
@@ -63,7 +71,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- 헬 Helpers & Funções Auxiliares ---
 # ==============================================================================
 def get_access_token():
-    logging.info("🔑 Autenticando com o Salesforce via JWT...")
+    logging.info("🔑 Autenticando com o Salesforce via JWT (método robusto)...")
     config = Config()
     if not all([config.SF_CLIENT_ID, config.SF_USERNAME, config.SF_AUDIENCE, config.SF_LOGIN_URL]):
         raise ValueError("Variáveis de ambiente de autenticação faltando no .env.")
@@ -84,6 +92,7 @@ def get_access_token():
     except requests.exceptions.RequestException as e:
         logging.error(f"❌ Erro na autenticação: {e.response.text if e.response else e}"); raise
 
+# --- FUNÇÃO ATUALIZADA PARA LER PAR (DMO, CAMPO) ---
 def read_used_field_pairs_from_csv(config: Config) -> set:
     used_field_pairs = set()
     file_path = config.ACTIVATION_FIELDS_CSV
@@ -93,7 +102,7 @@ def read_used_field_pairs_from_csv(config: Config) -> set:
             reader = csv.DictReader(f)
             headers = reader.fieldnames
             if not headers or (dmo_col not in headers or field_col not in headers):
-                 logging.warning(f"⚠️ Arquivo '{file_path}' encontrado, mas as colunas esperadas '{dmo_col}' e/ou '{field_col}' não existem. Pulando.")
+                 logging.warning(f"⚠️ Arquivo '{file_path}' encontrado, mas as colunas '{dmo_col}' e/ou '{field_col}' não existem. Pulando.")
                  return used_field_pairs
             for row in reader:
                 dmo_name, field_name = row.get(dmo_col), row.get(field_col)
@@ -124,7 +133,9 @@ def normalize_field_name_for_mapping(name: str) -> str:
     if not isinstance(name, str): return ""
     base_name = re.sub(r'(_[a-zA-Z])?__c$', '', name)
     return base_name.lower()
-
+# ==============================================================================
+# ---  Classe Salesforce API Client (Versão Original Restaurada) ---
+# ==============================================================================
 class SalesforceClient:
     def __init__(self, config, auth_data):
         self.config = config
@@ -216,7 +227,6 @@ class SalesforceClient:
         if not user_ids: return {}
         users = await self.fetch_records_in_bulk('User', ['Id', 'Name'], list(user_ids))
         return {user['Id']: user.get('Name', 'Nome não encontrado') for user in users}
-
 # ==============================================================================
 # --- 📊 FUNÇÕES DE ANÁLISE E PROCESSAMENTO ---
 # ==============================================================================
@@ -237,9 +247,11 @@ def build_usage_map(data, all_dmo_fields_map, used_field_pairs_from_csv):
     """Constrói um mapa de uso preciso com a chave (DMO, Campo)."""
     usage_map = defaultdict(list)
 
+    # 1. Adiciona usos do CSV (fonte mais precisa)
     for dmo_dev_name, field_api_name in used_field_pairs_from_csv:
         usage_map[(dmo_dev_name, field_api_name)].append(f"Ativação (CSV Externo): {Config.ACTIVATION_FIELDS_CSV}")
 
+    # 2. Extrai todos os nomes de campo mencionados em CIs, Segmentos, etc.
     mentioned_fields = set()
     sources = [
         (data['segments'], "Segmento", lambda s: f"{s.get('IncludeCriteria', '')} {s.get('ExcludeCriteria', '')}", lambda s: s.get('Name')),
@@ -252,8 +264,10 @@ def build_usage_map(data, all_dmo_fields_map, used_field_pairs_from_csv):
             if not content: continue
             for match in Config.FIELD_NAME_PATTERN.finditer(html.unescape(str(content))):
                 field_name = match.group(1)
-                mentioned_fields.add((field_name, f"{usage_type}: {name_extractor(item)}"))
+                item_name = name_extractor(item) or "Nome Indisponível"
+                mentioned_fields.add((field_name, f"{usage_type}: {item_name}"))
 
+    # 3. Cruza os campos mencionados com o mapa de todos os DMOs para criar a chave composta
     for field_name, context in mentioned_fields:
         if field_name in all_dmo_fields_map:
             for dmo_dev_name in all_dmo_fields_map[field_name]:
@@ -268,6 +282,36 @@ async def fetch_mappings_with_fallback(client, dmo_name):
         if normalized_name != dmo_name:
             mappings = await client.fetch_dmo_mappings(normalized_name)
     return mappings
+
+# --- NOVA FUNÇÃO PARA GERAR O DUMP CONTROLADO DE MAPEAMENTOS ---
+async def generate_mappings_dump(client: SalesforceClient, unused_dmos: list, config: Config):
+    if not unused_dmos:
+        logging.info("Nenhum DMO não utilizado encontrado para gerar o dump de mapeamentos.")
+        return
+        
+    logging.info(f"Buscando mapeamentos para {len(unused_dmos)} DMOs não utilizados para o dump...")
+    tasks = [fetch_mappings_with_fallback(client, name) for name in unused_dmos]
+    all_mapping_data = await tqdm.gather(*tasks, desc="Coletando mapeamentos para dump")
+
+    dump_rows = []
+    for mapping_data in all_mapping_data:
+        if not mapping_data or 'objectSourceTargetMaps' not in mapping_data:
+            continue
+        
+        for obj_map in mapping_data.get('objectSourceTargetMaps', []):
+            dmo_name = obj_map.get('targetEntityDeveloperName')
+            dlo_name = obj_map.get('sourceEntityDeveloperName')
+            dmo_mapping_id = obj_map.get('developerName')
+
+            field_mappings = obj_map.get('fieldMappings', [])
+            if not field_mappings:
+                dump_rows.append({'DMO_NAME': dmo_name, 'DLO_NAME': dlo_name, 'DMO_MAPPING_ID': dmo_mapping_id, 'FIELD_MAPPING_ID': 'N/A'})
+            else:
+                for field_map in field_mappings:
+                    dump_rows.append({'DMO_NAME': dmo_name, 'DLO_NAME': dlo_name, 'DMO_MAPPING_ID': dmo_mapping_id, 'FIELD_MAPPING_ID': field_map.get('developerName')})
+    
+    headers = ['DMO_NAME', 'DLO_NAME', 'DMO_MAPPING_ID', 'FIELD_MAPPING_ID']
+    write_csv_report(config.MAPPINGS_DUMP_CSV, dump_rows, headers)
 
 # ==============================================================================
 # --- 🚀 ORQUESTRADOR PRINCIPAL ---
@@ -289,7 +333,6 @@ async def main():
         user_id_to_name_map = await client.fetch_users_by_id(dmo_creator_ids)
         
         logging.info("--- FASE 2/4: Construindo mapa de uso preciso (DMO+Campo)... ---")
-        
         all_dmo_fields_map = defaultdict(list)
         all_dmo_fields = defaultdict(lambda: {'fields': {}, 'displayName': ''})
         for dmo in data['dmo_metadata']:
@@ -318,7 +361,6 @@ async def main():
                 
                 composite_key = (dmo_dev_name, field_api_name)
                 usages = usage_map.get(composite_key, [])
-                
                 is_in_grace_period = False
                 created_date = parse_sf_date(dmo_details.get('CreatedDate'))
                 if created_date and days_since(created_date) <= config.GRACE_PERIOD_DAYS:
@@ -337,10 +379,15 @@ async def main():
                     unused_results.append({**common_data, 'DELETAR': 'NAO', 'REASON': 'Não utilizado e DMO com mais de 90 dias'})
         
         if unused_results:
-            logging.info("--- FASE BÔNUS: Buscando Mapeamentos para campos não utilizados ---")
+            logging.info("--- FASE BÔNUS: Buscando Mapeamentos e Gerando Dump Controlado ---")
             unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_results}))
+            
+            # 1. Gera o dump controlado apenas para os DMOs não utilizados
+            await generate_mappings_dump(client, unused_dmos, config)
+
+            # 2. Continua com a lógica para enriquecer o relatório principal
             mapping_tasks = [fetch_mappings_with_fallback(client, dmo_name) for dmo_name in unused_dmos]
-            all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos de DMOs")
+            all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando mapeamentos para relatório")
             raw_mapping_by_dmo = dict(zip(unused_dmos, all_mapping_data))
 
             for row in unused_results:
