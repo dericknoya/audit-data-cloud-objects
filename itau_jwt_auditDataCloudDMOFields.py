@@ -3,15 +3,14 @@
 Este script audita uma instância do Salesforce Data Cloud para identificar 
 campos de DMOs (Data Model Objects) utilizados e não utilizados.
 
-Versão: 38.0-stable-robust-handling (Tratamento de Erro 404 e Uso Preciso)
-- PARTIDA: Baseado na versão estável 30.1 do usuário.
-- ROBUSTEZ: Aprimorado o tratamento de erros na chamada da API de mapeamentos.
-  Agora, erros '404 Not Found' são tratados como uma resposta esperada (indicando
-  ausência de mapeamento) e não interrompem mais o script.
-- PRECISÃO: Mantida a lógica de análise de uso por chave composta (DMO, Campo)
-  para eliminar falsos positivos.
-- DUMP CONTROLADO: Mantida a geração do dump de mapeamentos apenas para DMOs
-  não utilizados.
+Versão: 39.0-stable-final-fixes (Correção Final de Mapeamento e API)
+- PARTIDA: Baseado na versão estável 30.1 do usuário + correções consolidadas.
+- CORREÇÃO DE MAPEAMENTO: Removida a lógica de 'fallback' que tentava buscar
+  mapeamentos com o nome normalizado do DMO. A busca agora é feita sempre
+  e apenas com o nome completo (com sufixo __dlm), evitando erros 500.
+- CORREÇÃO DE API: A versão da API foi permanentemente corrigida para 'v64.0'.
+- ROBUSTEZ: Mantido o tratamento de erros 404, que são interpretados como
+  ausência de mapeamento e não interrompem a execução.
 """
 import os
 import time
@@ -41,7 +40,7 @@ class Config:
     USE_PROXY = os.getenv("USE_PROXY", "True").lower() == "true"
     PROXY_URL = os.getenv("PROXY_URL")
     VERIFY_SSL = os.getenv("VERIFY_SSL", "False").lower() == "true"
-    API_VERSION = "v60.0"
+    API_VERSION = "v64.0"  # <-- CORREÇÃO APLICADA
     SF_CLIENT_ID = os.getenv("SF_CLIENT_ID")
     SF_USERNAME = os.getenv("SF_USERNAME")
     SF_AUDIENCE = os.getenv("SF_AUDIENCE")
@@ -67,7 +66,6 @@ class Config:
 # --- 헬 Helpers & Funções Auxiliares ---
 # ==============================================================================
 def setup_logging(config: Config):
-    """Configura o logging para salvar em arquivo e exibir no console."""
     logger = logging.getLogger()
     if logger.hasHandlers():
         logger.handlers.clear()
@@ -162,7 +160,6 @@ class SalesforceClient:
     async def __aexit__(self, exc_type, exc, tb):
         if self.session and not self.session.closed: await self.session.close()
     
-    # --- LÓGICA DE TRATAMENTO DE ERRO 404 APRIMORADA ---
     async def fetch_api_data(self, relative_url, key_name=None):
         async with self.semaphore:
             for attempt in range(self.config.MAX_RETRIES):
@@ -186,7 +183,7 @@ class SalesforceClient:
                 except aiohttp.ClientResponseError as e:
                     if e.status == 404:
                         logging.warning(f"API retornou 404 Not Found para ...{relative_url[-80:]}. Isso é esperado para DMOs sem mapeamento. Continuando...")
-                        return None # Retorna None para ser tratado como "sem dados"
+                        return None
                     if attempt < self.config.MAX_RETRIES - 1:
                         logging.warning(f"Erro {e.status} ao buscar dados. Tentando novamente...")
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
@@ -250,7 +247,6 @@ class SalesforceClient:
         if not user_ids: return {}
         users = await self.fetch_records_in_bulk('User', ['Id', 'Name'], list(user_ids))
         return {user['Id']: user.get('Name', 'Nome não encontrado') for user in users}
-
 # ==============================================================================
 # --- 📊 FUNÇÕES DE ANÁLISE E PROCESSAMENTO ---
 # ==============================================================================
@@ -286,16 +282,6 @@ def build_usage_map(data, all_dmo_fields_map, used_field_pairs_from_csv, config)
             for dmo_dev_name in all_dmo_fields_map[field_name]:
                 usage_map[(dmo_dev_name, field_name)].append(context)
     return usage_map
-
-async def fetch_mappings_with_fallback(client, dmo_name):
-    logging.info(f"Tentando buscar mapeamento para: '{dmo_name}' (nome completo)")
-    mappings = await client.fetch_dmo_mappings(dmo_name)
-    if not mappings or not mappings.get('objectSourceTargetMaps'):
-        normalized_name = normalize_api_name(dmo_name)
-        if normalized_name != dmo_name:
-            logging.warning(f"Busca inicial para '{dmo_name}' falhou. Tentando com nome normalizado: '{normalized_name}'")
-            mappings = await client.fetch_dmo_mappings(normalized_name)
-    return mappings
 
 def generate_mappings_dump(all_mapping_data_responses, unused_dmos, config: Config):
     dump_rows = []
@@ -379,7 +365,9 @@ async def main():
             logging.info("--- FASE BÔNUS: Buscando Mapeamentos e Gerando Dump Controlado ---")
             unused_dmos = sorted(list({row['DMO_API_NAME'] for row in unused_results}))
             
-            mapping_tasks = [fetch_mappings_with_fallback(client, dmo_name) for dmo_name in unused_dmos]
+            # --- CORREÇÃO: Lógica de fallback removida ---
+            # A chamada agora é direta para cada DMO com seu nome completo.
+            mapping_tasks = [client.fetch_dmo_mappings(dmo_name) for dmo_name in unused_dmos]
             all_mapping_data = await tqdm.gather(*mapping_tasks, desc="Buscando mapeamentos")
             
             generate_mappings_dump(all_mapping_data, unused_dmos, config)
