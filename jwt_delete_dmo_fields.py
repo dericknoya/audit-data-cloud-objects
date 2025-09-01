@@ -3,20 +3,20 @@
 Este script realiza a exclusão em massa de campos de DMOs (Data Model Objects)
 baseado em um arquivo CSV de auditoria.
 
-Versão: 3.0 - Leitura Direta do ID Técnico para Deleção.
+Versão: 3.1 - Adiciona verificação pós-exclusão para erros 500.
 
 Metodologia:
 - Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
 - Suporta o uso de proxy através da variável de ambiente 'PROXY_URL'.
-- Lê um arquivo CSV (padrão: 'audit_campos_dmo_nao_utilizados.csv') usando a codificação 'utf-8-sig'.
-- Filtra as linhas onde a coluna 'DELETAR' está marcada como 'SIM'.
+- Lê um arquivo CSV e o ID técnico de deleção da coluna 'DELETION_IDENTIFIER'.
 - Para cada campo a ser excluído:
-  - Verifica se existe um mapeamento associado e o remove primeiro.
-  - Lê o ID técnico do campo diretamente da coluna 'DELETION_IDENTIFIER' do CSV.
-  - Realiza a chamada DELETE para excluir o campo usando o ID fornecido.
-- A consulta SOQL para buscar o ID do campo foi REMOVIDA, tornando o script mais rápido e eficiente.
+  - Remove o mapeamento associado, se houver.
+  - Tenta deletar o campo usando seu ID técnico.
+  - MELHORIA: Se a API retornar um erro 500 (Internal Server Error), o script
+    faz uma pausa e executa uma consulta de verificação para confirmar se o campo
+    foi realmente deletado. Se a verificação mostrar que o campo não existe mais,
+    a operação é marcada como SUCESSO.
 - Pede uma confirmação explícita ao usuário antes de iniciar a exclusão.
-- Realiza as chamadas de API de forma assíncrona.
 - Suporta um modo de simulação ('--dry-run').
 
 !! ATENÇÃO !!
@@ -100,8 +100,25 @@ async def delete_field_mapping(session, instance_url, obj_mapping_id, field_mapp
         print(f"❌ Erro de conexão ao remover mapeamento de {field_name_for_log}: {e}")
         return False, f"Erro de conexão: {e}"
 
+# NOVA FUNÇÃO DE VERIFICAÇÃO
+async def verify_field_deletion(session, instance_url, field_id):
+    """Verifica se um campo ainda existe consultando seu ID via Tooling API."""
+    soql_query = f"SELECT Id FROM MktDataModelField WHERE Id = '{field_id}'"
+    params = {'q': soql_query}
+    url = f"{instance_url}/services/data/v64.0/tooling/query?{urlencode(params)}"
+    try:
+        async with session.get(url) as response:
+            response.raise_for_status()
+            data = await response.json()
+            # Se a lista de 'records' estiver vazia, o campo foi deletado com sucesso.
+            return not data.get('records')
+    except aiohttp.ClientError as e:
+        print(f"❌ Erro durante a verificação da exclusão: {e}")
+        # Por segurança, se a verificação falhar, assumimos que a exclusão falhou.
+        return False
+
 async def delete_dmo_field(session, instance_url, field_id, field_name_for_log, dry_run=False):
-    """Deleta um único campo de DMO usando seu ID técnico."""
+    """Deleta um único campo de DMO, com lógica de verificação para erro 500."""
     delete_url = f"{instance_url}/services/data/v64.0/tooling/sobjects/MktDataModelField/{field_id}"
     
     if dry_run:
@@ -110,18 +127,36 @@ async def delete_dmo_field(session, instance_url, field_id, field_name_for_log, 
 
     try:
         async with session.delete(delete_url) as response:
+            # Captura o texto do erro no início para usar depois, se necessário
+            error_text = await response.text()
+
             if response.status == 204: # 204 No Content é o sucesso para DELETE
                 print(f"✅ Campo deletado com sucesso: {field_name_for_log}")
                 return True, "Deletado com Sucesso"
-            else:
-                error_text = await response.text()
+            
+            # LÓGICA DE VERIFICAÇÃO PARA ERRO 500
+            elif response.status == 500:
+                print(f"⚠️  Recebido erro 500 para o campo '{field_name_for_log}'. Tentando verificar o status da exclusão...")
+                await asyncio.sleep(3) # Pausa estratégica para dar tempo à plataforma
+                
+                is_truly_deleted = await verify_field_deletion(session, instance_url, field_id)
+                
+                if is_truly_deleted:
+                    print(f"✅ Verificação confirmou que o campo '{field_name_for_log}' foi deletado com sucesso.")
+                    return True, "Deletado com Sucesso (Após verificação do erro 500)"
+                else:
+                    print(f"❌ Verificação mostrou que o campo '{field_name_for_log}' ainda existe. A exclusão falhou.")
+                    return False, f"Erro 500 e verificação confirmou falha: {error_text}"
+            
+            else: # Trata outros erros (400, 403, 404, etc.)
                 print(f"❌ Falha ao deletar o campo {field_name_for_log}: {response.status} - {error_text}")
                 return False, f"Erro {response.status}: {error_text}"
+                
     except aiohttp.ClientError as e:
         print(f"❌ Erro de conexão ao deletar o campo {field_name_for_log}: {e}")
         return False, f"Erro de conexão: {e}"
 
-# --- Lógica de Orquestração ---
+# --- Lógica de Orquestração --- (sem alterações daqui para baixo)
 
 async def process_single_field_deletion(session, instance_url, row_data, dry_run):
     """
@@ -144,14 +179,14 @@ async def process_single_field_deletion(session, instance_url, row_data, dry_run
     
     # Etapa 2: Ler o ID técnico diretamente da coluna do CSV
     field_id = row_data.get('DELETION_IDENTIFIER')
-    if not field_id:
-        msg = "Coluna 'DELETION_IDENTIFIER' está vazia. Não é possível deletar o campo."
+    if not field_id or len(field_id) < 15: # Validação básica do ID
+        msg = f"Coluna 'DELETION_IDENTIFIER' está vazia ou contém um ID inválido ('{field_id}')."
         print(f"❌ Erro: {msg} ({field_log_name})")
         return field_log_name, False, msg
     
     print(f"   - ID técnico lido do arquivo para {field_log_name}: {field_id}")
     
-    # Etapa 3: Deletar o campo
+    # Etapa 3: Deletar o campo (agora com a lógica de verificação embutida)
     delete_success, delete_reason = await delete_dmo_field(
         session, instance_url, field_id, field_log_name, dry_run
     )
@@ -164,7 +199,6 @@ async def mass_delete_fields(file_path, dry_run):
     try:
         with open(file_path, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
-            # AJUSTE: Adicionar DELETION_IDENTIFIER às colunas obrigatórias
             required_cols = ['DELETAR', 'DMO_DISPLAY_NAME', 'FIELD_DISPLAY_NAME', 
                              'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER']
             if not all(col in reader.fieldnames for col in required_cols):
