@@ -1,16 +1,15 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.59 (Versão Final Estável)
+Versão: 10.60 (Versão Final Estável)
 - BASE ESTÁVEL: Script construído a partir da v10.37.
-- NOVO (Auditoria da Busca): Implementado um sistema de relatório detalhado
-  para a busca de mapeamentos. O script agora categoriza cada chamada de API
-  como 'Sucesso', 'Sem Mapeamento (404/500)' ou 'Falha' e gera um resumo no
-  log.
-- NOVO (Arquivos de Debug Detalhados): O script agora gera múltiplos arquivos
-  de depuração ('debug_dmos_com_mapeamento', 'debug_dmos_sem_mapeamento', etc.)
-  para permitir uma auditoria completa e transparente do processo de busca,
-  validando o comportamento de erros 404/500.
+- CORREÇÃO (Paginação): A função 'fetch_api_data' foi aprimorada para
+  reconhecer e iterar sobre o parâmetro 'nextPageUrl', utilizado por
+  endpoints da API SSOT como '/ssot/data-streams'. Isso garante que TODOS os
+  data streams (e outros objetos paginados) sejam coletados, em vez de
+  apenas a primeira página, resolvendo a subcontagem de objetos.
+- OTIMIZAÇÃO E DEBUG: Mantidas as otimizações e lógicas de depuração das
+  versões anteriores.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -76,6 +75,7 @@ def get_access_token():
     except requests.exceptions.RequestException as e:
         logging.error(f"❌ Salesforce authentication error: {e.response.text if e.response else e}"); raise
 
+# --- CORREÇÃO DE PAGINAÇÃO ---
 async def fetch_api_data(session, relative_url, semaphore, key_name=None):
     async with semaphore:
         for attempt in range(MAX_RETRIES):
@@ -94,17 +94,22 @@ async def fetch_api_data(session, relative_url, semaphore, key_name=None):
                         
                         if key_name:
                             all_records.extend(data.get(key_name, []))
-                            next_page_url = data.get('nextRecordsUrl')
+                            # Lógica de paginação aprimorada para incluir nextPageUrl
+                            next_page_url_v1 = data.get('nextRecordsUrl')
+                            next_page_url_v2 = data.get('nextPageUrl')
                             query_locator = data.get('queryLocator')
 
-                            if next_page_url:
-                                current_url = urljoin(str(session._base_url), next_page_url)
+                            next_page_path = next_page_url_v1 or next_page_url_v2
+
+                            if next_page_path:
+                                current_url = urljoin(str(session._base_url), next_page_path)
                             elif is_tooling_api and query_locator and not data.get('done', True):
                                 version = API_VERSION
                                 current_url = f"/services/data/{version}/tooling/query/{query_locator}"
                             else:
                                 current_url = None
                         else: 
+                            # Se não houver key_name, retorna o payload inteiro e não pagina
                             return data
                 return all_records
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -114,6 +119,7 @@ async def fetch_api_data(session, relative_url, semaphore, key_name=None):
                 else:
                     logging.error(f"❌ Todas as {MAX_RETRIES} tentativas falharam para {relative_url[:50]}...: {e}")
                     raise e
+# --- FIM DA CORREÇÃO ---
 
 async def fetch_dmo_mapping_data(session, semaphore, dmo_name, dataspace):
     """Função dedicada para buscar mapeamentos, que retorna um status e o dado."""
@@ -132,7 +138,6 @@ async def fetch_dmo_mapping_data(session, semaphore, dmo_name, dataspace):
                 if data.get("objectSourceTargetMaps"):
                     return {'status': 'success', 'dmo': dmo_name, 'data': data}
                 else:
-                    # Resposta 200 OK mas sem a chave, também é um caso de "sem mapeamento"
                     return {'status': 'no_mapping', 'dmo': dmo_name, 'data': None}
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -349,14 +354,14 @@ async def main():
         
         logging.info("--- Etapa 5: Coletando todos os mapeamentos DLO -> DMO ---")
         
+        active_dataspace = "default"
+        
         dmo_names_to_query = [
             dmo.get('name') for dmo in dm_objects
             if dmo.get('name') and dmo.get('category') != 'Segment Membership' and
             not any(dmo.get('name').lower().startswith(p) for p in dmo_prefixes_to_exclude)
         ]
         logging.info(f"Filtrando DMOs para busca de mapeamento. De {len(dm_objects)} DMOs totais, {len(dmo_names_to_query)} serão consultados.")
-        
-        active_dataspace = "default"
         
         tasks = []
         for dmo_name in dmo_names_to_query:
@@ -367,7 +372,6 @@ async def main():
         
         dlos_mapped_to_dmos = set()
         
-        # --- LÓGICA DE AUDITORIA DA BUSCA ---
         dmos_com_sucesso = []
         dmos_sem_mapeamento = []
         dmos_com_falha = []
@@ -392,7 +396,6 @@ async def main():
         logging.info(f"- DMOs sem mapeamento (API retornou 404/500): {len(dmos_sem_mapeamento)}")
         logging.info(f"- DMOs com falha de conexão/timeout: {len(dmos_com_falha)}")
         logging.info(f"- Total de DLOs únicos mapeados encontrados: {len(dlos_mapped_to_dmos)}")
-        # --- FIM DA LÓGICA DE AUDITORIA ---
 
         dmos_used_by_segments = {normalize_api_name(s.get('SegmentMembershipTable')) for s in segments if s.get('SegmentMembershipTable')}
         dmos_used_by_data_graphs = {normalize_api_name(obj.get('developerName')) for dg in data_graphs for obj in [dg.get('dgObject', {})] + dg.get('dgObject', {}).get('relatedObjects', []) if obj.get('developerName')}
@@ -422,7 +425,6 @@ async def main():
 
         logging.info("Auditando Segmentos...")
         for seg in tqdm(segments, desc="Auditando Segmentos"):
-            # ... (O restante do código permanece o mesmo)
             seg_id = str(get_segment_id(seg) or '')[:15];
             if not seg_id: continue
             last_pub_date = segment_publications.get(seg_id)
@@ -566,18 +568,19 @@ async def main():
                 writer.writerows(audit_results)
             logging.info(f"✅ Auditoria concluída. CSV gerado: {csv_file}")
             
-            # --- GERAÇÃO DE ARQUIVOS DE DEBUG DETALHADOS ---
             logging.info("--- Gerando arquivos de depuração para análise de mapeamento ---")
             
-            with open('debug_dmos_com_mapeamento.csv', 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=['DMO_Name'])
-                writer.writeheader()
-                writer.writerows(dmos_com_sucesso)
+            if dmos_com_sucesso:
+                with open('debug_dmos_com_mapeamento.csv', 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=['DMO_Name'])
+                    writer.writeheader()
+                    writer.writerows(dmos_com_sucesso)
             
-            with open('debug_dmos_sem_mapeamento_404_500.csv', 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=['DMO_Name'])
-                writer.writeheader()
-                writer.writerows(dmos_sem_mapeamento)
+            if dmos_sem_mapeamento:
+                with open('debug_dmos_sem_mapeamento_404_500.csv', 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=['DMO_Name'])
+                    writer.writeheader()
+                    writer.writerows(dmos_sem_mapeamento)
 
             if dmos_com_falha:
                 with open('debug_dmos_com_falha.csv', 'w', newline='', encoding='utf-8') as f:
@@ -590,7 +593,7 @@ async def main():
                 writer = csv.DictWriter(f, fieldnames=['DATASTREAM_NAME', 'DLO_NAME'])
                 writer.writeheader()
                 writer.writerows(ds_dlo_list)
-
+            
             logging.info("✅ Arquivos de depuração de mapeamento gerados.")
             
             counts = {'DMO': 0, 'DATA_STREAM': 0, 'CALCULATED_INSIGHT': 0, 'SEGMENT': 0, 'ACTIVATION': 0}
