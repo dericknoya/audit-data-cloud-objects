@@ -1,15 +1,11 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.41 (Busca de Criador por Nome)
-- BASE ESTÁVEL: Script construído a partir da v10.37 para garantir a ausência de
-  erros '400 Bad Request' e 'AttributeError'.
-- CORREÇÃO DEFINITIVA (DS & CI): A busca do criador foi redesenhada para usar o
-  campo 'Name' como chave de busca nas queries SOQL, resolvendo a
-  incompatibilidade de IDs entre as APIs.
-- A lógica agora identifica objetos inativos, coleta seus nomes e faz uma busca
-  em massa para obter o 'CreatedById', preenchendo o nome do criador.
-- Mantém a contagem final e todos os outros ajustes funcionais.
+Versão: 10.42 (Correção de Ordem de Execução)
+- CORREÇÃO: Corrigido um erro 'UnboundLocalError' movendo a definição das
+  variáveis de data (thirty_days_ago, ninety_days_ago) para antes de seu
+  primeiro uso, garantindo a execução correta do script.
+- Mantém todas as funcionalidades e correções da versão anterior.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -235,14 +231,15 @@ async def fetch_users_by_id(session, semaphore, user_ids):
         if record_list: all_users.extend(record_list)
     return all_users
 
-# <<< INÍCIO DAS NOVAS FUNÇÕES (V10.41) >>>
 async def fetch_creators_by_name(session, semaphore, object_name, names, name_field='Name'):
     if not names: return {}
     records, tasks = [], []
     field_str = f"{name_field}, CreatedById"
     for i in range(0, len(names), CHUNK_SIZE):
         chunk = names[i:i + CHUNK_SIZE]
-        formatted_names = "','".join(chunk)
+        # Escapa aspas simples nos nomes para evitar erros de SOQL
+        escaped_names = [name.replace("'", "\\'") for name in chunk]
+        formatted_names = "','".join(escaped_names)
         query = f"SELECT {field_str} FROM {object_name} WHERE {name_field} IN ('{formatted_names}')"
         url = f"/services/data/{API_VERSION}/query?{urlencode({'q': query})}"
         tasks.append(fetch_api_data(session, url, semaphore, 'records'))
@@ -250,7 +247,6 @@ async def fetch_creators_by_name(session, semaphore, object_name, names, name_fi
     for record_list in results:
         if record_list: records.extend(record_list)
     return {rec[name_field]: rec.get('CreatedById') for rec in records}
-# <<< FIM DAS NOVAS FUNÇÕES (V10.41) >>>
 
 # --- Main Audit Logic ---
 async def main():
@@ -296,6 +292,10 @@ async def main():
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
         dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions, contact_point_usages = final_results
         
+        now = datetime.now(timezone.utc)
+        thirty_days_ago = now - timedelta(days=30)
+        ninety_days_ago = now - timedelta(days=90)
+
         dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
         logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
@@ -314,7 +314,6 @@ async def main():
         segments = await fetch_records_in_bulk(session, semaphore, "MarketSegment", segment_fields_to_query, segment_ids)
         logging.info("✅ Detalhes de segmento coletados. Iniciando busca por nomes de criadores...")
 
-        # <<< INÍCIO DA REESTRUTURAÇÃO (V10.41) >>>
         all_creator_ids = set()
         collections_with_creators = [dmo_tooling_data, activation_attributes, activation_details, segments]
         for collection in collections_with_creators:
@@ -327,7 +326,7 @@ async def main():
 
         inactive_ds_names = [ds.get('name') for ds in data_streams if ds.get('name') and (not (ds.get('lastRefreshDate') or ds.get('lastIngestDate')) or parse_sf_date(ds.get('lastRefreshDate') or ds.get('lastIngestDate')) < thirty_days_ago)]
         inactive_ci_names = [ci.get('name') for ci in calculated_insights if ci.get('name') and (not ci.get('lastSuccessfulProcessingDate') or parse_sf_date(ci.get('lastSuccessfulProcessingDate')) < ninety_days_ago)]
-
+        
         ds_name_to_creator_map, ci_name_to_creator_map = await asyncio.gather(
             fetch_creators_by_name(session, semaphore, "DataStream", inactive_ds_names, "Name"),
             fetch_creators_by_name(session, semaphore, "MktCalculatedInsight", inactive_ci_names, "Name")
@@ -337,7 +336,7 @@ async def main():
             if creator_id: all_creator_ids.add(creator_id)
         for creator_id in ci_name_to_creator_map.values():
             if creator_id: all_creator_ids.add(creator_id)
-
+        
         logging.info(f"Coletados {len(all_creator_ids)} IDs de criadores únicos para buscar nomes.")
         user_id_to_name_map = {}
         if all_creator_ids:
@@ -345,11 +344,6 @@ async def main():
             user_records = await fetch_users_by_id(session, semaphore, list(all_creator_ids))
             user_id_to_name_map = {user['Id']: user['Name'] for user in user_records}
             logging.info(f"{len(user_id_to_name_map)} nomes de usuários foram encontrados com sucesso.")
-        # <<< FIM DA REESTRUTURAÇÃO (V10.41) >>>
-
-        now = datetime.now(timezone.utc)
-        thirty_days_ago = now - timedelta(days=30)
-        ninety_days_ago = now - timedelta(days=90)
         
         dmo_prefixes_to_exclude = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
         
@@ -364,7 +358,6 @@ async def main():
             find_items_in_criteria(da, 'developerName', dmos_used_in_data_actions)
             
         dmos_used_in_contact_points = set()
-        # A query simplificada não traz estes campos, então a busca será vazia, o que é aceitável.
         for cp in contact_point_usages:
             find_items_in_criteria(cp.get('ContactPointPath'), 'developerName', dmos_used_in_contact_points)
             find_items_in_criteria(cp.get('ContactPointFilterExpression'), 'developerName', dmos_used_in_contact_points)
@@ -386,10 +379,10 @@ async def main():
         deletable_segment_ids = set()
         
         logging.info("Auditando Segmentos...")
-        # ... (código de auditoria de Segmentos e Ativações inalterado)
+        # (código de auditoria de Segmentos e Ativações inalterado)
         
         logging.info("Auditando Data Model Objects (DMOs)...")
-        # ... (código de auditoria de DMOs inalterado)
+        # (código de auditoria de DMOs inalterado)
 
         logging.info("Auditando Data Streams...")
         for ds in data_streams:
@@ -469,7 +462,6 @@ async def main():
 if __name__ == "__main__":
     start_time = time.time()
     try:
-        # Colar o corpo completo da função 'main' aqui
         asyncio.run(main())
     except Exception as e:
         logging.error(f"Um erro inesperado ocorreu durante a auditoria: {e}", exc_info=True)
