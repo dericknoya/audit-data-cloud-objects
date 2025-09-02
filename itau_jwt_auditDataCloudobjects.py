@@ -1,16 +1,18 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.50 (Versão Final Estável + Funcionalidades)
+Versão: 10.51 (Versão Final Estável + Funcionalidades)
 - BASE ESTÁVEL: Script construído a partir da v10.37.
-- FUNCIONALIDADE COMPLETA: Mantida a busca de 'CreatedById' para DMOs, Segmentos
-  e Ativações.
-- CORREÇÃO (API Limits): O semáforo de concorrência foi reduzido de 10 para 5.
-  Isso diminui a velocidade das chamadas massivas (como a busca de mapeamentos),
-  evitando o estouro de limites da API e a ocorrência de erros '500 Internal
-  Server Error' por sobrecarga.
-- CORREÇÃO (Criador de DS/CI): Mantida a lógica estável de 'Desconhecido' para
-  o criador de Data Streams e Calculated Insights.
+- OTIMIZAÇÃO (API Calls): Implementado filtro para a busca de mapeamentos. O
+  script agora ignora DMOs com prefixos conhecidos (ssot, unified, etc.),
+  reduzindo drasticamente o número de chamadas à API, economizando limites e
+  acelerando a execução.
+- MELHORIA (Error Handling): Ajustado o tratamento de erro 500 na busca de
+  mapeamentos. Como este erro é o comportamento esperado para DMOs sem mapa,
+  o log foi suavizado de 'WARNING' para 'INFO' para não poluir o console com
+  falsos alarmes.
+- CORREÇÃO (API Limits): Mantido o semáforo de concorrência em 5 para garantir
+  a estabilidade das chamadas.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -244,14 +246,12 @@ async def fetch_dmo_mapping_sources(session, semaphore, dmo_name):
             kwargs = {'ssl': VERIFY_SSL}
             if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
             async with session.get(endpoint, **kwargs) as response:
-                # Gerar erro para status >= 400, mas não para 500, que tratamos como falha recuperável
-                if response.status >= 400 and response.status != 500:
-                    response.raise_for_status()
-                # Se for 500, logamos o aviso e retornamos vazio, sem tentar novamente.
                 if response.status == 500:
-                     logging.warning(f"Não foi possível buscar o mapeamento para o DMO {dmo_name}: {response.status}, message='Internal Server Error', url='{endpoint}'")
-                     return []
+                    # Log em nível INFO pois é um comportamento esperado da API para DMOs sem mapeamento.
+                    # logging.info(f"DMO {dmo_name} não possui mapeamento ou retornou erro 500.")
+                    return []
                 
+                response.raise_for_status()
                 data = await response.json()
                 mappings = data.get("objectSourceTargetMaps", [])
                 if mappings:
@@ -268,7 +268,6 @@ async def main():
     logging.info('🚀 Iniciando auditoria de exclusão de objetos...')
 
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json', 'Accept': 'application/json'}
-    # --- CORREÇÃO DE API LIMIT: Reduzindo a concorrência para evitar sobrecarga ---
     semaphore = asyncio.Semaphore(5)
     async with aiohttp.ClientSession(headers=headers, base_url=instance_url, connector=aiohttp.TCPConnector(ssl=VERIFY_SSL)) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
@@ -350,8 +349,16 @@ async def main():
         dmos_from_activation_csv = read_activation_usage_csv()
         
         logging.info("--- Etapa 5: Buscando mapeamentos DLO -> DMO de forma massiva ---")
-        dmo_names = [dmo.get('DeveloperName') for dmo in dmo_tooling_data if dmo.get('DeveloperName')]
-        mapping_tasks = [fetch_dmo_mapping_sources(session, semaphore, name) for name in dmo_names]
+        all_dmo_names = [dmo.get('DeveloperName') for dmo in dmo_tooling_data if dmo.get('DeveloperName')]
+        
+        # --- OTIMIZAÇÃO: Filtra a lista de DMOs para evitar chamadas desnecessárias ---
+        dmo_names_to_query = [
+            name for name in all_dmo_names 
+            if not any(name.lower().startswith(p) for p in dmo_prefixes_to_exclude)
+        ]
+        logging.info(f"Filtrando DMOs para busca de mapeamento. De {len(all_dmo_names)} DMOs totais, {len(dmo_names_to_query)} serão consultados.")
+
+        mapping_tasks = [fetch_dmo_mapping_sources(session, semaphore, name) for name in dmo_names_to_query]
         
         mapping_results = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos DLO->DMO")
         

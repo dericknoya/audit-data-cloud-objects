@@ -1,15 +1,16 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.27 (Versão Estável Consolidada)
-- BASE ESTÁVEL: Script baseado na versão que não causa erros '400 Bad Request'.
-- DMOs: Lógica de busca de criador e formatação de colunas está correta. Filtro
-  de DMOs sem registro na Tooling API está ativo.
-- Data Streams: Colunas 'ID_OR_API_NAME' e 'DISPLAY_NAME' usam o 'label' (nome
-  de exibição) do Data Stream. 'CREATED_BY_NAME' é 'Desconhecido' devido à
-  limitação da API.
-- Calculated Insights: 'CREATED_BY_NAME' é 'Desconhecido' devido à limitação
-  da API.
+Versão: 10.50 (Versão Final Estável + Funcionalidades)
+- BASE ESTÁVEL: Script construído a partir da v10.37.
+- FUNCIONALIDADE COMPLETA: Mantida a busca de 'CreatedById' para DMOs, Segmentos
+  e Ativações.
+- CORREÇÃO (API Limits): O semáforo de concorrência foi reduzido de 10 para 5.
+  Isso diminui a velocidade das chamadas massivas (como a busca de mapeamentos),
+  evitando o estouro de limites da API e a ocorrência de erros '500 Internal
+  Server Error' por sobrecarga.
+- CORREÇÃO (Criador de DS/CI): Mantida a lógica estável de 'Desconhecido' para
+  o criador de Data Streams e Calculated Insights.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -235,6 +236,31 @@ async def fetch_users_by_id(session, semaphore, user_ids):
         if record_list: all_users.extend(record_list)
     return all_users
 
+async def fetch_dmo_mapping_sources(session, semaphore, dmo_name):
+    """Busca as fontes (DLOs) de um DMO específico."""
+    async with semaphore:
+        endpoint = f"/services/data/{API_VERSION}/ssot/data-model-object-mappings?dataspace=default&dmoDeveloperName={dmo_name}"
+        try:
+            kwargs = {'ssl': VERIFY_SSL}
+            if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
+            async with session.get(endpoint, **kwargs) as response:
+                # Gerar erro para status >= 400, mas não para 500, que tratamos como falha recuperável
+                if response.status >= 400 and response.status != 500:
+                    response.raise_for_status()
+                # Se for 500, logamos o aviso e retornamos vazio, sem tentar novamente.
+                if response.status == 500:
+                     logging.warning(f"Não foi possível buscar o mapeamento para o DMO {dmo_name}: {response.status}, message='Internal Server Error', url='{endpoint}'")
+                     return []
+                
+                data = await response.json()
+                mappings = data.get("objectSourceTargetMaps", [])
+                if mappings:
+                    source_dlos = [m.get("sourceEntityDeveloperName") for m in mappings if m.get("sourceEntityDeveloperName")]
+                    return source_dlos
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logging.warning(f"Não foi possível buscar o mapeamento para o DMO {dmo_name}: {e}")
+        return []
+
 # --- Main Audit Logic ---
 async def main():
     auth_data = get_access_token()
@@ -242,13 +268,13 @@ async def main():
     logging.info('🚀 Iniciando auditoria de exclusão de objetos...')
 
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json', 'Accept': 'application/json'}
-    semaphore = asyncio.Semaphore(10)
+    # --- CORREÇÃO DE API LIMIT: Reduzindo a concorrência para evitar sobrecarga ---
+    semaphore = asyncio.Semaphore(5)
     async with aiohttp.ClientSession(headers=headers, base_url=instance_url, connector=aiohttp.TCPConnector(ssl=VERIFY_SSL)) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
         
         dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
-        # Usando as queries simplificadas que se provaram estáveis
         activation_attributes_query = "SELECT Id, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
         contact_point_query = "SELECT Id, CreatedById FROM MktSgmntActvtnContactPoint"
         
@@ -279,6 +305,10 @@ async def main():
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
         dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions, contact_point_usages = final_results
         
+        now = datetime.now(timezone.utc)
+        thirty_days_ago = now - timedelta(days=30)
+        ninety_days_ago = now - timedelta(days=90)
+
         dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
         logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
@@ -298,29 +328,39 @@ async def main():
         logging.info("✅ Detalhes de segmento coletados. Iniciando busca por nomes de criadores...")
 
         all_creator_ids = set()
-        collections_with_creators = [dmo_tooling_data, activation_attributes, activation_details, segments, calculated_insights, data_streams, contact_point_usages]
+        collections_with_creators = [dmo_tooling_data, activation_attributes, activation_details, segments]
         for collection in collections_with_creators:
+            if not isinstance(collection, list):
+                continue
             for item in collection:
-                if creator_id := (item.get('CreatedById') or item.get('createdById')):
-                    all_creator_ids.add(creator_id)
-        
-        logging.info(f"Coletados {len(all_creator_ids)} IDs de criadores únicos para buscar nomes.")
+                if isinstance(item, dict):
+                    if creator_id := (item.get('CreatedById') or item.get('createdById')):
+                        all_creator_ids.add(creator_id)
 
+        logging.info(f"Coletados {len(all_creator_ids)} IDs de criadores únicos para buscar nomes.")
         user_id_to_name_map = {}
         if all_creator_ids:
             logging.info(f"--- Etapa 4: Buscando nomes de {len(all_creator_ids)} criadores... ---")
             user_records = await fetch_users_by_id(session, semaphore, list(all_creator_ids))
             user_id_to_name_map = {user['Id']: user['Name'] for user in user_records}
             logging.info(f"{len(user_id_to_name_map)} nomes de usuários foram encontrados com sucesso.")
-
-        now = datetime.now(timezone.utc)
-        thirty_days_ago = now - timedelta(days=30)
-        ninety_days_ago = now - timedelta(days=90)
         
         dmo_prefixes_to_exclude = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
         
         dmos_from_activation_csv = read_activation_usage_csv()
         
+        logging.info("--- Etapa 5: Buscando mapeamentos DLO -> DMO de forma massiva ---")
+        dmo_names = [dmo.get('DeveloperName') for dmo in dmo_tooling_data if dmo.get('DeveloperName')]
+        mapping_tasks = [fetch_dmo_mapping_sources(session, semaphore, name) for name in dmo_names]
+        
+        mapping_results = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos DLO->DMO")
+        
+        dlos_mapped_to_dmos = set()
+        for dlo_list in mapping_results:
+            if dlo_list:
+                dlos_mapped_to_dmos.update(dlo_list)
+        logging.info(f"🔎 Encontrados {len(dlos_mapped_to_dmos)} DLOs únicos que estão mapeados para DMOs.")
+
         dmos_used_by_segments = {normalize_api_name(s.get('SegmentMembershipTable')) for s in segments if s.get('SegmentMembershipTable')}
         dmos_used_by_data_graphs = {normalize_api_name(obj.get('developerName')) for dg in data_graphs for obj in [dg.get('dgObject', {})] + dg.get('dgObject', {}).get('relatedObjects', []) if obj.get('developerName')}
         dmos_used_by_ci_relationships = {normalize_api_name(rel.get('fromEntity')) for ci in calculated_insights for rel in ci.get('relationships', []) if rel.get('fromEntity')}
@@ -377,7 +417,7 @@ async def main():
                 act_name = next((attr.get('Name') for attr in activation_attributes if attr.get('MarketSegmentActivationId') == act_id), 'Nome não encontrado')
                 creator_name = user_id_to_name_map.get(act_detail.get('CreatedById'), 'Desconhecido')
                 reason = f'Órfã (associada a segmento inativo e sem vínculos: {seg_id})'
-                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': act_id, 'DISPLAY_NAME': act_name, 'OBJECT_TYPE': 'ACTIVATION', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'N/A', 'DIAS_ATIVIDADE': 'N/A', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': act_name})
+                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': act_id, 'DISPLAY_NAME': act_name, 'OBJECT_TYPE': 'ACTIVATION', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'N/A', 'DIAS_ATIVIDADE': 'N/A', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': act_id})
 
         logging.info("Auditando Data Model Objects (DMOs)...")
         all_used_dmos = (dmos_used_by_segments | dmos_used_by_data_graphs | dmos_used_by_ci_relationships | dmos_used_in_data_actions | dmos_used_in_segment_criteria | dmos_from_activation_csv | dmos_used_in_contact_points)
@@ -427,22 +467,43 @@ async def main():
         logging.info("Auditando Data Streams...")
         for ds in data_streams:
             last_updated = parse_sf_date(ds.get('lastIngestDate'))
+            
             if not last_updated or last_updated < thirty_days_ago:
                 days_inactive = days_since(last_updated)
                 
-                ds_label = ds.get('label') or ds.get('name')
-                ds_id = ds.get('id')
-                
-                creator_name = 'Desconhecido' # Lógica simplificada pois a API não fornece o dado
+                ds_label = ds.get('label')
+                ds_api_name = ds.get('name')
+                dlo_info = ds.get('dataLakeObjectInfo', {})
+                deletion_id = dlo_info.get('name') 
 
-                has_mappings = bool(ds.get('mappings'))
+                if not ds_label:
+                    ds_label = dlo_info.get('label') or ds_api_name or "Nome não encontrado"
+                if not deletion_id:
+                    deletion_id = f"{ds_api_name}__dll" if ds_api_name else "ID de Exclusão não encontrado"
+
+                creator_name = 'Desconhecido'
+
+                has_field_mappings = bool(ds.get('mappings'))
+                is_mapped_to_dmo = deletion_id in dlos_mapped_to_dmos
+                has_mappings = has_field_mappings or is_mapped_to_dmo
                 
                 if not has_mappings:
                     reason = "Inativo (sem ingestão > 30d e sem mapeamentos)"
                 else:
                     reason = "Inativo (sem ingestão > 30d, mas possui mapeamentos)"
                 
-                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_label, 'DISPLAY_NAME': ds_label, 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds_id})
+                audit_results.append({
+                    'DELETAR': 'NAO', 
+                    'ID_OR_API_NAME': ds_label, 
+                    'DISPLAY_NAME': ds_label, 
+                    'OBJECT_TYPE': 'DATA_STREAM', 
+                    'STATUS': 'N/A', 
+                    'REASON': reason, 
+                    'TIPO_ATIVIDADE': 'Última Ingestão', 
+                    'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 
+                    'CREATED_BY_NAME': creator_name, 
+                    'DELETION_IDENTIFIER': deletion_id
+                })
         
         logging.info("Auditando Calculated Insights...")
         for ci in calculated_insights:
@@ -451,10 +512,21 @@ async def main():
                 days_inactive = days_since(last_processed)
                 ci_name = ci.get('name')
                 
-                creator_name = 'Desconhecido' # Lógica simplificada pois a API não fornece o dado
+                creator_name = 'Desconhecido'
 
                 reason = "Inativo (último processamento bem-sucedido > 90d)"
-                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ci_name, 'DISPLAY_NAME': ci.get('displayName'), 'OBJECT_TYPE': 'CALCULATED_INSIGHT', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Último Processamento', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ci_name})
+                audit_results.append({
+                    'DELETAR': 'NAO', 
+                    'ID_OR_API_NAME': ci_name, 
+                    'DISPLAY_NAME': ci.get('displayName'), 
+                    'OBJECT_TYPE': 'CALCULATED_INSIGHT', 
+                    'STATUS': 'N/A', 
+                    'REASON': reason, 
+                    'TIPO_ATIVIDADE': 'Último Processamento', 
+                    'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 
+                    'CREATED_BY_NAME': creator_name, 
+                    'DELETION_IDENTIFIER': ci_name
+                })
 
         if audit_results:
             csv_file = "audit_objetos_para_exclusao.csv"
@@ -464,6 +536,17 @@ async def main():
                 writer.writeheader()
                 writer.writerows(audit_results)
             logging.info(f"✅ Auditoria concluída. CSV gerado: {csv_file}")
+            
+            counts = {'DMO': 0, 'DATA_STREAM': 0, 'CALCULATED_INSIGHT': 0, 'SEGMENT': 0, 'ACTIVATION': 0}
+            for result in audit_results:
+                obj_type = result.get('OBJECT_TYPE')
+                if obj_type in counts:
+                    counts[obj_type] += 1
+            
+            summary_parts = [f"{key}: {value}" for key, value in counts.items() if value > 0]
+            if summary_parts:
+                logging.info(f"📊 Resumo de objetos identificados: {' | '.join(summary_parts)}")
+
         else:
             logging.info("🎉 Nenhum objeto órfão ou inativo encontrado com as regras atuais.")
 
