@@ -1,16 +1,15 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.56 (Versão Final Estável)
+Versão: 10.57 (Versão Final Estável)
 - BASE ESTÁVEL: Script construído a partir da v10.37.
-- CORREÇÃO FINAL (DMO Suffix): Corrigido o bug em que o sufixo '__dlm' não
-  era passado para a API de mapeamento. O script agora garante que o
-  DeveloperName completo seja usado na chamada, resolvendo a falha em encontrar
-  os mapeamentos DLO->DMO.
-- LIMPEZA: Removidos todos os arquivos e lógicas de depuração, resultando em
-  um código final de produção.
-- OTIMIZAÇÃO: Mantida a abordagem de 1 chamada SOQL para obter os mapeamentos,
-  evitando problemas de limite de API.
+- MELHORIA (Error Handling): A busca de mapeamentos agora trata erros '404 Not Found'
+  da mesma forma que erros '500', considerando-os como um comportamento esperado
+  da API para DMOs sem mapeamento e evitando que o script trave.
+- OTIMIZAÇÃO (Filtro de Categoria): A busca de mapeamentos agora filtra e ignora
+  DMOs da categoria 'Segment Membership'. Isso reduz ainda mais o número de chamadas
+  de API desnecessárias, focando apenas em DMOs relevantes (Profile, Engagement, Related).
+- CORREÇÃO (API Limits): Mantido o semáforo de concorrência em 5.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -243,11 +242,10 @@ async def main():
     logging.info('🚀 Iniciando auditoria de exclusão de objetos...')
 
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json', 'Accept': 'application/json'}
-    semaphore = asyncio.Semaphore(10)
+    semaphore = asyncio.Semaphore(5)
     async with aiohttp.ClientSession(headers=headers, base_url=instance_url, connector=aiohttp.TCPConnector(ssl=VERIFY_SSL)) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
         
-        # A query SOQL continua sendo a forma mais eficiente, mesmo sem o campo 'Datasource'
         dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
         activation_attributes_query = "SELECT Id, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
@@ -325,34 +323,32 @@ async def main():
         dmos_from_activation_csv = read_activation_usage_csv()
         
         logging.info("--- Etapa 5: Coletando todos os mapeamentos DLO -> DMO ---")
-        # O endpoint de metadados é a fonte mais confiável para a lista completa de DMOs
-        all_dmo_metadata = await fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata')
-        dmo_names_from_metadata = [dmo.get('name') for dmo in all_dmo_metadata if dmo.get('name')]
         
-        # Como o DeveloperName da SOQL pode vir sem sufixo, usamos a lista da API de Metadados que é garantida
+        # --- OTIMIZAÇÃO: Filtra DMOs por categoria antes de buscar mapeamentos ---
         dmo_names_to_query = [
-            name for name in dmo_names_from_metadata
-            if not any(name.lower().startswith(p) for p in dmo_prefixes_to_exclude)
+            dmo.get('name') for dmo in dm_objects
+            if dmo.get('name') and dmo.get('category') != 'Segment Membership' and
+            not any(dmo.get('name').lower().startswith(p) for p in dmo_prefixes_to_exclude)
         ]
-        logging.info(f"Filtrando DMOs para busca de mapeamento. De {len(dmo_names_from_metadata)} DMOs totais, {len(dmo_names_to_query)} serão consultados.")
+        logging.info(f"Filtrando DMOs para busca de mapeamento. De {len(dm_objects)} DMOs totais, {len(dmo_names_to_query)} serão consultados.")
         
-        # A busca via API de mapeamento é a única forma confirmada, mas precisa ser controlada
-        semaphore_mappings = asyncio.Semaphore(5)
-        active_dataspace = "default" # Confirmado pelo usuário
+        active_dataspace = "default"
         
-        mapping_tasks = []
-        for name in dmo_names_to_query:
-            # CORREÇÃO: Garante que o sufixo __dlm está presente, conforme diagnóstico
-            dmo_full_name = f"{name}__dlm" if not name.endswith('__dlm') else name
-            # A função de busca foi removida e a lógica colocada aqui para clareza
+        # Lógica de busca de mapeamento foi movida para uma função helper dedicada para melhor tratamento de erros
+        # A função fetch_dmo_mapping foi removida e a lógica integrada aqui para simplicidade
+        tasks = []
+        for dmo_name in dmo_names_to_query:
+            # Garante que o nome completo com sufixo seja usado
+            dmo_full_name = f"{dmo_name}__dlm" if not dmo_name.endswith('__dlm') else dmo_name
             endpoint = f"/services/data/{API_VERSION}/ssot/data-model-object-mappings?dataspace={active_dataspace}&dmoDeveloperName={dmo_full_name}"
-            mapping_tasks.append(fetch_api_data(session, endpoint, semaphore_mappings))
+            # Usamos uma nova função para tratar erros 404/500 de forma específica sem retentativas
+            tasks.append(fetch_api_data_single(session, endpoint, semaphore))
 
-        mapping_results = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos DLO->DMO")
+        mapping_results = await tqdm.gather(*tasks, desc="Buscando Mapeamentos DLO->DMO")
         
         dlos_mapped_to_dmos = set()
         for result in mapping_results:
-            if result:
+            if result: # Ignora resultados nulos (falhas tratadas)
                 mappings = result.get("objectSourceTargetMaps", [])
                 for m in mappings:
                     if dlo_name := m.get("sourceEntityDeveloperName"):
@@ -543,6 +539,21 @@ async def main():
 
         else:
             logging.info("🎉 Nenhum objeto órfão ou inativo encontrado com as regras atuais.")
+
+async def fetch_api_data_single(session, relative_url, semaphore):
+    """Função de busca dedicada que não faz retentativas e trata 404/500 como None."""
+    async with semaphore:
+        try:
+            kwargs = {'ssl': VERIFY_SSL}
+            if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
+            async with session.get(relative_url, **kwargs) as response:
+                if response.status in [404, 500]:
+                    return None
+                response.raise_for_status()
+                return await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logging.warning(f"Falha de conexão ao buscar {relative_url[:50]}...: {e}")
+            return None
 
 if __name__ == "__main__":
     start_time = time.time()
