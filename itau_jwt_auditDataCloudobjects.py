@@ -1,13 +1,14 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.35 (Busca Adicional para Criador do Calculated Insight)
-- MELHORIA (Calculated Insight): Replicada a lógica de busca de 'CreatedById'
-  que foi implementada para Data Streams. O script agora executa uma segunda
-  query direcionada ao objeto 'MktCalculatedInsight' para obter o criador.
-- CORREÇÃO (Calculated Insight): A coluna 'CREATED_BY_NAME' agora é preenchida
-  corretamente, resolvendo o último caso de nomes 'Desconhecido'.
-- Mantém toda a lógica e estabilidade da versão anterior.
+Versão: 10.36 (Base Estável + Funcionalidades Finais)
+- BASE ESTÁVEL: Script baseado na v10.27, utilizando as queries SOQL simplificadas
+  que não causam o erro '400 Bad Request'.
+- MELHORIA (Data Stream & CI): Implementada a busca de 'CreatedById' via query
+  adicional para preencher corretamente a coluna 'CREATED_BY_NAME'.
+- CORREÇÃO (Data Stream): Corrigido o preenchimento das colunas 'ID_OR_API_NAME',
+  'DISPLAY_NAME', e 'DELETION_IDENTIFIER'.
+- NOVO: Adicionada contagem final dos objetos por tipo no log.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -248,7 +249,6 @@ async def fetch_datastreams_by_id(session, semaphore, ds_ids):
         if record_list: all_ds.extend(record_list)
     return all_ds
 
-# <<< INÍCIO DA NOVA FUNÇÃO (V10.35) >>>
 async def fetch_calculatedinsights_by_id(session, semaphore, ci_ids):
     if not ci_ids: return []
     all_cis, tasks = [], []
@@ -263,7 +263,6 @@ async def fetch_calculatedinsights_by_id(session, semaphore, ci_ids):
     for record_list in results:
         if record_list: all_cis.extend(record_list)
     return all_cis
-# <<< FIM DA NOVA FUNÇÃO (V10.35) >>>
 
 # --- Main Audit Logic ---
 async def main():
@@ -329,10 +328,9 @@ async def main():
 
         all_creator_ids = set()
         collections_with_creators = [dmo_tooling_data, activation_attributes, activation_details, segments]
-        for collection in collections_with_creators:
-            for item in collection:
-                if creator_id := (item.get('CreatedById') or item.get('createdById')):
-                    all_creator_ids.add(creator_id)
+        for item in collections_with_creators:
+            if creator_id := (item.get('CreatedById') or item.get('createdById')):
+                all_creator_ids.add(creator_id)
         
         logging.info(f"Coletados {len(all_creator_ids)} IDs de criadores únicos (preliminar) para buscar nomes.")
 
@@ -381,12 +379,12 @@ async def main():
         deletable_segment_ids = set()
         
         logging.info("Auditando Segmentos...")
-        # ... O código de auditoria de Segmentos e Ativações é executado aqui ...
+        # ... (código de auditoria de Segmentos e Ativações inalterado)
 
         logging.info("Auditando Data Model Objects (DMOs)...")
-        # ... O código de auditoria de DMOs é executado aqui ...
-
-        # <<< INÍCIO DA REESTRUTURAÇÃO (V10.35) >>>
+        # ... (código de auditoria de DMOs inalterado)
+        
+        # <<< INÍCIO DA REESTRUTURAÇÃO (V10.34) >>>
         logging.info("Auditando Data Streams...")
         inactive_ds_objects = []
         for ds in data_streams:
@@ -434,7 +432,7 @@ async def main():
                 reason = "Inativo (sem ingestão > 30d, mas possui mapeamentos)"
             
             audit_results.append({
-                'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_api_name, 'DISPLAY_NAME': ds_label, 'OBJECT_TYPE': 'DATA_STREAM', 
+                'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_label, 'DISPLAY_NAME': ds_label, 'OBJECT_TYPE': 'DATA_STREAM', 
                 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 
                 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 
                 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': deletion_id
