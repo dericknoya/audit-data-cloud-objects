@@ -1,15 +1,16 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.57 (Versão Final Estável)
+Versão: 10.59 (Versão Final Estável)
 - BASE ESTÁVEL: Script construído a partir da v10.37.
-- MELHORIA (Error Handling): A busca de mapeamentos agora trata erros '404 Not Found'
-  da mesma forma que erros '500', considerando-os como um comportamento esperado
-  da API para DMOs sem mapeamento e evitando que o script trave.
-- OTIMIZAÇÃO (Filtro de Categoria): A busca de mapeamentos agora filtra e ignora
-  DMOs da categoria 'Segment Membership'. Isso reduz ainda mais o número de chamadas
-  de API desnecessárias, focando apenas em DMOs relevantes (Profile, Engagement, Related).
-- CORREÇÃO (API Limits): Mantido o semáforo de concorrência em 5.
+- NOVO (Auditoria da Busca): Implementado um sistema de relatório detalhado
+  para a busca de mapeamentos. O script agora categoriza cada chamada de API
+  como 'Sucesso', 'Sem Mapeamento (404/500)' ou 'Falha' e gera um resumo no
+  log.
+- NOVO (Arquivos de Debug Detalhados): O script agora gera múltiplos arquivos
+  de depuração ('debug_dmos_com_mapeamento', 'debug_dmos_sem_mapeamento', etc.)
+  para permitir uma auditoria completa e transparente do processo de busca,
+  validando o comportamento de erros 404/500.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -113,6 +114,30 @@ async def fetch_api_data(session, relative_url, semaphore, key_name=None):
                 else:
                     logging.error(f"❌ Todas as {MAX_RETRIES} tentativas falharam para {relative_url[:50]}...: {e}")
                     raise e
+
+async def fetch_dmo_mapping_data(session, semaphore, dmo_name, dataspace):
+    """Função dedicada para buscar mapeamentos, que retorna um status e o dado."""
+    async with semaphore:
+        endpoint = f"/services/data/{API_VERSION}/ssot/data-model-object-mappings?dataspace={dataspace}&dmoDeveloperName={dmo_name}"
+        try:
+            kwargs = {'ssl': VERIFY_SSL}
+            if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
+            async with session.get(endpoint, **kwargs) as response:
+                if response.status in [404, 500]:
+                    return {'status': 'no_mapping', 'dmo': dmo_name, 'data': None}
+                
+                response.raise_for_status()
+                data = await response.json()
+                
+                if data.get("objectSourceTargetMaps"):
+                    return {'status': 'success', 'dmo': dmo_name, 'data': data}
+                else:
+                    # Resposta 200 OK mas sem a chave, também é um caso de "sem mapeamento"
+                    return {'status': 'no_mapping', 'dmo': dmo_name, 'data': None}
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logging.warning(f"Falha de conexão ao buscar mapeamento para {dmo_name}: {e}")
+            return {'status': 'error', 'dmo': dmo_name, 'data': str(e)}
 
 def parse_sf_date(date_str):
     if not date_str: return None
@@ -324,7 +349,6 @@ async def main():
         
         logging.info("--- Etapa 5: Coletando todos os mapeamentos DLO -> DMO ---")
         
-        # --- OTIMIZAÇÃO: Filtra DMOs por categoria antes de buscar mapeamentos ---
         dmo_names_to_query = [
             dmo.get('name') for dmo in dm_objects
             if dmo.get('name') and dmo.get('category') != 'Segment Membership' and
@@ -334,27 +358,41 @@ async def main():
         
         active_dataspace = "default"
         
-        # Lógica de busca de mapeamento foi movida para uma função helper dedicada para melhor tratamento de erros
-        # A função fetch_dmo_mapping foi removida e a lógica integrada aqui para simplicidade
         tasks = []
         for dmo_name in dmo_names_to_query:
-            # Garante que o nome completo com sufixo seja usado
             dmo_full_name = f"{dmo_name}__dlm" if not dmo_name.endswith('__dlm') else dmo_name
-            endpoint = f"/services/data/{API_VERSION}/ssot/data-model-object-mappings?dataspace={active_dataspace}&dmoDeveloperName={dmo_full_name}"
-            # Usamos uma nova função para tratar erros 404/500 de forma específica sem retentativas
-            tasks.append(fetch_api_data_single(session, endpoint, semaphore))
+            tasks.append(fetch_dmo_mapping_data(session, semaphore, dmo_full_name, active_dataspace))
 
         mapping_results = await tqdm.gather(*tasks, desc="Buscando Mapeamentos DLO->DMO")
         
         dlos_mapped_to_dmos = set()
+        
+        # --- LÓGICA DE AUDITORIA DA BUSCA ---
+        dmos_com_sucesso = []
+        dmos_sem_mapeamento = []
+        dmos_com_falha = []
+
         for result in mapping_results:
-            if result: # Ignora resultados nulos (falhas tratadas)
-                mappings = result.get("objectSourceTargetMaps", [])
+            if not result: continue
+            status = result.get('status')
+            dmo = result.get('dmo')
+            if status == 'success':
+                dmos_com_sucesso.append({'DMO_Name': dmo})
+                mappings = result['data'].get("objectSourceTargetMaps", [])
                 for m in mappings:
                     if dlo_name := m.get("sourceEntityDeveloperName"):
                         dlos_mapped_to_dmos.add(dlo_name)
-        
-        logging.info(f"🔎 Encontrados {len(dlos_mapped_to_dmos)} DLOs únicos que estão mapeados para DMOs.")
+            elif status == 'no_mapping':
+                dmos_sem_mapeamento.append({'DMO_Name': dmo})
+            elif status == 'error':
+                dmos_com_falha.append({'DMO_Name': dmo, 'Error': result.get('data')})
+
+        logging.info("--- Resumo da Busca de Mapeamentos ---")
+        logging.info(f"- DMOs com mapeamento encontrado: {len(dmos_com_sucesso)}")
+        logging.info(f"- DMOs sem mapeamento (API retornou 404/500): {len(dmos_sem_mapeamento)}")
+        logging.info(f"- DMOs com falha de conexão/timeout: {len(dmos_com_falha)}")
+        logging.info(f"- Total de DLOs únicos mapeados encontrados: {len(dlos_mapped_to_dmos)}")
+        # --- FIM DA LÓGICA DE AUDITORIA ---
 
         dmos_used_by_segments = {normalize_api_name(s.get('SegmentMembershipTable')) for s in segments if s.get('SegmentMembershipTable')}
         dmos_used_by_data_graphs = {normalize_api_name(obj.get('developerName')) for dg in data_graphs for obj in [dg.get('dgObject', {})] + dg.get('dgObject', {}).get('relatedObjects', []) if obj.get('developerName')}
@@ -384,6 +422,7 @@ async def main():
 
         logging.info("Auditando Segmentos...")
         for seg in tqdm(segments, desc="Auditando Segmentos"):
+            # ... (O restante do código permanece o mesmo)
             seg_id = str(get_segment_id(seg) or '')[:15];
             if not seg_id: continue
             last_pub_date = segment_publications.get(seg_id)
@@ -527,6 +566,33 @@ async def main():
                 writer.writerows(audit_results)
             logging.info(f"✅ Auditoria concluída. CSV gerado: {csv_file}")
             
+            # --- GERAÇÃO DE ARQUIVOS DE DEBUG DETALHADOS ---
+            logging.info("--- Gerando arquivos de depuração para análise de mapeamento ---")
+            
+            with open('debug_dmos_com_mapeamento.csv', 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=['DMO_Name'])
+                writer.writeheader()
+                writer.writerows(dmos_com_sucesso)
+            
+            with open('debug_dmos_sem_mapeamento_404_500.csv', 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=['DMO_Name'])
+                writer.writeheader()
+                writer.writerows(dmos_sem_mapeamento)
+
+            if dmos_com_falha:
+                with open('debug_dmos_com_falha.csv', 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=['DMO_Name', 'Error'])
+                    writer.writeheader()
+                    writer.writerows(dmos_com_falha)
+
+            ds_dlo_list = [{'DATASTREAM_NAME': ds.get('name'), 'DLO_NAME': ds.get('dataLakeObjectInfo', {}).get('name')} for ds in data_streams]
+            with open('debug_datastreams_e_dlos.csv', 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=['DATASTREAM_NAME', 'DLO_NAME'])
+                writer.writeheader()
+                writer.writerows(ds_dlo_list)
+
+            logging.info("✅ Arquivos de depuração de mapeamento gerados.")
+            
             counts = {'DMO': 0, 'DATA_STREAM': 0, 'CALCULATED_INSIGHT': 0, 'SEGMENT': 0, 'ACTIVATION': 0}
             for result in audit_results:
                 obj_type = result.get('OBJECT_TYPE')
@@ -539,21 +605,6 @@ async def main():
 
         else:
             logging.info("🎉 Nenhum objeto órfão ou inativo encontrado com as regras atuais.")
-
-async def fetch_api_data_single(session, relative_url, semaphore):
-    """Função de busca dedicada que não faz retentativas e trata 404/500 como None."""
-    async with semaphore:
-        try:
-            kwargs = {'ssl': VERIFY_SSL}
-            if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
-            async with session.get(relative_url, **kwargs) as response:
-                if response.status in [404, 500]:
-                    return None
-                response.raise_for_status()
-                return await response.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logging.warning(f"Falha de conexão ao buscar {relative_url[:50]}...: {e}")
-            return None
 
 if __name__ == "__main__":
     start_time = time.time()
