@@ -458,18 +458,8 @@ async def main():
         logging.info("Auditando Data Streams...")
         for ds in data_streams:
             # --- INÍCIO DA CORREÇÃO ---
-            # 1. Obter ambas as datas como strings
-            refresh_date_str = ds.get('lastRefreshDate')
-            ingest_date_str = ds.get('lastIngestDate')
-
-            # 2. Converter ambas para objetos datetime, o que resultará em None se a string for nula/vazia
-            refresh_date = parse_sf_date(refresh_date_str)
-            ingest_date = parse_sf_date(ingest_date_str)
-
-            # 3. Criar uma lista com as datas válidas (não-None) e encontrar a mais recente (max)
-            # Se ambas forem None, o resultado será None, que é o comportamento desejado.
-            valid_dates = [d for d in [refresh_date, ingest_date] if d]
-            last_updated = max(valid_dates, default=None)
+            # Aplicando a lógica da v10.27 que se baseia apenas na data de ingestão.
+            last_updated = parse_sf_date(ds.get('lastIngestDate'))
             # --- FIM DA CORREÇÃO ---
             
             if not last_updated or last_updated < thirty_days_ago:
