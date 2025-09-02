@@ -1,15 +1,19 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.45 (Versão Final Estável + Funcionalidades)
+Versão: 10.46 (Versão Final Estável + Funcionalidades)
 - BASE ESTÁVEL: Script construído a partir da v10.37 para garantir a ausência de
   erros '400 Bad Request' e 'AttributeError'.
 - FUNCIONALIDADE COMPLETA: Inclui as funções para buscar o 'CreatedById' de
   Data Streams e Calculated Insights via query SOQL por Nome, preenchendo
   corretamente a coluna 'CREATED_BY_NAME'.
-- CORREÇÃO (Data Stream): Colunas de identificação e nome de exibição ajustadas
-  para usar os campos corretos do payload da API.
-- NOVO: Adicionada contagem final dos objetos por tipo no log.
+- CORREÇÃO (Data Stream): Lógica de inatividade corrigida para se basear
+  apenas em 'lastIngestDate', refletindo a regra de negócio correta.
+- CORREÇÃO (Data Stream Mappings): Lógica de verificação de mapeamentos
+  aprimorada para incluir a análise de DLO para DMO, corrigindo falsos
+  negativos.
+- NOVO: Adicionados logs de diagnóstico para a busca de criadores de Data
+  Streams e Calculated Insights.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -330,10 +334,16 @@ async def main():
         inactive_ds_names = [ds.get('name') for ds in data_streams if ds.get('name') and (not (ds.get('lastRefreshDate') or ds.get('lastIngestDate')) or parse_sf_date(ds.get('lastRefreshDate') or ds.get('lastIngestDate')) < thirty_days_ago)]
         inactive_ci_names = [ci.get('name') for ci in calculated_insights if ci.get('name') and (not ci.get('lastSuccessfulProcessingDate') or parse_sf_date(ci.get('lastSuccessfulProcessingDate')) < ninety_days_ago)]
         
+        logging.info(f"🔎 Buscando 'CreatedById' para {len(inactive_ds_names)} Data Streams inativos...")
+        logging.info(f"🔎 Buscando 'CreatedById' para {len(inactive_ci_names)} Calculated Insights inativos...")
+        
         ds_name_to_creator_map, ci_name_to_creator_map = await asyncio.gather(
             fetch_creators_by_name(session, semaphore, "DataStream", inactive_ds_names, "Name"),
             fetch_creators_by_name(session, semaphore, "MktCalculatedInsight", inactive_ci_names, "Name")
         )
+        
+        logging.info(f"📄 Resultado da busca (DataStream): {len(ds_name_to_creator_map)} nomes mapeados para IDs. Amostra: {dict(list(ds_name_to_creator_map.items())[:3])}")
+        logging.info(f"📄 Resultado da busca (Calculated Insight): {len(ci_name_to_creator_map)} nomes mapeados para IDs. Amostra: {dict(list(ci_name_to_creator_map.items())[:3])}")
         
         for creator_id in ds_name_to_creator_map.values():
             if creator_id: all_creator_ids.add(creator_id)
@@ -457,10 +467,7 @@ async def main():
         
         logging.info("Auditando Data Streams...")
         for ds in data_streams:
-            # --- INÍCIO DA CORREÇÃO ---
-            # Aplicando a lógica da v10.27 que se baseia apenas na data de ingestão.
             last_updated = parse_sf_date(ds.get('lastIngestDate'))
-            # --- FIM DA CORREÇÃO ---
             
             if not last_updated or last_updated < thirty_days_ago:
                 days_inactive = days_since(last_updated)
@@ -478,7 +485,13 @@ async def main():
                 creator_id = ds_name_to_creator_map.get(ds_api_name)
                 creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
 
-                has_mappings = bool(ds.get('mappings'))
+                # --- INÍCIO DA CORREÇÃO ---
+                # Lógica robusta para verificar se um Data Stream possui mapeamentos
+                # Um DS é considerado mapeado se tiver mapeamentos de campo (fonte->DLO) OU se o seu DLO estiver mapeado a um DMO
+                has_field_mappings = bool(ds.get('mappings'))
+                is_mapped_to_dmo = bool(dlo_info.get('dataModelName'))
+                has_mappings = has_field_mappings or is_mapped_to_dmo
+                # --- FIM DA CORREÇÃO ---
                 
                 if not has_mappings:
                     reason = "Inativo (sem ingestão > 30d e sem mapeamentos)"
