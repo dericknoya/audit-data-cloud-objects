@@ -1,17 +1,16 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.49 (Versão Final Estável + Funcionalidades)
-- BASE ESTÁVEL: Script construído a partir da v10.37 para garantir a ausência de
-  erros '400 Bad Request' e 'AttributeError'.
+Versão: 10.50 (Versão Final Estável + Funcionalidades)
+- BASE ESTÁVEL: Script construído a partir da v10.37.
 - FUNCIONALIDADE COMPLETA: Mantida a busca de 'CreatedById' para DMOs, Segmentos
   e Ativações.
-- CORREÇÃO FINALÍSSIMA (Data Stream Mappings): Implementada a busca massiva e
-  paralela de mapeamentos DLO->DMO utilizando o endpoint correto
-  '/ssot/data-model-object-mappings' para cada DMO. Esta é a fonte da verdade
-  e garante a precisão da auditoria.
+- CORREÇÃO (API Limits): O semáforo de concorrência foi reduzido de 10 para 5.
+  Isso diminui a velocidade das chamadas massivas (como a busca de mapeamentos),
+  evitando o estouro de limites da API e a ocorrência de erros '500 Internal
+  Server Error' por sobrecarga.
 - CORREÇÃO (Criador de DS/CI): Mantida a lógica estável de 'Desconhecido' para
-  o criador de Data Streams e Calculated Insights devido à limitação da API.
+  o criador de Data Streams e Calculated Insights.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -237,7 +236,6 @@ async def fetch_users_by_id(session, semaphore, user_ids):
         if record_list: all_users.extend(record_list)
     return all_users
 
-# --- NOVA FUNÇÃO HELPER ---
 async def fetch_dmo_mapping_sources(session, semaphore, dmo_name):
     """Busca as fontes (DLOs) de um DMO específico."""
     async with semaphore:
@@ -246,7 +244,14 @@ async def fetch_dmo_mapping_sources(session, semaphore, dmo_name):
             kwargs = {'ssl': VERIFY_SSL}
             if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
             async with session.get(endpoint, **kwargs) as response:
-                response.raise_for_status()
+                # Gerar erro para status >= 400, mas não para 500, que tratamos como falha recuperável
+                if response.status >= 400 and response.status != 500:
+                    response.raise_for_status()
+                # Se for 500, logamos o aviso e retornamos vazio, sem tentar novamente.
+                if response.status == 500:
+                     logging.warning(f"Não foi possível buscar o mapeamento para o DMO {dmo_name}: {response.status}, message='Internal Server Error', url='{endpoint}'")
+                     return []
+                
                 data = await response.json()
                 mappings = data.get("objectSourceTargetMaps", [])
                 if mappings:
@@ -263,7 +268,8 @@ async def main():
     logging.info('🚀 Iniciando auditoria de exclusão de objetos...')
 
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json', 'Accept': 'application/json'}
-    semaphore = asyncio.Semaphore(10)
+    # --- CORREÇÃO DE API LIMIT: Reduzindo a concorrência para evitar sobrecarga ---
+    semaphore = asyncio.Semaphore(5)
     async with aiohttp.ClientSession(headers=headers, base_url=instance_url, connector=aiohttp.TCPConnector(ssl=VERIFY_SSL)) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
         
@@ -343,7 +349,6 @@ async def main():
         
         dmos_from_activation_csv = read_activation_usage_csv()
         
-        # --- LÓGICA DE MAPEAMENTO FINAL ---
         logging.info("--- Etapa 5: Buscando mapeamentos DLO -> DMO de forma massiva ---")
         dmo_names = [dmo.get('DeveloperName') for dmo in dmo_tooling_data if dmo.get('DeveloperName')]
         mapping_tasks = [fetch_dmo_mapping_sources(session, semaphore, name) for name in dmo_names]
@@ -355,7 +360,6 @@ async def main():
             if dlo_list:
                 dlos_mapped_to_dmos.update(dlo_list)
         logging.info(f"🔎 Encontrados {len(dlos_mapped_to_dmos)} DLOs únicos que estão mapeados para DMOs.")
-        # --- FIM DA LÓGICA DE MAPEAMENTO ---
 
         dmos_used_by_segments = {normalize_api_name(s.get('SegmentMembershipTable')) for s in segments if s.get('SegmentMembershipTable')}
         dmos_used_by_data_graphs = {normalize_api_name(obj.get('developerName')) for dg in data_graphs for obj in [dg.get('dgObject', {})] + dg.get('dgObject', {}).get('relatedObjects', []) if obj.get('developerName')}
