@@ -1,15 +1,14 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.52 (Versão Final Estável + Funcionalidades)
+Versão: 10.54 (Versão Final Estável + Funcionalidades)
 - BASE ESTÁVEL: Script construído a partir da v10.37.
-- NOVO (Debug): Adicionada a geração de dois arquivos CSV de depuração
-  ('debug_mappings_encontrados.csv' e 'debug_dlos_para_verificacao.csv') para
-  diagnosticar por que os mapeamentos DLO->DMO não estão sendo encontrados.
+- NOVO (Debug): Adicionada a geração de um novo arquivo de log 'debug_api_calls_mappings.txt'.
+  Este arquivo contém as URLs exatas de cada chamada feita ao endpoint de mapeamento,
+  permitindo a validação externa e a depuração precisa das requisições.
 - OTIMIZAÇÃO (API Calls): Mantido o filtro para a busca de mapeamentos para
   reduzir o número de chamadas à API.
-- MELHORIA (Error Handling): Mantido o tratamento de erro 500 na busca de
-  mapeamentos como comportamento esperado.
+- CORREÇÃO (Dataspace): Mantida a lógica de descoberta dinâmica do dataspace.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -235,30 +234,30 @@ async def fetch_users_by_id(session, semaphore, user_ids):
         if record_list: all_users.extend(record_list)
     return all_users
 
-async def fetch_dmo_mapping_sources(session, semaphore, dmo_name):
-    """Busca as fontes (DLOs) de um DMO específico."""
+async def fetch_dmo_mapping_sources(session, semaphore, dmo_name, dataspace):
+    """Busca as fontes (DLOs) de um DMO e retorna o resultado junto com a URL da chamada."""
     async with semaphore:
-        endpoint = f"/services/data/{API_VERSION}/ssot/data-model-object-mappings?dataspace=default&dmoDeveloperName={dmo_name}"
+        endpoint = f"/services/data/{API_VERSION}/ssot/data-model-object-mappings?dataspace={dataspace}&dmoDeveloperName={dmo_name}"
+        full_url = urljoin(str(session._base_url), endpoint)
+        source_dlos_tuples = []
         try:
             kwargs = {'ssl': VERIFY_SSL}
             if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
             async with session.get(endpoint, **kwargs) as response:
                 if response.status == 500:
-                    return []
+                    return [], full_url
                 
                 response.raise_for_status()
                 data = await response.json()
                 mappings = data.get("objectSourceTargetMaps", [])
                 if mappings:
-                    # Retorna uma lista de tuplas (DMO, DLO) para depuração
-                    source_dlos = [
+                    source_dlos_tuples = [
                         (m.get("targetEntityDeveloperName"), m.get("sourceEntityDeveloperName"))
                         for m in mappings if m.get("sourceEntityDeveloperName")
                     ]
-                    return source_dlos
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logging.warning(f"Não foi possível buscar o mapeamento para o DMO {dmo_name}: {e}")
-        return []
+        return source_dlos_tuples, full_url
 
 # --- Main Audit Logic ---
 async def main():
@@ -310,6 +309,17 @@ async def main():
         dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
         logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
+        
+        active_dataspace = "default"
+        try:
+            dataspace_info = await fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/dataspace-info", semaphore, 'dataspaces')
+            if dataspace_info and isinstance(dataspace_info, list):
+                user_dataspace = next((ds.get('developerName') for ds in dataspace_info if ds.get('developerName') != 'sfdc_internal'), None)
+                if user_dataspace:
+                    active_dataspace = user_dataspace
+            logging.info(f"✅ Etapa 1.2: Dataspace ativo a ser usado: '{active_dataspace}'")
+        except Exception as e:
+            logging.warning(f"⚠️ Não foi possível descobrir o dataspace dinamicamente. Usando 'default'. Erro: {e}")
 
         activation_ids = list(set(attr['MarketSegmentActivationId'] for attr in activation_attributes if attr.get('MarketSegmentActivationId')))
         
@@ -356,19 +366,22 @@ async def main():
         ]
         logging.info(f"Filtrando DMOs para busca de mapeamento. De {len(all_dmo_names)} DMOs totais, {len(dmo_names_to_query)} serão consultados.")
 
-        mapping_tasks = [fetch_dmo_mapping_sources(session, semaphore, name) for name in dmo_names_to_query]
+        mapping_tasks = [fetch_dmo_mapping_sources(session, semaphore, name, active_dataspace) for name in dmo_names_to_query]
         
         mapping_results = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos DLO->DMO")
         
-        # --- LÓGICA DE DEBUG ---
         found_mappings_debug = []
         dlos_mapped_to_dmos = set()
-        for mapping_list in mapping_results:
+        dmo_mapping_urls_debug = [] # Lista para salvar as URLs para debug
+
+        for result_tuple in mapping_results:
+            mapping_list, url = result_tuple
+            dmo_mapping_urls_debug.append(url)
+
             if mapping_list:
                 for dmo_name, dlo_name in mapping_list:
                     dlos_mapped_to_dmos.add(dlo_name)
                     found_mappings_debug.append({'DMO_Name': dmo_name, 'DLO_Source': dlo_name})
-        # --- FIM DA LÓGICA DE DEBUG ---
 
         logging.info(f"🔎 Encontrados {len(dlos_mapped_to_dmos)} DLOs únicos que estão mapeados para DMOs.")
 
@@ -401,13 +414,9 @@ async def main():
         audit_results = []
         deletable_segment_ids = set()
         
-        # --- LÓGICA DE DEBUG ---
         dlo_check_list_debug = []
-        # --- FIM DA LÓGICA DE DEBUG ---
 
         logging.info("Auditando Segmentos...")
-        # (O restante do código permanece o mesmo)
-
         for seg in tqdm(segments, desc="Auditando Segmentos"):
             seg_id = str(get_segment_id(seg) or '')[:15];
             if not seg_id: continue
@@ -493,10 +502,8 @@ async def main():
                 dlo_info = ds.get('dataLakeObjectInfo', {})
                 deletion_id = dlo_info.get('name') 
 
-                # --- LÓGICA DE DEBUG ---
                 if deletion_id:
                     dlo_check_list_debug.append({'DLO_FROM_DATASTREAM': deletion_id})
-                # --- FIM DA LÓGICA DE DEBUG ---
 
                 if not ds_label:
                     ds_label = dlo_info.get('label') or ds_api_name or "Nome não encontrado"
@@ -537,7 +544,16 @@ async def main():
                 creator_name = 'Desconhecido'
 
                 reason = "Inativo (último processamento bem-sucedido > 90d)"
-                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ci_name, 'DISPLAY_NAME': ci.get('displayName'), 'OBJECT_TYPE': 'CALCULATED_INSIGHT', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Último Processamento', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ci_name})
+                audit_results.append({'DELETAR': 'NAO', 
+                                    'ID_OR_API_NAME': ci_name, 
+                                    'DISPLAY_NAME': ci.get('displayName'), 
+                                    'OBJECT_TYPE': 'CALCULATED_INSIGHT', 
+                                    'STATUS': 'N/A', 
+                                    'REASON': reason, 
+                                    'TIPO_ATIVIDADE': 'Último Processamento', 
+                                    'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 
+                                    'CREATED_BY_NAME': creator_name, 
+                                    'DELETION_IDENTIFIER': ci_name})
 
         if audit_results:
             csv_file = "audit_objetos_para_exclusao.csv"
@@ -548,8 +564,14 @@ async def main():
                 writer.writerows(audit_results)
             logging.info(f"✅ Auditoria concluída. CSV gerado: {csv_file}")
             
-            # --- LÓGICA DE DEBUG ---
             logging.info("--- Gerando arquivos de depuração para análise de mapeamento ---")
+            
+            if dmo_mapping_urls_debug:
+                with open('debug_api_calls_mappings.txt', 'w', encoding='utf-8') as f:
+                    for url in dmo_mapping_urls_debug:
+                        f.write(f"{url}\n")
+                logging.info("✅ Arquivo 'debug_api_calls_mappings.txt' gerado com as URLs exatas das chamadas de API.")
+
             if found_mappings_debug:
                 with open('debug_mappings_encontrados.csv', 'w', newline='', encoding='utf-8') as f:
                     writer = csv.DictWriter(f, fieldnames=['DMO_Name', 'DLO_Source'])
@@ -565,7 +587,6 @@ async def main():
                     writer.writeheader()
                     writer.writerows(dlo_check_list_debug)
                 logging.info("✅ Arquivo 'debug_dlos_para_verificacao.csv' gerado com os DLOs vindos dos Data Streams.")
-            # --- FIM DA LÓGICA DE DEBUG ---
 
             counts = {'DMO': 0, 'DATA_STREAM': 0, 'CALCULATED_INSIGHT': 0, 'SEGMENT': 0, 'ACTIVATION': 0}
             for result in audit_results:
