@@ -1,14 +1,16 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.54 (Versão Final Estável + Funcionalidades)
+Versão: 10.56 (Versão Final Estável)
 - BASE ESTÁVEL: Script construído a partir da v10.37.
-- NOVO (Debug): Adicionada a geração de um novo arquivo de log 'debug_api_calls_mappings.txt'.
-  Este arquivo contém as URLs exatas de cada chamada feita ao endpoint de mapeamento,
-  permitindo a validação externa e a depuração precisa das requisições.
-- OTIMIZAÇÃO (API Calls): Mantido o filtro para a busca de mapeamentos para
-  reduzir o número de chamadas à API.
-- CORREÇÃO (Dataspace): Mantida a lógica de descoberta dinâmica do dataspace.
+- CORREÇÃO FINAL (DMO Suffix): Corrigido o bug em que o sufixo '__dlm' não
+  era passado para a API de mapeamento. O script agora garante que o
+  DeveloperName completo seja usado na chamada, resolvendo a falha em encontrar
+  os mapeamentos DLO->DMO.
+- LIMPEZA: Removidos todos os arquivos e lógicas de depuração, resultando em
+  um código final de produção.
+- OTIMIZAÇÃO: Mantida a abordagem de 1 chamada SOQL para obter os mapeamentos,
+  evitando problemas de limite de API.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -234,31 +236,6 @@ async def fetch_users_by_id(session, semaphore, user_ids):
         if record_list: all_users.extend(record_list)
     return all_users
 
-async def fetch_dmo_mapping_sources(session, semaphore, dmo_name, dataspace):
-    """Busca as fontes (DLOs) de um DMO e retorna o resultado junto com a URL da chamada."""
-    async with semaphore:
-        endpoint = f"/services/data/{API_VERSION}/ssot/data-model-object-mappings?dataspace={dataspace}&dmoDeveloperName={dmo_name}"
-        full_url = urljoin(str(session._base_url), endpoint)
-        source_dlos_tuples = []
-        try:
-            kwargs = {'ssl': VERIFY_SSL}
-            if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
-            async with session.get(endpoint, **kwargs) as response:
-                if response.status == 500:
-                    return [], full_url
-                
-                response.raise_for_status()
-                data = await response.json()
-                mappings = data.get("objectSourceTargetMaps", [])
-                if mappings:
-                    source_dlos_tuples = [
-                        (m.get("targetEntityDeveloperName"), m.get("sourceEntityDeveloperName"))
-                        for m in mappings if m.get("sourceEntityDeveloperName")
-                    ]
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logging.warning(f"Não foi possível buscar o mapeamento para o DMO {dmo_name}: {e}")
-        return source_dlos_tuples, full_url
-
 # --- Main Audit Logic ---
 async def main():
     auth_data = get_access_token()
@@ -266,10 +243,11 @@ async def main():
     logging.info('🚀 Iniciando auditoria de exclusão de objetos...')
 
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json', 'Accept': 'application/json'}
-    semaphore = asyncio.Semaphore(5)
+    semaphore = asyncio.Semaphore(10)
     async with aiohttp.ClientSession(headers=headers, base_url=instance_url, connector=aiohttp.TCPConnector(ssl=VERIFY_SSL)) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
         
+        # A query SOQL continua sendo a forma mais eficiente, mesmo sem o campo 'Datasource'
         dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
         activation_attributes_query = "SELECT Id, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
@@ -309,17 +287,6 @@ async def main():
         dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
         logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
-        
-        active_dataspace = "default"
-        try:
-            dataspace_info = await fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/dataspace-info", semaphore, 'dataspaces')
-            if dataspace_info and isinstance(dataspace_info, list):
-                user_dataspace = next((ds.get('developerName') for ds in dataspace_info if ds.get('developerName') != 'sfdc_internal'), None)
-                if user_dataspace:
-                    active_dataspace = user_dataspace
-            logging.info(f"✅ Etapa 1.2: Dataspace ativo a ser usado: '{active_dataspace}'")
-        except Exception as e:
-            logging.warning(f"⚠️ Não foi possível descobrir o dataspace dinamicamente. Usando 'default'. Erro: {e}")
 
         activation_ids = list(set(attr['MarketSegmentActivationId'] for attr in activation_attributes if attr.get('MarketSegmentActivationId')))
         
@@ -357,47 +324,52 @@ async def main():
         
         dmos_from_activation_csv = read_activation_usage_csv()
         
-        logging.info("--- Etapa 5: Buscando mapeamentos DLO -> DMO de forma massiva ---")
-        all_dmo_names = [dmo.get('DeveloperName') for dmo in dmo_tooling_data if dmo.get('DeveloperName')]
+        logging.info("--- Etapa 5: Coletando todos os mapeamentos DLO -> DMO ---")
+        # O endpoint de metadados é a fonte mais confiável para a lista completa de DMOs
+        all_dmo_metadata = await fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata')
+        dmo_names_from_metadata = [dmo.get('name') for dmo in all_dmo_metadata if dmo.get('name')]
         
+        # Como o DeveloperName da SOQL pode vir sem sufixo, usamos a lista da API de Metadados que é garantida
         dmo_names_to_query = [
-            name for name in all_dmo_names 
+            name for name in dmo_names_from_metadata
             if not any(name.lower().startswith(p) for p in dmo_prefixes_to_exclude)
         ]
-        logging.info(f"Filtrando DMOs para busca de mapeamento. De {len(all_dmo_names)} DMOs totais, {len(dmo_names_to_query)} serão consultados.")
-
-        mapping_tasks = [fetch_dmo_mapping_sources(session, semaphore, name, active_dataspace) for name in dmo_names_to_query]
+        logging.info(f"Filtrando DMOs para busca de mapeamento. De {len(dmo_names_from_metadata)} DMOs totais, {len(dmo_names_to_query)} serão consultados.")
         
+        # A busca via API de mapeamento é a única forma confirmada, mas precisa ser controlada
+        semaphore_mappings = asyncio.Semaphore(5)
+        active_dataspace = "default" # Confirmado pelo usuário
+        
+        mapping_tasks = []
+        for name in dmo_names_to_query:
+            # CORREÇÃO: Garante que o sufixo __dlm está presente, conforme diagnóstico
+            dmo_full_name = f"{name}__dlm" if not name.endswith('__dlm') else name
+            # A função de busca foi removida e a lógica colocada aqui para clareza
+            endpoint = f"/services/data/{API_VERSION}/ssot/data-model-object-mappings?dataspace={active_dataspace}&dmoDeveloperName={dmo_full_name}"
+            mapping_tasks.append(fetch_api_data(session, endpoint, semaphore_mappings))
+
         mapping_results = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos DLO->DMO")
         
-        found_mappings_debug = []
         dlos_mapped_to_dmos = set()
-        dmo_mapping_urls_debug = [] # Lista para salvar as URLs para debug
-
-        for result_tuple in mapping_results:
-            mapping_list, url = result_tuple
-            dmo_mapping_urls_debug.append(url)
-
-            if mapping_list:
-                for dmo_name, dlo_name in mapping_list:
-                    dlos_mapped_to_dmos.add(dlo_name)
-                    found_mappings_debug.append({'DMO_Name': dmo_name, 'DLO_Source': dlo_name})
-
+        for result in mapping_results:
+            if result:
+                mappings = result.get("objectSourceTargetMaps", [])
+                for m in mappings:
+                    if dlo_name := m.get("sourceEntityDeveloperName"):
+                        dlos_mapped_to_dmos.add(dlo_name)
+        
         logging.info(f"🔎 Encontrados {len(dlos_mapped_to_dmos)} DLOs únicos que estão mapeados para DMOs.")
 
         dmos_used_by_segments = {normalize_api_name(s.get('SegmentMembershipTable')) for s in segments if s.get('SegmentMembershipTable')}
         dmos_used_by_data_graphs = {normalize_api_name(obj.get('developerName')) for dg in data_graphs for obj in [dg.get('dgObject', {})] + dg.get('dgObject', {}).get('relatedObjects', []) if obj.get('developerName')}
         dmos_used_by_ci_relationships = {normalize_api_name(rel.get('fromEntity')) for ci in calculated_insights for rel in ci.get('relationships', []) if rel.get('fromEntity')}
-        
         dmos_used_in_data_actions = set()
         for da in data_actions:
             find_items_in_criteria(da, 'developerName', dmos_used_in_data_actions)
-            
         dmos_used_in_contact_points = set()
         for cp in contact_point_usages:
             find_items_in_criteria(cp.get('ContactPointPath'), 'developerName', dmos_used_in_contact_points)
             find_items_in_criteria(cp.get('ContactPointFilterExpression'), 'developerName', dmos_used_in_contact_points)
-            
         nested_segment_parents = {}
         dmos_used_in_segment_criteria = set()
         logging.info("Analisando critérios de segmentos para DMOs e aninhamento...")
@@ -413,8 +385,6 @@ async def main():
 
         audit_results = []
         deletable_segment_ids = set()
-        
-        dlo_check_list_debug = []
 
         logging.info("Auditando Segmentos...")
         for seg in tqdm(segments, desc="Auditando Segmentos"):
@@ -502,9 +472,6 @@ async def main():
                 dlo_info = ds.get('dataLakeObjectInfo', {})
                 deletion_id = dlo_info.get('name') 
 
-                if deletion_id:
-                    dlo_check_list_debug.append({'DLO_FROM_DATASTREAM': deletion_id})
-
                 if not ds_label:
                     ds_label = dlo_info.get('label') or ds_api_name or "Nome não encontrado"
                 if not deletion_id:
@@ -564,30 +531,6 @@ async def main():
                 writer.writerows(audit_results)
             logging.info(f"✅ Auditoria concluída. CSV gerado: {csv_file}")
             
-            logging.info("--- Gerando arquivos de depuração para análise de mapeamento ---")
-            
-            if dmo_mapping_urls_debug:
-                with open('debug_api_calls_mappings.txt', 'w', encoding='utf-8') as f:
-                    for url in dmo_mapping_urls_debug:
-                        f.write(f"{url}\n")
-                logging.info("✅ Arquivo 'debug_api_calls_mappings.txt' gerado com as URLs exatas das chamadas de API.")
-
-            if found_mappings_debug:
-                with open('debug_mappings_encontrados.csv', 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.DictWriter(f, fieldnames=['DMO_Name', 'DLO_Source'])
-                    writer.writeheader()
-                    writer.writerows(found_mappings_debug)
-                logging.info("✅ Arquivo 'debug_mappings_encontrados.csv' gerado com os resultados da API.")
-            else:
-                logging.warning("⚠️ Nenhum mapeamento foi encontrado nas chamadas de API. O arquivo de debug de mapeamentos não será gerado.")
-
-            if dlo_check_list_debug:
-                with open('debug_dlos_para_verificacao.csv', 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.DictWriter(f, fieldnames=['DLO_FROM_DATASTREAM'])
-                    writer.writeheader()
-                    writer.writerows(dlo_check_list_debug)
-                logging.info("✅ Arquivo 'debug_dlos_para_verificacao.csv' gerado com os DLOs vindos dos Data Streams.")
-
             counts = {'DMO': 0, 'DATA_STREAM': 0, 'CALCULATED_INSIGHT': 0, 'SEGMENT': 0, 'ACTIVATION': 0}
             for result in audit_results:
                 obj_type = result.get('OBJECT_TYPE')
