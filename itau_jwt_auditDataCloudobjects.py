@@ -1,18 +1,17 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.47 (Versão Final Estável + Funcionalidades)
+Versão: 10.49 (Versão Final Estável + Funcionalidades)
 - BASE ESTÁVEL: Script construído a partir da v10.37 para garantir a ausência de
   erros '400 Bad Request' e 'AttributeError'.
 - FUNCIONALIDADE COMPLETA: Mantida a busca de 'CreatedById' para DMOs, Segmentos
-  e Ativações, onde a API funciona de forma confiável.
-- CORREÇÃO DEFINITIVA (Data Stream Mappings): A verificação de mapeamento agora
-  é feita criando um conjunto de todos os DLOs usados por DMOs e verificando
-  contra ele. Esta é a forma mais robusta e corrige o erro anterior.
-- CORREÇÃO (Criador de DS/CI): Removida a tentativa de buscar o criador de Data
-  Streams e Calculated Insights via SOQL, pois os logs confirmaram que a API
-  não retorna dados. O campo será preenchido com 'Desconhecido', como nas
-  versões estáveis anteriores.
+  e Ativações.
+- CORREÇÃO FINALÍSSIMA (Data Stream Mappings): Implementada a busca massiva e
+  paralela de mapeamentos DLO->DMO utilizando o endpoint correto
+  '/ssot/data-model-object-mappings' para cada DMO. Esta é a fonte da verdade
+  e garante a precisão da auditoria.
+- CORREÇÃO (Criador de DS/CI): Mantida a lógica estável de 'Desconhecido' para
+  o criador de Data Streams e Calculated Insights devido à limitação da API.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -238,6 +237,25 @@ async def fetch_users_by_id(session, semaphore, user_ids):
         if record_list: all_users.extend(record_list)
     return all_users
 
+# --- NOVA FUNÇÃO HELPER ---
+async def fetch_dmo_mapping_sources(session, semaphore, dmo_name):
+    """Busca as fontes (DLOs) de um DMO específico."""
+    async with semaphore:
+        endpoint = f"/services/data/{API_VERSION}/ssot/data-model-object-mappings?dataspace=default&dmoDeveloperName={dmo_name}"
+        try:
+            kwargs = {'ssl': VERIFY_SSL}
+            if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
+            async with session.get(endpoint, **kwargs) as response:
+                response.raise_for_status()
+                data = await response.json()
+                mappings = data.get("objectSourceTargetMaps", [])
+                if mappings:
+                    source_dlos = [m.get("sourceEntityDeveloperName") for m in mappings if m.get("sourceEntityDeveloperName")]
+                    return source_dlos
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logging.warning(f"Não foi possível buscar o mapeamento para o DMO {dmo_name}: {e}")
+        return []
+
 # --- Main Audit Logic ---
 async def main():
     auth_data = get_access_token()
@@ -251,7 +269,6 @@ async def main():
         
         dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
-        # Usando as queries simplificadas que se provaram estáveis
         activation_attributes_query = "SELECT Id, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
         contact_point_query = "SELECT Id, CreatedById FROM MktSgmntActvtnContactPoint"
         
@@ -326,15 +343,19 @@ async def main():
         
         dmos_from_activation_csv = read_activation_usage_csv()
         
-        # --- INÍCIO DA CORREÇÃO DEFINITIVA DE MAPEAMENTO ---
-        # Cria um conjunto de todos os DLOs que são usados como fonte para DMOs.
+        # --- LÓGICA DE MAPEAMENTO FINAL ---
+        logging.info("--- Etapa 5: Buscando mapeamentos DLO -> DMO de forma massiva ---")
+        dmo_names = [dmo.get('DeveloperName') for dmo in dmo_tooling_data if dmo.get('DeveloperName')]
+        mapping_tasks = [fetch_dmo_mapping_sources(session, semaphore, name) for name in dmo_names]
+        
+        mapping_results = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos DLO->DMO")
+        
         dlos_mapped_to_dmos = set()
-        for dmo in dm_objects:
-            # A chave 'dataSourceName' na metadata do DMO indica o DLO de origem.
-            if dlo_source_name := dmo.get('dataSourceName'):
-                dlos_mapped_to_dmos.add(dlo_source_name)
-        logging.info(f"🔎 Encontrados {len(dlos_mapped_to_dmos)} DLOs que estão mapeados para DMOs.")
-        # --- FIM DA CORREÇÃO DEFINITIVA DE MAPEAMENTO ---
+        for dlo_list in mapping_results:
+            if dlo_list:
+                dlos_mapped_to_dmos.update(dlo_list)
+        logging.info(f"🔎 Encontrados {len(dlos_mapped_to_dmos)} DLOs únicos que estão mapeados para DMOs.")
+        # --- FIM DA LÓGICA DE MAPEAMENTO ---
 
         dmos_used_by_segments = {normalize_api_name(s.get('SegmentMembershipTable')) for s in segments if s.get('SegmentMembershipTable')}
         dmos_used_by_data_graphs = {normalize_api_name(obj.get('developerName')) for dg in data_graphs for obj in [dg.get('dgObject', {})] + dg.get('dgObject', {}).get('relatedObjects', []) if obj.get('developerName')}
@@ -449,22 +470,18 @@ async def main():
                 ds_label = ds.get('label')
                 ds_api_name = ds.get('name')
                 dlo_info = ds.get('dataLakeObjectInfo', {})
-                deletion_id = dlo_info.get('name') # Este é o nome do DLO, ex: NomeObjeto__dll
+                deletion_id = dlo_info.get('name') 
 
                 if not ds_label:
                     ds_label = dlo_info.get('label') or ds_api_name or "Nome não encontrado"
                 if not deletion_id:
                     deletion_id = f"{ds_api_name}__dll" if ds_api_name else "ID de Exclusão não encontrado"
 
-                # Lógica estável para nome do criador, devido à limitação da API
                 creator_name = 'Desconhecido'
 
-                # --- LÓGICA DE MAPEAMENTO CORRIGIDA ---
                 has_field_mappings = bool(ds.get('mappings'))
-                # Verifica se o DLO deste Data Stream está no conjunto de DLOs mapeados a DMOs
                 is_mapped_to_dmo = deletion_id in dlos_mapped_to_dmos
                 has_mappings = has_field_mappings or is_mapped_to_dmo
-                # --- FIM DA LÓGICA DE MAPEAMENTO CORRIGIDA ---
                 
                 if not has_mappings:
                     reason = "Inativo (sem ingestão > 30d e sem mapeamentos)"
@@ -491,7 +508,6 @@ async def main():
                 days_inactive = days_since(last_processed)
                 ci_name = ci.get('name')
                 
-                # Lógica estável para nome do criador, devido à limitação da API
                 creator_name = 'Desconhecido'
 
                 reason = "Inativo (último processamento bem-sucedido > 90d)"
