@@ -2,12 +2,11 @@
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
 Versão: 11.00 (Versão Final Consolidada)
-- BASE ESTÁVEL: Script baseado na v10.60, incorporando todas as correções.
+- BASE ESTÁVEL: Script construído a partir da v10.60, incorporando todas as correções.
 - CORREÇÃO (Erro 400 em Segmentos): Implementada uma estratégia híbrida. A busca
   em massa de segmentos via Bulk API agora pede apenas campos simples. Os campos
   complexos ('IncludeCriteria', 'ExcludeCriteria') são buscados depois, via API
-  REST, apenas para o subconjunto de segmentos inativos, garantindo estabilidade
-  e performance sem estourar limites.
+  REST, apenas para o subconjunto de segmentos inativos, garantindo estabilidade e performance.
 - LÓGICA CONSOLIDADA: Todas as funções principais, incluindo 'fetch_records_in_bulk'
   e 'execute_query_job', foram mantidas para as chamadas onde são estáveis.
 - FUNCIONALIDADE COMPLETA: Todas as lógicas de auditoria, otimização de chamadas
@@ -289,7 +288,14 @@ async def main():
             fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/data-actions", semaphore, 'dataActions'),
         ]
         
-        results = await tqdm.gather(*initial_tasks, return_exceptions=True, desc="Coletando metadados iniciais")
+        async def run_safely(coro):
+            try:
+                return await coro
+            except Exception as e:
+                return e
+
+        safe_initial_tasks = [run_safely(task) for task in initial_tasks]
+        results = await tqdm.gather(*safe_initial_tasks, desc="Coletando metadados iniciais")
         
         task_names = ["DMO Tooling", "Segment IDs", "DMO Metadata", "Activation Attributes", "Calculated Insights", "Data Streams", "Data Graphs", "Data Actions"]
         final_results = []
@@ -322,6 +328,7 @@ async def main():
         segment_publications = { str(act.get('MarketSegmentId') or '')[:15]: parse_sf_date(act.get('LastModifiedDate')) for act in activation_details if act.get('MarketSegmentId') and act.get('LastModifiedDate')}
 
         logging.info(f"--- Etapa 3: Buscando detalhes de {len(segment_ids)} segmentos (Estratégia Híbrida)... ---")
+        
         segment_fields_simple = ["Id", "Name", "SegmentMembershipTable", "SegmentStatus", "CreatedById"]
         segments = await fetch_records_in_bulk(session, semaphore, "MarketSegment", segment_fields_simple, segment_ids)
         segments_map = {s['Id']: s for s in segments}
@@ -392,7 +399,7 @@ async def main():
             for m in mappings:
                 if dlo_name := m.get("sourceEntityDeveloperName"):
                     dlos_mapped_to_dmos.add(dlo_name)
-
+        
         logging.info(f"🔎 Encontrados {len(dlos_mapped_to_dmos)} DLOs únicos que estão mapeados para DMOs.")
 
         dmos_used_by_segments = {normalize_api_name(s.get('SegmentMembershipTable')) for s in segments if s.get('SegmentMembershipTable')}
@@ -409,6 +416,7 @@ async def main():
             parent_name = get_segment_name(seg)
             for criteria_field in ['IncludeCriteria', 'ExcludeCriteria']:
                 criteria_str = seg.get(criteria_field)
+                if not criteria_str: continue # Adicionado para segurança
                 find_items_in_criteria(criteria_str, 'developerName', dmos_used_in_segment_criteria)
                 nested_ids_found = set()
                 find_items_in_criteria(criteria_str, 'segmentId', nested_ids_found)
