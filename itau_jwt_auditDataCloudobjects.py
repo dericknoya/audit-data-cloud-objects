@@ -471,7 +471,7 @@ async def main():
             valid_dates = [d for d in [refresh_date, ingest_date] if d]
             last_updated = max(valid_dates, default=None)
             # --- FIM DA CORREÇÃO ---
-
+            
             if not last_updated or last_updated < thirty_days_ago:
                 days_inactive = days_since(last_updated)
                 
@@ -502,7 +502,7 @@ async def main():
                     'OBJECT_TYPE': 'DATA_STREAM', 
                     'STATUS': 'N/A', 
                     'REASON': reason, 
-                    'TIPO_ATIVIDADE': 'Última Atividade', 
+                    'TIPO_ATIVIDADE': 'Última Ingestão', 
                     'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 
                     'CREATED_BY_NAME': creator_name, 
                     'DELETION_IDENTIFIER': deletion_id
