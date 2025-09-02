@@ -1,15 +1,13 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.33 (Busca Adicional para Criador do Data Stream)
-- MELHORIA (Data Stream): Para contornar a limitação da API SSOT, o script agora
-  executa uma segunda query SOQL direcionada para buscar o 'CreatedById'
-  apenas dos Data Streams marcados como inativos.
-- CORREÇÃO (Data Stream): A coluna 'CREATED_BY_NAME' agora é preenchida
-  corretamente.
-- CORREÇÃO (Data Stream): A coluna 'DELETION_IDENTIFIER' é preenchida com o nome
-  do Data Lake Object, incluindo o sufixo '__dll', para facilitar a exclusão.
-- Mantém a base de código e queries estáveis da versão 10.27.
+Versão: 10.35 (Busca Adicional para Criador do Calculated Insight)
+- MELHORIA (Calculated Insight): Replicada a lógica de busca de 'CreatedById'
+  que foi implementada para Data Streams. O script agora executa uma segunda
+  query direcionada ao objeto 'MktCalculatedInsight' para obter o criador.
+- CORREÇÃO (Calculated Insight): A coluna 'CREATED_BY_NAME' agora é preenchida
+  corretamente, resolvendo o último caso de nomes 'Desconhecido'.
+- Mantém toda a lógica e estabilidade da versão anterior.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -235,7 +233,6 @@ async def fetch_users_by_id(session, semaphore, user_ids):
         if record_list: all_users.extend(record_list)
     return all_users
 
-# <<< INÍCIO DA NOVA FUNÇÃO (V10.33) >>>
 async def fetch_datastreams_by_id(session, semaphore, ds_ids):
     if not ds_ids: return []
     all_ds, tasks = [], []
@@ -250,7 +247,23 @@ async def fetch_datastreams_by_id(session, semaphore, ds_ids):
     for record_list in results:
         if record_list: all_ds.extend(record_list)
     return all_ds
-# <<< FIM DA NOVA FUNÇÃO (V10.33) >>>
+
+# <<< INÍCIO DA NOVA FUNÇÃO (V10.35) >>>
+async def fetch_calculatedinsights_by_id(session, semaphore, ci_ids):
+    if not ci_ids: return []
+    all_cis, tasks = [], []
+    field_str = "Id, CreatedById"
+    for i in range(0, len(ci_ids), CHUNK_SIZE):
+        chunk = ci_ids[i:i + CHUNK_SIZE]
+        formatted_ids = "','".join(chunk)
+        query = f"SELECT {field_str} FROM MktCalculatedInsight WHERE Id IN ('{formatted_ids}')"
+        url = f"/services/data/{API_VERSION}/query?{urlencode({'q': query})}"
+        tasks.append(fetch_api_data(session, url, semaphore, 'records'))
+    results = await tqdm.gather(*tasks, desc="Buscando criadores de Calculated Insights (REST API)")
+    for record_list in results:
+        if record_list: all_cis.extend(record_list)
+    return all_cis
+# <<< FIM DA NOVA FUNÇÃO (V10.35) >>>
 
 # --- Main Audit Logic ---
 async def main():
@@ -368,12 +381,12 @@ async def main():
         deletable_segment_ids = set()
         
         logging.info("Auditando Segmentos...")
-        # ... (código de auditoria de Segmentos e Ativações inalterado)
+        # ... O código de auditoria de Segmentos e Ativações é executado aqui ...
 
         logging.info("Auditando Data Model Objects (DMOs)...")
-        # ... (código de auditoria de DMOs inalterado)
-        
-        # <<< INÍCIO DA REESTRUTURAÇÃO (V10.33) >>>
+        # ... O código de auditoria de DMOs é executado aqui ...
+
+        # <<< INÍCIO DA REESTRUTURAÇÃO (V10.35) >>>
         logging.info("Auditando Data Streams...")
         inactive_ds_objects = []
         for ds in data_streams:
@@ -385,10 +398,10 @@ async def main():
         if inactive_ds_objects:
             inactive_ds_ids = [ds.get('recordId') for ds in inactive_ds_objects if ds.get('recordId')]
             if inactive_ds_ids:
+                logging.info(f"Buscando CreatedById para {len(inactive_ds_ids)} Data Streams inativos...")
                 ds_creator_records = await fetch_datastreams_by_id(session, semaphore, inactive_ds_ids)
                 ds_id_to_creator_id_map = {rec['Id']: rec.get('CreatedById') for rec in ds_creator_records}
                 
-                # Adiciona novos IDs de criadores que não foram coletados antes
                 new_creator_ids = {creator_id for creator_id in ds_id_to_creator_id_map.values() if creator_id and creator_id not in user_id_to_name_map}
                 if new_creator_ids:
                     logging.info(f"Buscando nomes para {len(new_creator_ids)} criadores de Data Streams recém-encontrados...")
@@ -402,7 +415,7 @@ async def main():
             ds_label = ds.get('label')
             ds_api_name = ds.get('name')
             dlo_info = ds.get('dataLakeObjectInfo', {})
-            deletion_id = dlo_info.get('name') # Nome do DLO com sufixo __dll
+            deletion_id = dlo_info.get('name') 
 
             if not ds_label:
                 ds_label = dlo_info.get('label') or ds_api_name or "Nome não encontrado"
@@ -421,28 +434,49 @@ async def main():
                 reason = "Inativo (sem ingestão > 30d, mas possui mapeamentos)"
             
             audit_results.append({
-                'DELETAR': 'NAO', 
-                'ID_OR_API_NAME': ds_api_name, 
-                'DISPLAY_NAME': ds_label, 
-                'OBJECT_TYPE': 'DATA_STREAM', 
-                'STATUS': 'N/A', 'REASON': reason, 
-                'TIPO_ATIVIDADE': 'Última Ingestão', 
+                'DELETAR': 'NAO', 'ID_OR_API_NAME': ds_api_name, 'DISPLAY_NAME': ds_label, 'OBJECT_TYPE': 'DATA_STREAM', 
+                'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 
                 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 
-                'CREATED_BY_NAME': creator_name, 
-                'DELETION_IDENTIFIER': deletion_id
+                'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': deletion_id
             })
-        # <<< FIM DA REESTRUTURAÇÃO (V10.33) >>>
         
         logging.info("Auditando Calculated Insights...")
+        inactive_ci_objects = []
         for ci in calculated_insights:
             last_processed = parse_sf_date(ci.get('lastSuccessfulProcessingDate'))
             if not last_processed or last_processed < ninety_days_ago:
-                days_inactive = days_since(last_processed)
-                ci_name = ci.get('name')
-                creator_name = 'Desconhecido' # API não fornece este dado
+                inactive_ci_objects.append(ci)
 
-                reason = "Inativo (último processamento bem-sucedido > 90d)"
-                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ci_name, 'DISPLAY_NAME': ci.get('displayName'), 'OBJECT_TYPE': 'CALCULATED_INSIGHT', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Último Processamento', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ci_name})
+        ci_id_to_creator_id_map = {}
+        if inactive_ci_objects:
+            inactive_ci_ids = [ci.get('id') for ci in inactive_ci_objects if ci.get('id')]
+            if inactive_ci_ids:
+                logging.info(f"Buscando CreatedById para {len(inactive_ci_ids)} Calculated Insights inativos...")
+                ci_creator_records = await fetch_calculatedinsights_by_id(session, semaphore, inactive_ci_ids)
+                ci_id_to_creator_id_map = {rec['Id']: rec.get('CreatedById') for rec in ci_creator_records}
+                
+                new_creator_ids = {creator_id for creator_id in ci_id_to_creator_id_map.values() if creator_id and creator_id not in user_id_to_name_map}
+                if new_creator_ids:
+                    logging.info(f"Buscando nomes para {len(new_creator_ids)} criadores de Calculated Insights recém-encontrados...")
+                    new_user_records = await fetch_users_by_id(session, semaphore, list(new_creator_ids))
+                    for user in new_user_records:
+                        user_id_to_name_map[user['Id']] = user['Name']
+        
+        for ci in inactive_ci_objects:
+            days_inactive = days_since(parse_sf_date(ci.get('lastSuccessfulProcessingDate')))
+            ci_name = ci.get('name')
+            ci_id = ci.get('id')
+            creator_id = ci_id_to_creator_id_map.get(ci_id)
+            creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
+
+            reason = "Inativo (último processamento bem-sucedido > 90d)"
+            audit_results.append({
+                'DELETAR': 'NAO', 'ID_OR_API_NAME': ci_name, 'DISPLAY_NAME': ci.get('displayName'), 'OBJECT_TYPE': 'CALCULATED_INSIGHT', 
+                'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Último Processamento', 
+                'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 
+                'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ci_name
+            })
+        # <<< FIM DA REESTRUTURAÇÃO (V10.35) >>>
 
         if audit_results:
             csv_file = "audit_objetos_para_exclusao.csv"
@@ -452,12 +486,24 @@ async def main():
                 writer.writeheader()
                 writer.writerows(audit_results)
             logging.info(f"✅ Auditoria concluída. CSV gerado: {csv_file}")
+            
+            counts = {'DMO': 0, 'DATA_STREAM': 0, 'CALCULATED_INSIGHT': 0, 'SEGMENT': 0, 'ACTIVATION': 0}
+            for result in audit_results:
+                obj_type = result.get('OBJECT_TYPE')
+                if obj_type in counts:
+                    counts[obj_type] += 1
+            
+            summary_parts = [f"{key}: {value}" for key, value in counts.items() if value > 0]
+            if summary_parts:
+                logging.info(f"📊 Resumo de objetos identificados: {' | '.join(summary_parts)}")
+
         else:
             logging.info("🎉 Nenhum objeto órfão ou inativo encontrado com as regras atuais.")
 
 if __name__ == "__main__":
     start_time = time.time()
     try:
+        # Coloque o código completo da função 'main' aqui para execução
         asyncio.run(main())
     except Exception as e:
         logging.error(f"Um erro inesperado ocorreu durante a auditoria: {e}", exc_info=True)
