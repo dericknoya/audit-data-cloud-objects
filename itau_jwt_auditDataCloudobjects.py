@@ -1,18 +1,15 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.51 (Versão Final Estável + Funcionalidades)
+Versão: 10.52 (Versão Final Estável + Funcionalidades)
 - BASE ESTÁVEL: Script construído a partir da v10.37.
-- OTIMIZAÇÃO (API Calls): Implementado filtro para a busca de mapeamentos. O
-  script agora ignora DMOs com prefixos conhecidos (ssot, unified, etc.),
-  reduzindo drasticamente o número de chamadas à API, economizando limites e
-  acelerando a execução.
-- MELHORIA (Error Handling): Ajustado o tratamento de erro 500 na busca de
-  mapeamentos. Como este erro é o comportamento esperado para DMOs sem mapa,
-  o log foi suavizado de 'WARNING' para 'INFO' para não poluir o console com
-  falsos alarmes.
-- CORREÇÃO (API Limits): Mantido o semáforo de concorrência em 5 para garantir
-  a estabilidade das chamadas.
+- NOVO (Debug): Adicionada a geração de dois arquivos CSV de depuração
+  ('debug_mappings_encontrados.csv' e 'debug_dlos_para_verificacao.csv') para
+  diagnosticar por que os mapeamentos DLO->DMO não estão sendo encontrados.
+- OTIMIZAÇÃO (API Calls): Mantido o filtro para a busca de mapeamentos para
+  reduzir o número de chamadas à API.
+- MELHORIA (Error Handling): Mantido o tratamento de erro 500 na busca de
+  mapeamentos como comportamento esperado.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -247,15 +244,17 @@ async def fetch_dmo_mapping_sources(session, semaphore, dmo_name):
             if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
             async with session.get(endpoint, **kwargs) as response:
                 if response.status == 500:
-                    # Log em nível INFO pois é um comportamento esperado da API para DMOs sem mapeamento.
-                    # logging.info(f"DMO {dmo_name} não possui mapeamento ou retornou erro 500.")
                     return []
                 
                 response.raise_for_status()
                 data = await response.json()
                 mappings = data.get("objectSourceTargetMaps", [])
                 if mappings:
-                    source_dlos = [m.get("sourceEntityDeveloperName") for m in mappings if m.get("sourceEntityDeveloperName")]
+                    # Retorna uma lista de tuplas (DMO, DLO) para depuração
+                    source_dlos = [
+                        (m.get("targetEntityDeveloperName"), m.get("sourceEntityDeveloperName"))
+                        for m in mappings if m.get("sourceEntityDeveloperName")
+                    ]
                     return source_dlos
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logging.warning(f"Não foi possível buscar o mapeamento para o DMO {dmo_name}: {e}")
@@ -351,7 +350,6 @@ async def main():
         logging.info("--- Etapa 5: Buscando mapeamentos DLO -> DMO de forma massiva ---")
         all_dmo_names = [dmo.get('DeveloperName') for dmo in dmo_tooling_data if dmo.get('DeveloperName')]
         
-        # --- OTIMIZAÇÃO: Filtra a lista de DMOs para evitar chamadas desnecessárias ---
         dmo_names_to_query = [
             name for name in all_dmo_names 
             if not any(name.lower().startswith(p) for p in dmo_prefixes_to_exclude)
@@ -362,10 +360,16 @@ async def main():
         
         mapping_results = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos DLO->DMO")
         
+        # --- LÓGICA DE DEBUG ---
+        found_mappings_debug = []
         dlos_mapped_to_dmos = set()
-        for dlo_list in mapping_results:
-            if dlo_list:
-                dlos_mapped_to_dmos.update(dlo_list)
+        for mapping_list in mapping_results:
+            if mapping_list:
+                for dmo_name, dlo_name in mapping_list:
+                    dlos_mapped_to_dmos.add(dlo_name)
+                    found_mappings_debug.append({'DMO_Name': dmo_name, 'DLO_Source': dlo_name})
+        # --- FIM DA LÓGICA DE DEBUG ---
+
         logging.info(f"🔎 Encontrados {len(dlos_mapped_to_dmos)} DLOs únicos que estão mapeados para DMOs.")
 
         dmos_used_by_segments = {normalize_api_name(s.get('SegmentMembershipTable')) for s in segments if s.get('SegmentMembershipTable')}
@@ -397,7 +401,13 @@ async def main():
         audit_results = []
         deletable_segment_ids = set()
         
+        # --- LÓGICA DE DEBUG ---
+        dlo_check_list_debug = []
+        # --- FIM DA LÓGICA DE DEBUG ---
+
         logging.info("Auditando Segmentos...")
+        # (O restante do código permanece o mesmo)
+
         for seg in tqdm(segments, desc="Auditando Segmentos"):
             seg_id = str(get_segment_id(seg) or '')[:15];
             if not seg_id: continue
@@ -483,6 +493,11 @@ async def main():
                 dlo_info = ds.get('dataLakeObjectInfo', {})
                 deletion_id = dlo_info.get('name') 
 
+                # --- LÓGICA DE DEBUG ---
+                if deletion_id:
+                    dlo_check_list_debug.append({'DLO_FROM_DATASTREAM': deletion_id})
+                # --- FIM DA LÓGICA DE DEBUG ---
+
                 if not ds_label:
                     ds_label = dlo_info.get('label') or ds_api_name or "Nome não encontrado"
                 if not deletion_id:
@@ -522,18 +537,7 @@ async def main():
                 creator_name = 'Desconhecido'
 
                 reason = "Inativo (último processamento bem-sucedido > 90d)"
-                audit_results.append({
-                    'DELETAR': 'NAO', 
-                    'ID_OR_API_NAME': ci_name, 
-                    'DISPLAY_NAME': ci.get('displayName'), 
-                    'OBJECT_TYPE': 'CALCULATED_INSIGHT', 
-                    'STATUS': 'N/A', 
-                    'REASON': reason, 
-                    'TIPO_ATIVIDADE': 'Último Processamento', 
-                    'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 
-                    'CREATED_BY_NAME': creator_name, 
-                    'DELETION_IDENTIFIER': ci_name
-                })
+                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ci_name, 'DISPLAY_NAME': ci.get('displayName'), 'OBJECT_TYPE': 'CALCULATED_INSIGHT', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'Último Processamento', 'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ci_name})
 
         if audit_results:
             csv_file = "audit_objetos_para_exclusao.csv"
@@ -544,6 +548,25 @@ async def main():
                 writer.writerows(audit_results)
             logging.info(f"✅ Auditoria concluída. CSV gerado: {csv_file}")
             
+            # --- LÓGICA DE DEBUG ---
+            logging.info("--- Gerando arquivos de depuração para análise de mapeamento ---")
+            if found_mappings_debug:
+                with open('debug_mappings_encontrados.csv', 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=['DMO_Name', 'DLO_Source'])
+                    writer.writeheader()
+                    writer.writerows(found_mappings_debug)
+                logging.info("✅ Arquivo 'debug_mappings_encontrados.csv' gerado com os resultados da API.")
+            else:
+                logging.warning("⚠️ Nenhum mapeamento foi encontrado nas chamadas de API. O arquivo de debug de mapeamentos não será gerado.")
+
+            if dlo_check_list_debug:
+                with open('debug_dlos_para_verificacao.csv', 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=['DLO_FROM_DATASTREAM'])
+                    writer.writeheader()
+                    writer.writerows(dlo_check_list_debug)
+                logging.info("✅ Arquivo 'debug_dlos_para_verificacao.csv' gerado com os DLOs vindos dos Data Streams.")
+            # --- FIM DA LÓGICA DE DEBUG ---
+
             counts = {'DMO': 0, 'DATA_STREAM': 0, 'CALCULATED_INSIGHT': 0, 'SEGMENT': 0, 'ACTIVATION': 0}
             for result in audit_results:
                 obj_type = result.get('OBJECT_TYPE')
