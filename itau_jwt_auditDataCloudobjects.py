@@ -1,7 +1,7 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.44 (Versão Final Estável + Funcionalidades)
+Versão: 10.45 (Versão Final Estável + Funcionalidades)
 - BASE ESTÁVEL: Script construído a partir da v10.37 para garantir a ausência de
   erros '400 Bad Request' e 'AttributeError'.
 - FUNCIONALIDADE COMPLETA: Inclui as funções para buscar o 'CreatedById' de
@@ -238,7 +238,6 @@ async def fetch_users_by_id(session, semaphore, user_ids):
 async def fetch_creators_by_name(session, semaphore, object_name, names, name_field='Name'):
     if not names: return {}
     records, tasks = [], []
-    # Usamos Name para DataStream e MktCalculatedInsight, e DeveloperName para DMOs
     field_str = f"{name_field}, CreatedById"
     for i in range(0, len(names), CHUNK_SIZE):
         chunk = names[i:i + CHUNK_SIZE]
@@ -296,6 +295,10 @@ async def main():
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
         dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions, contact_point_usages = final_results
         
+        now = datetime.now(timezone.utc)
+        thirty_days_ago = now - timedelta(days=30)
+        ninety_days_ago = now - timedelta(days=90)
+
         dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
         logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
@@ -314,10 +317,6 @@ async def main():
         segments = await fetch_records_in_bulk(session, semaphore, "MarketSegment", segment_fields_to_query, segment_ids)
         logging.info("✅ Detalhes de segmento coletados. Iniciando busca por nomes de criadores...")
 
-        now = datetime.now(timezone.utc)
-        thirty_days_ago = now - timedelta(days=30)
-        ninety_days_ago = now - timedelta(days=90)
-        
         all_creator_ids = set()
         collections_with_creators = [dmo_tooling_data, activation_attributes, activation_details, segments]
         for collection in collections_with_creators:
@@ -409,7 +408,7 @@ async def main():
                 act_name = next((attr.get('Name') for attr in activation_attributes if attr.get('MarketSegmentActivationId') == act_id), 'Nome não encontrado')
                 creator_name = user_id_to_name_map.get(act_detail.get('CreatedById'), 'Desconhecido')
                 reason = f'Órfã (associada a segmento inativo e sem vínculos: {seg_id})'
-                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': act_id, 'DISPLAY_NAME': act_name, 'OBJECT_TYPE': 'ACTIVATION', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'N/A', 'DIAS_ATIVIDADE': 'N/A', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': act_name})
+                audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': act_id, 'DISPLAY_NAME': act_name, 'OBJECT_TYPE': 'ACTIVATION', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'N/A', 'DIAS_ATIVIDADE': 'N/A', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': act_id})
 
         logging.info("Auditando Data Model Objects (DMOs)...")
         all_used_dmos = (dmos_used_by_segments | dmos_used_by_data_graphs | dmos_used_by_ci_relationships | dmos_used_in_data_actions | dmos_used_in_segment_criteria | dmos_from_activation_csv | dmos_used_in_contact_points)
@@ -475,7 +474,7 @@ async def main():
 
                 creator_id = ds_name_to_creator_map.get(ds_api_name)
                 creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
-                
+
                 has_mappings = bool(ds.get('mappings'))
                 
                 if not has_mappings:
