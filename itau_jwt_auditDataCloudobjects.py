@@ -1,7 +1,7 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.43 (Final Consolidada)
+Versão: 10.44 (Versão Final Estável + Funcionalidades)
 - BASE ESTÁVEL: Script construído a partir da v10.37 para garantir a ausência de
   erros '400 Bad Request' e 'AttributeError'.
 - FUNCIONALIDADE COMPLETA: Inclui as funções para buscar o 'CreatedById' de
@@ -238,6 +238,7 @@ async def fetch_users_by_id(session, semaphore, user_ids):
 async def fetch_creators_by_name(session, semaphore, object_name, names, name_field='Name'):
     if not names: return {}
     records, tasks = [], []
+    # Usamos Name para DataStream e MktCalculatedInsight, e DeveloperName para DMOs
     field_str = f"{name_field}, CreatedById"
     for i in range(0, len(names), CHUNK_SIZE):
         chunk = names[i:i + CHUNK_SIZE]
@@ -313,6 +314,10 @@ async def main():
         segments = await fetch_records_in_bulk(session, semaphore, "MarketSegment", segment_fields_to_query, segment_ids)
         logging.info("✅ Detalhes de segmento coletados. Iniciando busca por nomes de criadores...")
 
+        now = datetime.now(timezone.utc)
+        thirty_days_ago = now - timedelta(days=30)
+        ninety_days_ago = now - timedelta(days=90)
+        
         all_creator_ids = set()
         collections_with_creators = [dmo_tooling_data, activation_attributes, activation_details, segments]
         for collection in collections_with_creators:
@@ -322,11 +327,7 @@ async def main():
                 if isinstance(item, dict):
                     if creator_id := (item.get('CreatedById') or item.get('createdById')):
                         all_creator_ids.add(creator_id)
-        
-        now = datetime.now(timezone.utc)
-        thirty_days_ago = now - timedelta(days=30)
-        ninety_days_ago = now - timedelta(days=90)
-        
+
         inactive_ds_names = [ds.get('name') for ds in data_streams if ds.get('name') and (not (ds.get('lastRefreshDate') or ds.get('lastIngestDate')) or parse_sf_date(ds.get('lastRefreshDate') or ds.get('lastIngestDate')) < thirty_days_ago)]
         inactive_ci_names = [ci.get('name') for ci in calculated_insights if ci.get('name') and (not ci.get('lastSuccessfulProcessingDate') or parse_sf_date(ci.get('lastSuccessfulProcessingDate')) < ninety_days_ago)]
         
@@ -462,11 +463,11 @@ async def main():
             if not last_updated or last_updated < thirty_days_ago:
                 days_inactive = days_since(last_updated)
                 
-                ds_label = ds.get('label') or ds.get('name')
+                ds_label = ds.get('label')
                 ds_api_name = ds.get('name')
                 dlo_info = ds.get('dataLakeObjectInfo', {})
-                deletion_id = dlo_info.get('name')
-                
+                deletion_id = dlo_info.get('name') 
+
                 if not ds_label:
                     ds_label = dlo_info.get('label') or ds_api_name or "Nome não encontrado"
                 if not deletion_id:
