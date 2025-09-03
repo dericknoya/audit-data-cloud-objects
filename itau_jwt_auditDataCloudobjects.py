@@ -2,15 +2,17 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 17.00 (Refinamento de Lógica e Correção de Regressões)
-- BASE: v16.05
-- CORREÇÃO (Created By Name): Restaurada a lógica que busca os nomes dos 
-  usuários criadores dos objetos. A coluna 'CREATED_BY_NAME' volta a ser
-  preenchida corretamente, eliminando a regressão que a fixava como "N/A".
-- REFINAMENTO (Data Streams): A lógica para identificar Data Streams órfãos
-  foi aprimorada. Em vez de verificar o array 'mappings' (indisponível na
-  API de listagem), o script agora verifica a existência de uma conexão com
-  um Data Lake Object (DLO), uma abordagem mais precisa e robusta.
+Versão: 17.01 (Correção Final de CreatedById)
+- BASE: v17.00
+- CORREÇÃO (CreatedById para DMOs e Data Streams): O script foi ajustado para
+  utilizar as fontes de dados corretas para obter o ID do criador de DMOs
+  (via Tooling API, objeto MktDataModelObject) e Data Streams (via Query API,
+  objeto DataStream).
+- COLETA DE DADOS OTIMIZADA: As consultas necessárias foram adicionadas, e a
+  coleta de IDs de usuários foi unificada para garantir que todos os nomes
+  sejam buscados corretamente em uma única chamada.
+- RESULTADO: A coluna 'CREATED_BY_NAME' agora é preenchida corretamente para
+  todos os tipos de objeto no relatório final.
 """
 import os
 import time
@@ -229,7 +231,7 @@ async def main():
     config = Config()
     setup_logging(config.LOG_FILE)
     
-    logging.info("🚀 Iniciando auditoria de objetos v17.00...")
+    logging.info("🚀 Iniciando auditoria de objetos v17.01...")
     auth_data = get_access_token(config)
     
     async with SalesforceClient(config, auth_data) as client:
@@ -242,11 +244,12 @@ async def main():
             "dmo_tooling": client.query_api("SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject", tooling=True),
             "all_segments": client.query_api("SELECT Id, Name, IncludeCriteria, ExcludeCriteria, CreatedById FROM MarketSegment"),
             "all_activations": client.query_api("SELECT Id, Name, MarketSegmentId, LastModifiedDate, CreatedById FROM MarketSegmentActivation"),
+            "datastream_sobjects": client.query_api("SELECT Id, Name, CreatedById FROM DataStream"), # <--- NOVA CONSULTA
             "dmo_metadata": client.get_ssot_metadata("DataModelObject"),
             "calculated_insights": client.get_ssot_metadata("CalculatedInsight", key_name='records'),
             "data_graphs": client.get_ssot_endpoint("data-graphs/metadata", key_name='dataGraphMetadata'),
             "data_actions": client.get_ssot_endpoint("data-actions", key_name='dataActions'),
-            "data_streams": client.get_ssot_endpoint("data-streams", key_name='dataStreams'),
+            "data_streams_ssot": client.get_ssot_endpoint("data-streams", key_name='dataStreams'),
         }
         results = await tqdm.gather(*tasks.values(), desc="Coletando dados da API")
         data = dict(zip(tasks.keys(), results))
@@ -254,9 +257,9 @@ async def main():
         # ETAPA 2: Processamento e Mapeamento de Dependências
         logging.info("--- Etapa 2/4: Processando dados e mapeando dependências... ---")
 
-        ### LÓGICA RESTAURADA: Buscar nomes de usuários ###
+        ### LÓGICA CORRIGIDA: Coleta unificada de IDs de criadores ###
         all_creator_ids = set()
-        for key in ["dmo_tooling", "all_segments", "all_activations"]:
+        for key in ["dmo_tooling", "all_segments", "all_activations", "datastream_sobjects"]:
             if data.get(key):
                 for item in data[key]:
                     if creator_id := item.get('CreatedById'):
@@ -264,13 +267,14 @@ async def main():
         
         user_id_to_name_map = {}
         if all_creator_ids:
-            logging.info(f"Buscando nomes para {len(all_creator_ids)} criadores...")
+            logging.info(f"Buscando nomes para {len(all_creator_ids)} criadores únicos...")
             user_ids_str = "','".join(list(all_creator_ids))
             user_records = await client.query_api(f"SELECT Id, Name FROM User WHERE Id IN ('{user_ids_str}')")
             if user_records:
                 user_id_to_name_map = {user['Id']: user['Name'] for user in user_records}
         
         dmo_details_map = {rec.get('DeveloperName'): rec for rec in data.get('dmo_tooling', [])}
+        datastream_details_map = {rec.get('Name'): rec for rec in data.get('datastream_sobjects', [])}
         dmos_used = defaultdict(list)
         for dmo in dmos_from_csv: dmos_used[dmo].append("Ativação (CSV)")
         
@@ -316,11 +320,10 @@ async def main():
                 if str(act.get('MarketSegmentId', ''))[:15] in deletable_segment_ids:
                     audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': act.get('Id'), 'DISPLAY_NAME': act.get('Name'), 'OBJECT_TYPE': 'ACTIVATION', 'STATUS': 'Órfã', 'REASON': 'Associada a um segmento órfão.', 'TIPO_ATIVIDADE': 'N/A', 'DIAS_ATIVIDADE': 'N/A', 'CREATED_BY_NAME': user_id_to_name_map.get(act.get('CreatedById'), 'Desconhecido'), 'DELETION_IDENTIFIER': act.get('Id')})
 
-        if streams_data := data.get('data_streams'):
-            for ds in streams_data:
+        if streams_data_ssot := data.get('data_streams_ssot'):
+            for ds in streams_data_ssot:
                 last_ingest = parse_sf_date(ds.get('lastIngestDate'))
                 if not last_ingest or days_since(last_ingest) > config.INACTIVE_STREAM_DAYS:
-                    ### LÓGICA REFINADA: Verifica a conexão com DLO em vez de 'mappings' ###
                     has_dlo_connection = bool(ds.get('dataLakeObjectInfo'))
                     status, reason = "", ""
                     dlo_name = ds.get('dataLakeObjectInfo', {}).get('name', 'N/A')
@@ -328,7 +331,12 @@ async def main():
                         status, reason = "Órfão", f"Última ingestão > {config.INACTIVE_STREAM_DAYS} dias e sem conexão com um DLO."
                     else: 
                         status, reason = "Inativo", f"Última ingestão > {config.INACTIVE_STREAM_DAYS} dias, mas possui conexão com DLO: {dlo_name}."
-                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds.get('name'), 'DISPLAY_NAME': ds.get('label'), 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': status, 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_since(last_ingest) or f'>{config.INACTIVE_STREAM_DAYS}', 'CREATED_BY_NAME': "N/A", 'DELETION_IDENTIFIER': ds.get('id')})
+                    
+                    ### LÓGICA CORRIGIDA: Busca o criador no mapa de Data Streams ###
+                    ds_details = datastream_details_map.get(ds.get('name'), {})
+                    creator_name = user_id_to_name_map.get(ds_details.get('CreatedById'), 'Desconhecido')
+                    
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds.get('name'), 'DISPLAY_NAME': ds.get('label'), 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': status, 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_since(last_ingest) or f'>{config.INACTIVE_STREAM_DAYS}', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds.get('id')})
         
         logging.info("Auditando DMOs...")
         if dmo_metadata := data.get('dmo_metadata'):
@@ -343,7 +351,9 @@ async def main():
                 if not is_in_use and is_old_enough:
                     has_mappings = await client.check_dmo_mappings(dmo_api_name)
                     if not has_mappings:
-                        audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': dmo_api_name, 'DISPLAY_NAME': dmo.get('displayName', dmo_api_name), 'OBJECT_TYPE': 'DMO', 'STATUS': 'Órfão', 'REASON': f"Criado > {config.ORPHAN_DMO_DAYS} dias, sem uso conhecido e sem mapeamentos de ingestão.", 'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_since(created_date) or f'>{config.ORPHAN_DMO_DAYS}', 'CREATED_BY_NAME': user_id_to_name_map.get(dmo_details.get('CreatedById'), 'Desconhecido'), 'DELETION_IDENTIFIER': dmo_details.get('Id', 'ID não encontrado')})
+                        ### LÓGICA CORRIGIDA: Busca o criador no mapa de DMOs ###
+                        creator_name = user_id_to_name_map.get(dmo_details.get('CreatedById'), 'Desconhecido')
+                        audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': dmo_api_name, 'DISPLAY_NAME': dmo.get('displayName', dmo_api_name), 'OBJECT_TYPE': 'DMO', 'STATUS': 'Órfão', 'REASON': f"Criado > {config.ORPHAN_DMO_DAYS} dias, sem uso conhecido e sem mapeamentos de ingestão.", 'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_since(created_date) or f'>{config.ORPHAN_DMO_DAYS}', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': dmo_details.get('Id', 'ID não encontrado')})
         
         # ETAPA 4: Geração do Relatório
         logging.info("--- Etapa 4/4: Gerando relatório CSV... ---")
