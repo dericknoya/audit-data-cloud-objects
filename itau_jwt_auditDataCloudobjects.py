@@ -1,14 +1,12 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 14.01 (Regras de Negócio Redefinidas)
-- BASE ESTÁVEL: Script construído a partir da v10.37.
-- CORREÇÃO (NameError): Corrigido o erro 'NameError: name 'item' is not defined'
-  que ocorria devido a um laço 'for' incompleto na coleta de IDs de criadores,
-  impedindo a execução completa do script.
+Versão: 14.02 (Versão Final Estável)
+- BASE ESTÁVEL: Script construído a partir da v13.01.
+- CORREÇÃO (NameError): Corrigido o erro 'NameError: name 'get_segment_id' is
+  not defined' que ocorria devido à remoção acidental da função auxiliar
+  correspondente.
 - REGRAS DE NEGÓCIO: Mantida a lógica de auditoria redefinida na v14.00.
-- ESTABILIDADE: Mantidas todas as correções de estabilidade de API e UX das
-  versões anteriores.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -143,7 +141,6 @@ def normalize_api_name(name):
     return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
 
 def find_dmos_in_payload(payload, dmo_set):
-    """Busca DMOs em um payload JSON, procurando por várias chaves possíveis."""
     if not payload: return
     try:
         data = json.loads(html.unescape(str(payload))) if isinstance(payload, str) else payload
@@ -162,10 +159,9 @@ def find_dmos_in_payload(payload, dmo_set):
     except (json.JSONDecodeError, TypeError): return
 
 def find_segments_in_criteria(criteria_str, segment_set):
-    """Busca IDs de segmentos aninhados nos critérios."""
     if not criteria_str: return
     try:
-        criteria_json = json.loads(html.unescape(str(criteria_str))) if isinstance(criteria_str, str) else criteria_str
+        criteria_json = json.loads(html.unescape(str(criteria_str))) if isinstance(criteria_str, str) else criteria_json
         def recurse(obj):
             if isinstance(obj, dict):
                 for key, value in obj.items():
@@ -179,6 +175,7 @@ def find_segments_in_criteria(criteria_str, segment_set):
         recurse(criteria_json)
     except (json.JSONDecodeError, TypeError): return
 
+def get_segment_id(seg): return seg.get('Id') # <-- FUNÇÃO ADICIONADA DE VOLTA
 def get_segment_name(seg): return seg.get('Name') or '(Sem nome)'
 def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('name') or '(Sem nome)'
 
@@ -240,7 +237,7 @@ async def main():
 
         all_creator_ids = set()
         for collection in [dmo_tooling_data, activation_attributes, activation_details, segments]:
-            for item in collection: # <--- CORREÇÃO DO BUG AQUI
+            for item in collection:
                 if creator_id := item.get('CreatedById'):
                     all_creator_ids.add(creator_id)
 
@@ -352,6 +349,19 @@ async def main():
                     'DIAS_ATIVIDADE': days_since(last_updated) if last_updated else ">30",
                     'CREATED_BY_NAME': 'Desconhecido',
                     'DELETION_IDENTIFIER': dlo_name or ds.get('name')
+                })
+        
+        logging.info("Auditando Calculated Insights...")
+        for ci in calculated_insights:
+            last_processed = parse_sf_date(ci.get('lastSuccessfulProcessingDate'))
+            if not last_processed or last_processed < ninety_days_ago:
+                 audit_results.append({
+                    'DELETAR': 'NAO', 'ID_OR_API_NAME': ci.get('name'),
+                    'DISPLAY_NAME': ci.get('displayName'), 'OBJECT_TYPE': 'CALCULATED_INSIGHT', 'STATUS': 'Inativo',
+                    'REASON': "Inativo: Último processamento bem-sucedido > 90 dias.", 'TIPO_ATIVIDADE': 'Último Processamento',
+                    'DIAS_ATIVIDADE': days_since(last_processed) if last_processed else '>90',
+                    'CREATED_BY_NAME': 'Desconhecido',
+                    'DELETION_IDENTIFIER': ci.get('name')
                 })
 
         if audit_results:
