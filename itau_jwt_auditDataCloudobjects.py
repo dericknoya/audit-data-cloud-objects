@@ -1,12 +1,14 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 14.02 (Versão Final Estável)
-- BASE ESTÁVEL: Script construído a partir da v13.01.
-- CORREÇÃO (NameError): Corrigido o erro 'NameError: name 'get_segment_id' is
-  not defined' que ocorria devido à remoção acidental da função auxiliar
-  correspondente.
+Versão: 14.03 (Versão Final Estável + Debug de DMOs)
+- BASE ESTÁVEL: Script baseado na v14.02.
+- NOVO (Debug de DMOs): Adicionada a geração do arquivo 'debug_dmos_encontrados_em_segmentos.csv'.
+  Este arquivo lista todos os DMOs que o script encontrou dentro dos critérios
+  dos segmentos, permitindo uma depuração precisa da lógica de detecção de dependências.
 - REGRAS DE NEGÓCIO: Mantida a lógica de auditoria redefinida na v14.00.
+- ESTABILIDADE: Mantidas todas as correções de estabilidade de API e bugs
+  das versões anteriores.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -141,6 +143,7 @@ def normalize_api_name(name):
     return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
 
 def find_dmos_in_payload(payload, dmo_set):
+    """Busca DMOs em um payload JSON, procurando por várias chaves possíveis."""
     if not payload: return
     try:
         data = json.loads(html.unescape(str(payload))) if isinstance(payload, str) else payload
@@ -159,6 +162,7 @@ def find_dmos_in_payload(payload, dmo_set):
     except (json.JSONDecodeError, TypeError): return
 
 def find_segments_in_criteria(criteria_str, segment_set):
+    """Busca IDs de segmentos aninhados nos critérios."""
     if not criteria_str: return
     try:
         criteria_json = json.loads(html.unescape(str(criteria_str))) if isinstance(criteria_str, str) else criteria_json
@@ -175,7 +179,7 @@ def find_segments_in_criteria(criteria_str, segment_set):
         recurse(criteria_json)
     except (json.JSONDecodeError, TypeError): return
 
-def get_segment_id(seg): return seg.get('Id') # <-- FUNÇÃO ADICIONADA DE VOLTA
+def get_segment_id(seg): return seg.get('Id')
 def get_segment_name(seg): return seg.get('Name') or '(Sem nome)'
 def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('name') or '(Sem nome)'
 
@@ -350,7 +354,7 @@ async def main():
                     'CREATED_BY_NAME': 'Desconhecido',
                     'DELETION_IDENTIFIER': dlo_name or ds.get('name')
                 })
-        
+
         logging.info("Auditando Calculated Insights...")
         for ci in calculated_insights:
             last_processed = parse_sf_date(ci.get('lastSuccessfulProcessingDate'))
@@ -372,7 +376,16 @@ async def main():
                 writer.writeheader()
                 writer.writerows(audit_results)
             logging.info(f"✅ Auditoria concluída. CSV gerado: {csv_file}")
-            
+
+            # --- GERAÇÃO DE ARQUIVO DE DEBUG ---
+            if dmos_used_in_segments:
+                with open('debug_dmos_encontrados_em_segmentos.csv', 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['DMO_NORMALIZED_NAME_FOUND_IN_SEGMENTS'])
+                    for dmo_name in sorted(list(dmos_used_in_segments)):
+                        writer.writerow([dmo_name])
+                logging.info("✅ Arquivo 'debug_dmos_encontrados_em_segmentos.csv' gerado.")
+
             counts = {t: 0 for t in ['DMO', 'DATA_STREAM', 'CALCULATED_INSIGHT', 'SEGMENT', 'ACTIVATION']}
             for result in audit_results:
                  if result.get('OBJECT_TYPE') in counts:
