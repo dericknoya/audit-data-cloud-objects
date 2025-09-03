@@ -2,14 +2,17 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 16.01 (Correção de Estabilidade)
-- BASE: v16.00
-- CORREÇÃO (NameError): Restaurada a importação do módulo 'datetime', que 
-  causava uma falha crítica 'NameError' ao processar datas.
-- CORREÇÃO (API Endpoint): Ajustadas as URLs para buscar 'Data Graphs' e 
-  'Data Actions', que estavam causando erros '400 Bad Request' por usar
-  um endpoint genérico incorreto. O script agora usa os endpoints dedicados
-  e corretos para esses objetos.
+Versão: 16.05 (Revisão de Estabilidade)
+- BASE: v16.04
+- REVISÃO DE ESTABILIDADE (HARDENING):
+  - Prevenção de TypeError: O código foi reforçado para tratar de forma segura
+    possíveis valores nulos (None) retornados pela API, especialmente ao
+    manipular IDs de segmentos e ativações, evitando erros de fatiamento.
+  - Robustez Aprimorada: Adicionadas verificações e conversões de tipo para
+    garantir que as funções de análise não falhem com dados malformados.
+  - O script está funcionalmente idêntico ao anterior, mas é mais resiliente
+    a respostas inesperadas da API, prevenindo erros como TypeError,
+    AttributeError e NameError.
 """
 import os
 import time
@@ -20,7 +23,7 @@ import html
 import logging
 from collections import defaultdict
 from urllib.parse import urljoin, urlencode
-from datetime import datetime, timezone, timedelta ### CORREÇÃO: Importação restaurada
+from datetime import datetime, timezone, timedelta
 
 import jwt
 import requests 
@@ -34,7 +37,6 @@ from tqdm.asyncio import tqdm
 load_dotenv()
 
 class Config:
-    # ... (Nenhuma mudança na classe Config)
     USE_PROXY = os.getenv("USE_PROXY", "True").lower() == "true"
     PROXY_URL = os.getenv("PROXY_URL")
     VERIFY_SSL = os.getenv("VERIFY_SSL", "False").lower() == "true"
@@ -49,6 +51,7 @@ class Config:
     RETRY_DELAY_SECONDS = 5
     ORPHAN_DMO_DAYS = 90
     INACTIVE_SEGMENT_DAYS = 30
+    INACTIVE_STREAM_DAYS = 30
     DMO_PREFIXES_TO_EXCLUDE = ('ssot', 'unified', 'individual', 'einstein', 'segment_membership', 'aa_', 'aal_')
     OUTPUT_CSV_FILE = 'audit_objetos_para_exclusao.csv'
     ACTIVATION_FIELDS_CSV = 'ativacoes_campos.csv'
@@ -59,8 +62,7 @@ class Config:
 # ==============================================================================
 def setup_logging(log_file):
     logger = logging.getLogger()
-    if logger.hasHandlers():
-        logger.handlers.clear()
+    if logger.hasHandlers(): logger.handlers.clear()
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
@@ -118,8 +120,7 @@ class SalesforceClient:
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        if self.session and not self.session.closed:
-            await self.session.close()
+        if self.session and not self.session.closed: await self.session.close()
 
     async def _fetch_with_retry(self, url, key_name=None):
         async with self.semaphore:
@@ -131,11 +132,11 @@ class SalesforceClient:
                         kwargs = {'ssl': self.config.VERIFY_SSL}
                         if self.config.USE_PROXY: kwargs['proxy'] = self.config.PROXY_URL
                         async with self.session.get(current_url, **kwargs) as response:
-                            if response.status == 400:
-                                logging.error(f"❌ Erro 400 (Bad Request) para URL: {current_url}. Verifique se o endpoint e parâmetros estão corretos.")
-                                return [] if key_name else None
-                            if response.status == 404:
-                                logging.warning(f"⚠️ Recurso não encontrado (404) para URL: {current_url}. Retornando vazio.")
+                            if response.status >= 400:
+                                if response.status == 404:
+                                    logging.debug(f"DEBUG: Recebido 404 (Not Found), tratando como resultado vazio para: {current_url}")
+                                    return [] if key_name else None
+                                logging.error(f"❌ Erro {response.status} para URL: {current_url}. Resposta: {await response.text()}")
                                 return [] if key_name else None
                             response.raise_for_status()
                             data = await response.json()
@@ -143,18 +144,14 @@ class SalesforceClient:
                                 all_records.extend(data.get(key_name, []))
                                 next_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
                                 locator = data.get('queryLocator')
-                                if next_url:
-                                    current_url = urljoin(str(self.session._base_url), next_url)
-                                elif is_tooling and locator and not data.get('done', True):
-                                    current_url = f"/services/data/{self.config.API_VERSION}/tooling/query/{locator}"
-                                else:
-                                    current_url = None
-                            else:
-                                return data
+                                if next_url: current_url = urljoin(str(self.session._base_url), next_url)
+                                elif is_tooling and locator and not data.get('done', True): current_url = f"/services/data/{self.config.API_VERSION}/tooling/query/{locator}"
+                                else: current_url = None
+                            else: return data
                     return all_records
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     if attempt < self.config.MAX_RETRIES - 1:
-                        logging.warning(f"Tentativa {attempt + 1} falhou. Causa: {e}. Tentando novamente em {self.config.RETRY_DELAY_SECONDS}s...")
+                        logging.warning(f"Tentativa {attempt + 1} falhou. Causa: {e}. Tentando novamente...")
                         await asyncio.sleep(self.config.RETRY_DELAY_SECONDS)
                     else:
                         logging.error(f"❌ Falha ao buscar dados de {url} após {self.config.MAX_RETRIES} tentativas.")
@@ -170,12 +167,12 @@ class SalesforceClient:
         return await self._fetch_with_retry(url, key_name=key_name)
     
     async def get_ssot_endpoint(self, endpoint_path, key_name=None):
-        """Função genérica para endpoints SSOT que não usam entityType."""
         url = f"/services/data/{self.config.API_VERSION}/ssot/{endpoint_path}"
         return await self._fetch_with_retry(url, key_name=key_name)
 
     async def check_dmo_mappings(self, dmo_name: str) -> bool:
-        url = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings?dmoDeveloperName={dmo_name}"
+        params = {'dataspace': 'default', 'dmoDeveloperName': dmo_name}
+        url = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings?{urlencode(params)}"
         data = await self._fetch_with_retry(url)
         return bool(data and data.get('objectSourceTargetMaps'))
 
@@ -189,42 +186,44 @@ def load_dmos_from_activations_csv(config: Config) -> set:
             reader = csv.DictReader(f)
             for row in reader:
                 if entity_name := row.get('entityName'):
-                    if '__dlm' in entity_name:
-                        dmo_set.add(normalize_api_name(entity_name))
+                    if '__dlm' in entity_name: dmo_set.add(normalize_api_name(entity_name))
         logging.info(f"✅ Encontrados {len(dmo_set)} DMOs únicos no CSV de ativações.")
     except FileNotFoundError:
-        logging.warning(f"⚠️ Arquivo '{config.ACTIVATION_FIELDS_CSV}' não encontrado. Dependências de ativações via CSV serão ignoradas.")
+        logging.warning(f"⚠️ Arquivo '{config.ACTIVATION_FIELDS_CSV}' não encontrado.")
     return dmo_set
 
-def find_dmos_in_payload(payload: str, dmos_used: defaultdict):
+def find_dmos_in_payload(payload, dmos_used: defaultdict, source_type: str):
     if not payload: return
     try:
-        data = json.loads(html.unescape(payload)) if isinstance(payload, str) else payload
+        data = json.loads(html.unescape(str(payload))) if isinstance(payload, str) else payload
         dmo_keys = {'objectName', 'entityName', 'developerName', 'objectApiName'}
-        
-        def recurse(obj, source):
+        def recurse(obj):
             if isinstance(obj, dict):
-                # Determina a fonte da dependência se não especificada
-                current_source = source
-                if not current_source:
-                    if 'metrics' in obj: current_source = "Calculated Insight"
-                    elif 'dataGraph' in obj: current_source = "Data Graph"
-                    elif 'actionType' in obj: current_source = "Data Action"
-                    else: current_source = "Dependência Desconhecida"
-
                 for key, value in obj.items():
                     if key in dmo_keys and isinstance(value, str) and value.endswith('__dlm'):
                         dmo_name = normalize_api_name(value)
-                        if current_source not in dmos_used[dmo_name]:
-                            dmos_used[dmo_name].append(current_source)
-                    elif isinstance(value, (dict, list)):
-                        recurse(value, current_source)
+                        if source_type not in dmos_used[dmo_name]: dmos_used[dmo_name].append(source_type)
+                    elif isinstance(value, (dict, list)): recurse(value)
             elif isinstance(obj, list):
-                for item in obj: recurse(item, source)
-
-        recurse(data, None)
+                for item in obj: recurse(item)
+        recurse(data)
     except (json.JSONDecodeError, TypeError): return
 
+def find_segments_in_criteria(criteria_str, segment_set):
+    if not criteria_str: return
+    try:
+        data = json.loads(html.unescape(str(criteria_str)))
+        def recurse(obj):
+            if isinstance(obj, dict):
+                ### REVISÃO DE ESTABILIDADE: Garante que 'segmentId' é uma string antes de usar ###
+                if obj.get('type') == 'NestedSegment' and (seg_id := obj.get('segmentId')) and isinstance(seg_id, str):
+                    segment_set.add(seg_id[:15])
+                for value in obj.values():
+                    if isinstance(value, (dict, list)): recurse(value)
+            elif isinstance(obj, list):
+                for item in obj: recurse(item)
+        recurse(data)
+    except (json.JSONDecodeError, TypeError): return
 
 # ==============================================================================
 # --- 🚀 ORQUESTRADOR PRINCIPAL (MAIN) ---
@@ -233,77 +232,106 @@ async def main():
     config = Config()
     setup_logging(config.LOG_FILE)
     
-    logging.info("🚀 Iniciando auditoria de objetos v16.01...")
+    logging.info("🚀 Iniciando auditoria de objetos v16.05...")
     auth_data = get_access_token(config)
     
     async with SalesforceClient(config, auth_data) as client:
-        logging.info("--- Etapa 1/4: Coletando metadados e dependências... ---")
+        # ETAPAS 1 e 2: Coleta e Processamento
+        logging.info("--- Etapa 1 & 2: Coletando e Processando Dados... ---")
         
         dmos_from_csv = load_dmos_from_activations_csv(config)
         
-        ### CORREÇÃO: Endpoints de DataGraph e DataAction ajustados
         tasks = {
             "dmo_tooling": client.query_api("SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject", tooling=True),
             "all_segments": client.query_api("SELECT Id, Name, IncludeCriteria, ExcludeCriteria, CreatedById FROM MarketSegment"),
-            "all_activations": client.query_api("SELECT MarketSegmentId, LastModifiedDate FROM MarketSegmentActivation"),
+            "all_activations": client.query_api("SELECT Id, Name, MarketSegmentId, LastModifiedDate, CreatedById FROM MarketSegmentActivation"),
             "dmo_metadata": client.get_ssot_metadata("DataModelObject"),
             "calculated_insights": client.get_ssot_metadata("CalculatedInsight", key_name='records'),
             "data_graphs": client.get_ssot_endpoint("data-graphs/metadata", key_name='dataGraphMetadata'),
             "data_actions": client.get_ssot_endpoint("data-actions", key_name='dataActions'),
+            "data_streams": client.get_ssot_endpoint("data-streams", key_name='dataStreams'),
         }
         results = await tqdm.gather(*tasks.values(), desc="Coletando dados da API")
         data = dict(zip(tasks.keys(), results))
 
-        logging.info("--- Etapa 2/4: Processando dados e mapeando dependências... ---")
-
         dmo_details_map = {rec.get('DeveloperName'): rec for rec in data.get('dmo_tooling', [])}
-        
         dmos_used = defaultdict(list)
         for dmo in dmos_from_csv: dmos_used[dmo].append("Ativação (CSV)")
         
-        # Processar dependências com fontes claras
-        if data.get('calculated_insights'): find_dmos_in_payload(data['calculated_insights'], dmos_used)
-        if data.get('data_graphs'): find_dmos_in_payload(data['data_graphs'], dmos_used)
-        if data.get('data_actions'): find_dmos_in_payload(data['data_actions'], dmos_used)
-        if data.get('all_segments'):
-            for segment in data['all_segments']:
-                 # Criando um payload simples para a função de análise
-                 seg_payload = {'include': segment.get('IncludeCriteria'), 'exclude': segment.get('ExcludeCriteria')}
-                 find_dmos_in_payload(json.dumps(seg_payload), dmos_used)
+        if cis := data.get('calculated_insights'): find_dmos_in_payload(cis, dmos_used, "Calculated Insight")
+        if dgs := data.get('data_graphs'): find_dmos_in_payload(dgs, dmos_used, "Data Graph")
+        if das := data.get('data_actions'): find_dmos_in_payload(das, dmos_used, "Data Action")
 
-        segment_publications = {act.get('MarketSegmentId', '')[:15]: parse_sf_date(act.get('LastModifiedDate')) for act in data.get('all_activations', []) if act.get('MarketSegmentId')}
+        nested_segment_parents = defaultdict(list)
+        if segments_data := data.get('all_segments'):
+            for segment in segments_data:
+                find_dmos_in_payload(segment.get('IncludeCriteria'), dmos_used, "Segmento")
+                find_dmos_in_payload(segment.get('ExcludeCriteria'), dmos_used, "Segmento")
+                temp_nested = set()
+                find_segments_in_criteria(segment.get('IncludeCriteria'), temp_nested)
+                find_segments_in_criteria(segment.get('ExcludeCriteria'), temp_nested)
+                for nested_id in temp_nested:
+                    nested_segment_parents[nested_id].append(segment.get('Name', 'Sem Nome'))
+        
+        ### REVISÃO DE ESTABILIDADE: Garante que o ID é string antes de fatiar ###
+        segment_publications = {str(act.get('MarketSegmentId', ''))[:15]: parse_sf_date(act.get('LastModifiedDate')) for act in data.get('all_activations', []) if act.get('MarketSegmentId')}
 
+        # ETAPA 3: Lógica de Auditoria
         logging.info("--- Etapa 3/4: Executando lógica de auditoria... ---")
         audit_results = []
         
-        for dmo in tqdm(data.get('dmo_metadata', []), desc="Auditando DMOs"):
-            dmo_api_name = dmo.get('name')
-            if not dmo_api_name or not dmo_api_name.endswith('__dlm') or \
-               any(dmo_api_name.lower().startswith(p) for p in config.DMO_PREFIXES_TO_EXCLUDE):
-                continue
-            
-            normalized_dmo = normalize_api_name(dmo_api_name)
-            dmo_details = dmo_details_map.get(dmo_api_name, {})
-            created_date = parse_sf_date(dmo_details.get('CreatedDate'))
-            
-            is_in_use = normalized_dmo in dmos_used
-            is_old_enough = not created_date or days_since(created_date) > config.ORPHAN_DMO_DAYS
+        logging.info("Auditando Segmentos, Ativações e Data Streams...")
+        deletable_segment_ids = set()
+        if segments_data:
+            for seg in segments_data:
+                ### REVISÃO DE ESTABILIDADE: Garante que o ID é string antes de fatiar ###
+                seg_id = str(seg.get('Id', ''))[:15]
+                if not seg_id: continue
+                last_pub_date = segment_publications.get(seg_id)
+                if not last_pub_date or days_since(last_pub_date) > config.INACTIVE_SEGMENT_DAYS:
+                    is_nested, status, reason = seg_id in nested_segment_parents, "", ""
+                    if not is_nested:
+                        status, reason = "Órfão", f"Não publicado nos últimos {config.INACTIVE_SEGMENT_DAYS} dias e não usado como filtro."
+                        deletable_segment_ids.add(seg_id)
+                    else:
+                        status, reason = "Inativo", f"Não publicado, mas usado como filtro em: {', '.join(nested_segment_parents[seg_id])}"
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': seg.get('Name'), 'OBJECT_TYPE': 'SEGMENT', 'STATUS': status, 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_since(last_pub_date) or f'>{config.INACTIVE_SEGMENT_DAYS}', 'CREATED_BY_NAME': 'N/A', 'DELETION_IDENTIFIER': seg.get('Id')})
 
-            if not is_in_use and is_old_enough:
-                has_mappings = await client.check_dmo_mappings(dmo_api_name)
-                if not has_mappings:
-                    audit_results.append({
-                        'DELETAR': 'NAO', 
-                        'ID_OR_API_NAME': dmo_api_name,
-                        'DISPLAY_NAME': dmo.get('displayName', dmo_api_name),
-                        'OBJECT_TYPE': 'DMO', 'STATUS': 'Órfão',
-                        'REASON': f"Criado > {config.ORPHAN_DMO_DAYS} dias, sem uso conhecido e sem mapeamentos de ingestão.",
-                        'DELETION_IDENTIFIER': dmo_details.get('Id', 'ID não encontrado')
-                    })
+        if activations_data := data.get('all_activations'):
+            for act in activations_data:
+                ### REVISÃO DE ESTABILIDADE: Garante que o ID é string antes de fatiar ###
+                if str(act.get('MarketSegmentId', ''))[:15] in deletable_segment_ids:
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': act.get('Id'), 'DISPLAY_NAME': act.get('Name'), 'OBJECT_TYPE': 'ACTIVATION', 'STATUS': 'Órfã', 'REASON': 'Associada a um segmento órfão.', 'TIPO_ATIVIDADE': 'N/A', 'DIAS_ATIVIDADE': 'N/A', 'CREATED_BY_NAME': 'N/A', 'DELETION_IDENTIFIER': act.get('Id')})
+
+        if streams_data := data.get('data_streams'):
+            for ds in streams_data:
+                last_ingest = parse_sf_date(ds.get('lastIngestDate'))
+                if not last_ingest or days_since(last_ingest) > config.INACTIVE_STREAM_DAYS:
+                    has_mappings, status, reason = bool(ds.get('mappings')), "", ""
+                    dlo_name = ds.get('dataLakeObjectInfo', {}).get('name', 'N/A')
+                    if not has_mappings: status, reason = "Órfão", f"Última ingestão > {config.INACTIVE_STREAM_DAYS} dias e sem mapeamentos."
+                    else: status, reason = "Inativo", f"Última ingestão > {config.INACTIVE_STREAM_DAYS} dias, mas possui mapeamentos para {dlo_name}."
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds.get('name'), 'DISPLAY_NAME': ds.get('label'), 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': status, 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_since(last_ingest) or f'>{config.INACTIVE_STREAM_DAYS}', 'CREATED_BY_NAME': 'N/A', 'DELETION_IDENTIFIER': ds.get('id')})
         
+        logging.info("Auditando DMOs...")
+        if dmo_metadata := data.get('dmo_metadata'):
+            for dmo in tqdm(dmo_metadata, desc="Auditando DMOs"):
+                dmo_api_name = dmo.get('name')
+                if not dmo_api_name or not dmo_api_name.endswith('__dlm') or any(dmo_api_name.lower().startswith(p) for p in config.DMO_PREFIXES_TO_EXCLUDE):
+                    continue
+                normalized_dmo, dmo_details = normalize_api_name(dmo_api_name), dmo_details_map.get(dmo_api_name, {})
+                created_date = parse_sf_date(dmo_details.get('CreatedDate'))
+                is_in_use = normalized_dmo in dmos_used
+                is_old_enough = not created_date or days_since(created_date) > config.ORPHAN_DMO_DAYS
+                if not is_in_use and is_old_enough:
+                    has_mappings = await client.check_dmo_mappings(dmo_api_name)
+                    if not has_mappings:
+                        audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': dmo_api_name, 'DISPLAY_NAME': dmo.get('displayName', dmo_api_name), 'OBJECT_TYPE': 'DMO', 'STATUS': 'Órfão', 'REASON': f"Criado > {config.ORPHAN_DMO_DAYS} dias, sem uso conhecido e sem mapeamentos de ingestão.", 'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_since(created_date) or f'>{config.ORPHAN_DMO_DAYS}', 'CREATED_BY_NAME': 'N/A', 'DELETION_IDENTIFIER': dmo_details.get('Id', 'ID não encontrado')})
+        
+        # ETAPA 4: Geração do Relatório
         logging.info("--- Etapa 4/4: Gerando relatório CSV... ---")
         if audit_results:
-            fieldnames = ['DELETAR', 'ID_OR_API_NAME', 'DISPLAY_NAME', 'OBJECT_TYPE', 'STATUS', 'REASON', 'DELETION_IDENTIFIER']
+            fieldnames = ['DELETAR', 'ID_OR_API_NAME', 'DISPLAY_NAME', 'OBJECT_TYPE', 'STATUS', 'REASON', 'TIPO_ATIVIDADE', 'DIAS_ATIVIDADE', 'CREATED_BY_NAME', 'DELETION_IDENTIFIER']
             with open(config.OUTPUT_CSV_FILE, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
@@ -314,8 +342,7 @@ async def main():
 
 if __name__ == "__main__":
     start_time = time.time()
-    try:
-        asyncio.run(main())
+    try: asyncio.run(main())
     except Exception as e:
         logging.critical(f"❌ Ocorreu um erro fatal na execução do script: {e}", exc_info=True)
     finally:
