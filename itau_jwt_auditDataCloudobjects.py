@@ -1,15 +1,12 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 14.00 (Regras de Negócio Redefinidas)
-- REGRAS DE NEGÓCIO: A lógica de auditoria foi completamente reescrita para
-  seguir um novo conjunto de regras focado em dependências diretas, conforme
-  especificado.
-- DMOs: A verificação de DMOs órfãos agora é mais completa, incluindo a análise
-  de uso em Segmentos, Data Graphs, Calculated Insights e Data Actions.
-- Data Streams: A lógica foi simplificada. Um Data Stream é considerado órfão
-  ou inativo com base apenas na sua data de última ingestão e na presença
-  de mapeamentos de origem no payload da API.
+Versão: 14.01 (Regras de Negócio Redefinidas)
+- BASE ESTÁVEL: Script construído a partir da v10.37.
+- CORREÇÃO (NameError): Corrigido o erro 'NameError: name 'item' is not defined'
+  que ocorria devido a um laço 'for' incompleto na coleta de IDs de criadores,
+  impedindo a execução completa do script.
+- REGRAS DE NEGÓCIO: Mantida a lógica de auditoria redefinida na v14.00.
 - ESTABILIDADE: Mantidas todas as correções de estabilidade de API e UX das
   versões anteriores.
 
@@ -98,7 +95,6 @@ async def fetch_api_data(session, relative_url, semaphore, key_name=None):
                             next_page_url_v1 = data.get('nextRecordsUrl')
                             next_page_url_v2 = data.get('nextPageUrl')
                             query_locator = data.get('queryLocator')
-
                             next_page_path = next_page_url_v1 or next_page_url_v2
 
                             if next_page_path:
@@ -166,6 +162,7 @@ def find_dmos_in_payload(payload, dmo_set):
     except (json.JSONDecodeError, TypeError): return
 
 def find_segments_in_criteria(criteria_str, segment_set):
+    """Busca IDs de segmentos aninhados nos critérios."""
     if not criteria_str: return
     try:
         criteria_json = json.loads(html.unescape(str(criteria_str))) if isinstance(criteria_str, str) else criteria_str
@@ -243,7 +240,9 @@ async def main():
 
         all_creator_ids = set()
         for collection in [dmo_tooling_data, activation_attributes, activation_details, segments]:
-            if creator_id := item.get('CreatedById'): all_creator_ids.add(creator_id)
+            for item in collection: # <--- CORREÇÃO DO BUG AQUI
+                if creator_id := item.get('CreatedById'):
+                    all_creator_ids.add(creator_id)
 
         user_id_to_name_map = {}
         if all_creator_ids:
@@ -265,17 +264,10 @@ async def main():
                 for nested_id in temp_nested_ids:
                     nested_segment_parents.setdefault(nested_id, []).append(get_segment_name(seg))
 
-        dmos_used_in_data_graphs = set()
-        for dg in data_graphs:
-            find_dmos_in_payload(dg, dmos_used_in_data_graphs)
-
-        dmos_used_in_cis = set()
-        for ci in calculated_insights:
-            find_dmos_in_payload(ci, dmos_used_in_cis)
-
-        dmos_used_in_data_actions = set()
-        for da in data_actions:
-            find_dmos_in_payload(da, dmos_used_in_data_actions)
+        dmos_used_in_data_graphs, dmos_used_in_cis, dmos_used_in_data_actions = set(), set(), set()
+        for dg in data_graphs: find_dmos_in_payload(dg, dmos_used_in_data_graphs)
+        for ci in calculated_insights: find_dmos_in_payload(ci, dmos_used_in_cis)
+        for da in data_actions: find_dmos_in_payload(da, dmos_used_in_data_actions)
             
         all_used_dmos = dmos_used_in_segments.union(dmos_used_in_data_graphs, dmos_used_in_cis, dmos_used_in_data_actions)
 
@@ -302,7 +294,8 @@ async def main():
                     'DISPLAY_NAME': get_segment_name(seg), 'OBJECT_TYPE': 'SEGMENT', 'STATUS': status,
                     'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação',
                     'DIAS_ATIVIDADE': days_since(last_pub_date) if last_pub_date else '>30',
-                    'CREATED_BY_NAME': user_id_to_name_map.get(seg.get('CreatedById'), 'Desconhecido')
+                    'CREATED_BY_NAME': user_id_to_name_map.get(seg.get('CreatedById'), 'Desconhecido'),
+                    'DELETION_IDENTIFIER': get_segment_name(seg)
                 })
 
         for act_detail in activation_details:
@@ -314,7 +307,8 @@ async def main():
                     'DELETAR': 'NAO', 'ID_OR_API_NAME': act_id,
                     'DISPLAY_NAME': act_name, 'OBJECT_TYPE': 'ACTIVATION', 'STATUS': 'Órfã',
                     'REASON': f'Órfã: Associada a um segmento que foi identificado como órfão ({seg_id_short}).', 'TIPO_ATIVIDADE': 'N/A',
-                    'DIAS_ATIVIDADE': 'N/A', 'CREATED_BY_NAME': user_id_to_name_map.get(act_detail.get('CreatedById'), 'Desconhecido')
+                    'DIAS_ATIVIDADE': 'N/A', 'CREATED_BY_NAME': user_id_to_name_map.get(act_detail.get('CreatedById'), 'Desconhecido'),
+                    'DELETION_IDENTIFIER': act_name
                 })
 
         logging.info("Auditando Data Model Objects (DMOs)...")
@@ -333,7 +327,8 @@ async def main():
                     'REASON': "Órfão: Criado > 90 dias (ou data desconhecida) e não utilizado em Segmentos, Data Graphs, CIs ou Data Actions.", 
                     'TIPO_ATIVIDADE': 'Criação',
                     'DIAS_ATIVIDADE': days_since(created_date) if created_date else '>90',
-                    'CREATED_BY_NAME': user_id_to_name_map.get(dmo_details.get('CreatedById'), 'Desconhecido')
+                    'CREATED_BY_NAME': user_id_to_name_map.get(dmo_details.get('CreatedById'), 'Desconhecido'),
+                    'DELETION_IDENTIFIER': dmo_name
                 })
         
         logging.info("Auditando Data Streams...")
@@ -342,11 +337,11 @@ async def main():
             if not last_updated or last_updated < thirty_days_ago:
                 has_mappings = bool(ds.get('mappings'))
                 reason, status = "", ""
+                dlo_name = ds.get('dataLakeObjectInfo', {}).get('name', 'N/A')
                 if not has_mappings:
                     reason = "Órfão: A última atualização foi > 30 dias e o array 'mappings' está vazio."
                     status = "Órfão"
                 else:
-                    dlo_name = ds.get('dataLakeObjectInfo', {}).get('name', 'N/A')
                     reason = f"Inativo: A última atualização foi > 30 dias, mas possui mapeamentos para o DLO: {dlo_name}"
                     status = "Inativo"
                 
@@ -355,13 +350,14 @@ async def main():
                     'DISPLAY_NAME': ds.get('label'), 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': status,
                     'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão',
                     'DIAS_ATIVIDADE': days_since(last_updated) if last_updated else ">30",
-                    'CREATED_BY_NAME': 'Desconhecido'
+                    'CREATED_BY_NAME': 'Desconhecido',
+                    'DELETION_IDENTIFIER': dlo_name or ds.get('name')
                 })
-        
+
         if audit_results:
             csv_file = "audit_objetos_para_exclusao.csv"
             with open(csv_file, mode='w', newline='', encoding='utf-8') as f:
-                fieldnames = ['DELETAR', 'ID_OR_API_NAME', 'DISPLAY_NAME', 'OBJECT_TYPE', 'STATUS', 'REASON', 'TIPO_ATIVIDADE', 'DIAS_ATIVIDADE', 'CREATED_BY_NAME']
+                fieldnames = ['DELETAR', 'ID_OR_API_NAME', 'DISPLAY_NAME', 'OBJECT_TYPE', 'STATUS', 'REASON', 'TIPO_ATIVIDADE', 'DIAS_ATIVIDADE', 'CREATED_BY_NAME', 'DELETION_IDENTIFIER']
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(audit_results)
