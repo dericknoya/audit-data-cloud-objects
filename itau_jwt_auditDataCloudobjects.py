@@ -1,16 +1,17 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 11.00 (Versão Final Consolidada)
-- BASE ESTÁVEL: Script construído a partir da v10.60, incorporando todas as correções.
-- CORREÇÃO (Erro 400 em Segmentos): Implementada uma estratégia híbrida. A busca
-  em massa de segmentos via Bulk API agora pede apenas campos simples. Os campos
-  complexos ('IncludeCriteria', 'ExcludeCriteria') são buscados depois, via API
-  REST, apenas para o subconjunto de segmentos inativos, garantindo estabilidade e performance.
-- LÓGICA CONSOLIDADA: Todas as funções principais, incluindo 'fetch_records_in_bulk'
-  e 'execute_query_job', foram mantidas para as chamadas onde são estáveis.
-- FUNCIONALIDADE COMPLETA: Todas as lógicas de auditoria, otimização de chamadas
-  e melhorias de UX (barra de progresso) foram mantidas.
+Versão: 12.00 (Versão Final de Produção)
+- BASE ESTÁVEL: Script construído a partir da v10.37, incorporando todas as correções.
+- FUNCIONALIDADE (Criador de Data Stream): Implementada a busca do 'CreatedById'
+  para Data Streams inativos através de uma consulta em lote por ID, resolvendo a
+  questão do 'criador desconhecido' para este objeto.
+- FUNCIONALIDADE (Debug Aprimorado): Adicionada a geração do arquivo
+  'debug_datastream_mapping_check.csv', que detalha para cada Data Stream se seu
+  DLO correspondente foi encontrado na lista de mapeamentos, permitindo uma
+  auditoria completa e transparente.
+- ESTABILIDADE: Mantida a abordagem híbrida (Bulk + REST) para a busca de
+  Segmentos, garantindo performance e evitando erros '400 Bad Request'.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -40,7 +41,7 @@ load_dotenv()
 USE_PROXY = True
 PROXY_URL = os.getenv("PROXY_URL")
 VERIFY_SSL = False
-CHUNK_SIZE = 100 # Valor seguro para queries GET da API REST que podem ser longas
+CHUNK_SIZE = 100 
 MAX_RETRIES = 3
 RETRY_DELAY = 5 # segundos
 API_VERSION = "v64.0" 
@@ -349,18 +350,30 @@ async def main():
                     segments_map[criteria_detail['Id']].update(criteria_detail)
         
         segments = list(segments_map.values())
-        logging.info("✅ Detalhes de segmento coletados. Iniciando busca por nomes de criadores...")
+        logging.info("✅ Detalhes de segmento coletados.")
 
+        # --- ETAPA 3.5: Pré-busca de criadores de Data Streams inativos ---
+        logging.info("--- Etapa 3.5: Identificando criadores de Data Streams inativos ---")
+        inactive_ds_for_audit = [ds for ds in data_streams if not (parse_sf_date(ds.get('lastIngestDate'))) or parse_sf_date(ds.get('lastIngestDate')) < thirty_days_ago]
+        inactive_ds_ids = [ds.get('recordId') for ds in inactive_ds_for_audit if ds.get('recordId')]
+        ds_id_to_creator_id_map = {}
+
+        if inactive_ds_ids:
+            ds_creator_details = await fetch_records_by_ids_rest(session, semaphore, "DataStream", ["Id", "CreatedById"], inactive_ds_ids, "Buscando criadores de Data Stream")
+            ds_id_to_creator_id_map = {rec['Id']: rec.get('CreatedById') for rec in ds_creator_details}
+        
         all_creator_ids = set()
         collections_with_creators = [dmo_tooling_data, activation_attributes, activation_details, segments]
         for collection in collections_with_creators:
-            if not isinstance(collection, list):
-                continue
             for item in collection:
-                if isinstance(item, dict):
-                    if creator_id := (item.get('CreatedById') or item.get('createdById')):
-                        all_creator_ids.add(creator_id)
+                if isinstance(item, dict) and (creator_id := (item.get('CreatedById') or item.get('createdById'))):
+                    all_creator_ids.add(creator_id)
 
+        # Adiciona os IDs dos criadores de Data Streams ao conjunto principal
+        for creator_id in ds_id_to_creator_id_map.values():
+            if creator_id:
+                all_creator_ids.add(creator_id)
+        
         logging.info(f"Coletados {len(all_creator_ids)} IDs de criadores únicos para buscar nomes.")
         user_id_to_name_map = {}
         if all_creator_ids:
@@ -392,7 +405,6 @@ async def main():
         mapping_results = await tqdm.gather(*tasks, desc="Buscando Mapeamentos DLO->DMO")
         
         dlos_mapped_to_dmos = set()
-        
         for result in mapping_results:
             if not result or result.get('status') != 'success': continue
             mappings = result['data'].get("objectSourceTargetMaps", [])
@@ -416,7 +428,7 @@ async def main():
             parent_name = get_segment_name(seg)
             for criteria_field in ['IncludeCriteria', 'ExcludeCriteria']:
                 criteria_str = seg.get(criteria_field)
-                if not criteria_str: continue # Adicionado para segurança
+                if not criteria_str: continue
                 find_items_in_criteria(criteria_str, 'developerName', dmos_used_in_segment_criteria)
                 nested_ids_found = set()
                 find_items_in_criteria(criteria_str, 'segmentId', nested_ids_found)
@@ -496,40 +508,47 @@ async def main():
                     })
         
         logging.info("Auditando Data Streams...")
-        for ds in data_streams:
-            last_updated = parse_sf_date(ds.get('lastIngestDate'))
+        datastream_mapping_check_debug = []
+        for ds in inactive_ds_for_audit:
+            days_inactive = days_since(parse_sf_date(ds.get('lastIngestDate')))
+            ds_label = ds.get('label') or ds.get('name')
+            dlo_info = ds.get('dataLakeObjectInfo', {})
+            deletion_id = dlo_info.get('name') 
             
-            if not last_updated or last_updated < thirty_days_ago:
-                days_inactive = days_since(last_updated)
-                
-                ds_label = ds.get('label') or ds.get('name')
-                dlo_info = ds.get('dataLakeObjectInfo', {})
-                deletion_id = dlo_info.get('name') 
-                
-                if not deletion_id:
-                    deletion_id = f"{ds.get('name')}__dll" if ds.get('name') else "ID de Exclusão não encontrado"
+            if not deletion_id:
+                deletion_id = f"{ds.get('name')}__dll" if ds.get('name') else "ID de Exclusão não encontrado"
 
-                has_field_mappings = bool(ds.get('mappings'))
-                is_mapped_to_dmo = deletion_id in dlos_mapped_to_dmos
-                has_mappings = has_field_mappings or is_mapped_to_dmo
-                
-                if not has_mappings:
-                    reason = "Inativo (sem ingestão > 30d e sem mapeamentos)"
-                else:
-                    reason = "Inativo (sem ingestão > 30d, mas possui mapeamentos)"
-                
-                audit_results.append({
-                    'DELETAR': 'NAO', 
-                    'ID_OR_API_NAME': ds_label, 
-                    'DISPLAY_NAME': ds_label, 
-                    'OBJECT_TYPE': 'DATA_STREAM', 
-                    'STATUS': 'N/A', 
-                    'REASON': reason, 
-                    'TIPO_ATIVIDADE': 'Última Ingestão', 
-                    'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 
-                    'CREATED_BY_NAME': 'Desconhecido', 
-                    'DELETION_IDENTIFIER': deletion_id
-                })
+            ds_id = ds.get('recordId')
+            creator_id = ds_id_to_creator_id_map.get(ds_id)
+            creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido')
+
+            has_field_mappings = bool(ds.get('mappings'))
+            is_mapped_to_dmo = deletion_id in dlos_mapped_to_dmos
+            has_mappings = has_field_mappings or is_mapped_to_dmo
+            
+            datastream_mapping_check_debug.append({
+                'DATASTREAM_NAME': ds.get('name'),
+                'DLO_NAME': deletion_id,
+                'IS_MAPPED': is_mapped_to_dmo
+            })
+            
+            if not has_mappings:
+                reason = "Inativo (sem ingestão > 30d e sem mapeamentos)"
+            else:
+                reason = "Inativo (sem ingestão > 30d, mas possui mapeamentos)"
+            
+            audit_results.append({
+                'DELETAR': 'NAO', 
+                'ID_OR_API_NAME': ds_label, 
+                'DISPLAY_NAME': ds_label, 
+                'OBJECT_TYPE': 'DATA_STREAM', 
+                'STATUS': 'N/A', 
+                'REASON': reason, 
+                'TIPO_ATIVIDADE': 'Última Ingestão', 
+                'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 
+                'CREATED_BY_NAME': creator_name, 
+                'DELETION_IDENTIFIER': deletion_id
+            })
         
         logging.info("Auditando Calculated Insights...")
         for ci in calculated_insights:
@@ -558,6 +577,12 @@ async def main():
                 writer.writeheader()
                 writer.writerows(audit_results)
             logging.info(f"✅ Auditoria concluída. CSV gerado: {csv_file}")
+            
+            with open('debug_datastream_mapping_check.csv', 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=['DATASTREAM_NAME', 'DLO_NAME', 'IS_MAPPED'])
+                writer.writeheader()
+                writer.writerows(datastream_mapping_check_debug)
+            logging.info("✅ Arquivo 'debug_datastream_mapping_check.csv' gerado.")
             
             counts = {'DMO': 0, 'DATA_STREAM': 0, 'CALCULATED_INSIGHT': 0, 'SEGMENT': 0, 'ACTIVATION': 0}
             for result in audit_results:

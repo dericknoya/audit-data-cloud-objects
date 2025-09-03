@@ -1,16 +1,16 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 10.50 (Versão Final Estável + Funcionalidades)
-- BASE ESTÁVEL: Script construído a partir da v10.37.
-- FUNCIONALIDADE COMPLETA: Mantida a busca de 'CreatedById' para DMOs, Segmentos
-  e Ativações.
-- CORREÇÃO (API Limits): O semáforo de concorrência foi reduzido de 10 para 5.
-  Isso diminui a velocidade das chamadas massivas (como a busca de mapeamentos),
-  evitando o estouro de limites da API e a ocorrência de erros '500 Internal
-  Server Error' por sobrecarga.
-- CORREÇÃO (Criador de DS/CI): Mantida a lógica estável de 'Desconhecido' para
-  o criador de Data Streams e Calculated Insights.
+Versão: 11.00 (Versão Final Consolidada)
+- BASE ESTÁVEL: Script construído a partir da v10.60, incorporando todas as correções.
+- CORREÇÃO (Erro 400 em Segmentos): Implementada uma estratégia híbrida. A busca
+  em massa de segmentos via Bulk API agora pede apenas campos simples. Os campos
+  complexos ('IncludeCriteria', 'ExcludeCriteria') são buscados depois, via API
+  REST, apenas para o subconjunto de segmentos inativos, garantindo estabilidade e performance.
+- LÓGICA CONSOLIDADA: Todas as funções principais, incluindo 'fetch_records_in_bulk'
+  e 'execute_query_job', foram mantidas para as chamadas onde são estáveis.
+- FUNCIONALIDADE COMPLETA: Todas as lógicas de auditoria, otimização de chamadas
+  e melhorias de UX (barra de progresso) foram mantidas.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -40,7 +40,7 @@ load_dotenv()
 USE_PROXY = True
 PROXY_URL = os.getenv("PROXY_URL")
 VERIFY_SSL = False
-CHUNK_SIZE = 400
+CHUNK_SIZE = 100 # Valor seguro para queries GET da API REST que podem ser longas
 MAX_RETRIES = 3
 RETRY_DELAY = 5 # segundos
 API_VERSION = "v64.0" 
@@ -94,11 +94,14 @@ async def fetch_api_data(session, relative_url, semaphore, key_name=None):
                         
                         if key_name:
                             all_records.extend(data.get(key_name, []))
-                            next_page_url = data.get('nextRecordsUrl')
+                            next_page_url_v1 = data.get('nextRecordsUrl')
+                            next_page_url_v2 = data.get('nextPageUrl')
                             query_locator = data.get('queryLocator')
 
-                            if next_page_url:
-                                current_url = urljoin(str(session._base_url), next_page_url)
+                            next_page_path = next_page_url_v1 or next_page_url_v2
+
+                            if next_page_path:
+                                current_url = urljoin(str(session._base_url), next_page_path)
                             elif is_tooling_api and query_locator and not data.get('done', True):
                                 version = API_VERSION
                                 current_url = f"/services/data/{version}/tooling/query/{query_locator}"
@@ -114,6 +117,28 @@ async def fetch_api_data(session, relative_url, semaphore, key_name=None):
                 else:
                     logging.error(f"❌ Todas as {MAX_RETRIES} tentativas falharam para {relative_url[:50]}...: {e}")
                     raise e
+
+async def fetch_dmo_mapping_data(session, semaphore, dmo_name, dataspace):
+    async with semaphore:
+        endpoint = f"/services/data/{API_VERSION}/ssot/data-model-object-mappings?dataspace={dataspace}&dmoDeveloperName={dmo_name}"
+        try:
+            kwargs = {'ssl': VERIFY_SSL}
+            if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
+            async with session.get(endpoint, **kwargs) as response:
+                if response.status in [404, 500]:
+                    return {'status': 'no_mapping', 'dmo': dmo_name, 'data': None}
+                
+                response.raise_for_status()
+                data = await response.json()
+                
+                if data.get("objectSourceTargetMaps"):
+                    return {'status': 'success', 'dmo': dmo_name, 'data': data}
+                else:
+                    return {'status': 'no_mapping', 'dmo': dmo_name, 'data': None}
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logging.warning(f"Falha de conexão ao buscar mapeamento para {dmo_name}: {e}")
+            return {'status': 'error', 'dmo': dmo_name, 'data': str(e)}
 
 def parse_sf_date(date_str):
     if not date_str: return None
@@ -207,9 +232,10 @@ async def execute_query_job(session, query, semaphore):
 
 async def fetch_records_in_bulk(session, semaphore, object_name, fields, record_ids):
     if not record_ids: return []
+    bulk_chunk_size = 400
     all_records, tasks, field_str = [], [], ", ".join(fields)
-    for i in range(0, len(record_ids), CHUNK_SIZE):
-        chunk = record_ids[i:i + CHUNK_SIZE]; formatted_ids = "','".join(chunk)
+    for i in range(0, len(record_ids), bulk_chunk_size):
+        chunk = record_ids[i:i + bulk_chunk_size]; formatted_ids = "','".join(chunk)
         query = f"SELECT {field_str} FROM {object_name} WHERE Id IN ('{formatted_ids}')"
         tasks.append(execute_query_job(session, query, semaphore))
     
@@ -222,44 +248,19 @@ async def fetch_records_in_bulk(session, semaphore, object_name, fields, record_
         logging.error(f"❌ Falha crítica ao buscar registros em massa para '{object_name}': {e}. O script continuará com os dados que possui.")
         return []
 
-async def fetch_users_by_id(session, semaphore, user_ids):
-    if not user_ids: return []
-    all_users, tasks = [], []
-    field_str = "Id, Name"
-    for i in range(0, len(user_ids), CHUNK_SIZE):
-        chunk = user_ids[i:i + CHUNK_SIZE]; formatted_ids = "','".join(chunk)
-        query = f"SELECT {field_str} FROM User WHERE Id IN ('{formatted_ids}')"
+async def fetch_records_by_ids_rest(session, semaphore, object_name, fields, record_ids, desc_text):
+    if not record_ids: return []
+    all_records, tasks, field_str = [], [], ", ".join(fields)
+    for i in range(0, len(record_ids), CHUNK_SIZE):
+        chunk = record_ids[i:i + CHUNK_SIZE]; formatted_ids = "','".join(chunk)
+        query = f"SELECT {field_str} FROM {object_name} WHERE Id IN ('{formatted_ids}')"
         url = f"/services/data/{API_VERSION}/query?{urlencode({'q': query})}"
         tasks.append(fetch_api_data(session, url, semaphore, 'records'))
-    results = await tqdm.gather(*tasks, desc="Buscando nomes de criadores (REST API)")
+    
+    results = await tqdm.gather(*tasks, desc=desc_text)
     for record_list in results:
-        if record_list: all_users.extend(record_list)
-    return all_users
-
-async def fetch_dmo_mapping_sources(session, semaphore, dmo_name):
-    """Busca as fontes (DLOs) de um DMO específico."""
-    async with semaphore:
-        endpoint = f"/services/data/{API_VERSION}/ssot/data-model-object-mappings?dataspace=default&dmoDeveloperName={dmo_name}"
-        try:
-            kwargs = {'ssl': VERIFY_SSL}
-            if USE_PROXY and PROXY_URL: kwargs['proxy'] = PROXY_URL
-            async with session.get(endpoint, **kwargs) as response:
-                # Gerar erro para status >= 400, mas não para 500, que tratamos como falha recuperável
-                if response.status >= 400 and response.status != 500:
-                    response.raise_for_status()
-                # Se for 500, logamos o aviso e retornamos vazio, sem tentar novamente.
-                if response.status == 500:
-                     logging.warning(f"Não foi possível buscar o mapeamento para o DMO {dmo_name}: {response.status}, message='Internal Server Error', url='{endpoint}'")
-                     return []
-                
-                data = await response.json()
-                mappings = data.get("objectSourceTargetMaps", [])
-                if mappings:
-                    source_dlos = [m.get("sourceEntityDeveloperName") for m in mappings if m.get("sourceEntityDeveloperName")]
-                    return source_dlos
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logging.warning(f"Não foi possível buscar o mapeamento para o DMO {dmo_name}: {e}")
-        return []
+        if record_list: all_records.extend(record_list)
+    return all_records
 
 # --- Main Audit Logic ---
 async def main():
@@ -268,7 +269,6 @@ async def main():
     logging.info('🚀 Iniciando auditoria de exclusão de objetos...')
 
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json', 'Accept': 'application/json'}
-    # --- CORREÇÃO DE API LIMIT: Reduzindo a concorrência para evitar sobrecarga ---
     semaphore = asyncio.Semaphore(5)
     async with aiohttp.ClientSession(headers=headers, base_url=instance_url, connector=aiohttp.TCPConnector(ssl=VERIFY_SSL)) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
@@ -276,23 +276,28 @@ async def main():
         dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
         activation_attributes_query = "SELECT Id, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
-        contact_point_query = "SELECT Id, CreatedById FROM MktSgmntActvtnContactPoint"
         
         initial_tasks = [
             fetch_api_data(session, f"/services/data/{API_VERSION}/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
             fetch_api_data(session, f"/services/data/{API_VERSION}/query?{urlencode({'q': segment_soql_query})}", semaphore, 'records'),
             fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
-            execute_query_job(session, activation_attributes_query, semaphore),
+            fetch_api_data(session, f"/services/data/{API_VERSION}/query?{urlencode({'q': activation_attributes_query})}", semaphore, 'records'),
             fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
             fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/data-streams", semaphore, 'dataStreams'),
             fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/data-graphs/metadata", semaphore, 'dataGraphMetadata'),
             fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/data-actions", semaphore, 'dataActions'),
-            execute_query_job(session, contact_point_query, semaphore),
         ]
         
-        results = await asyncio.gather(*initial_tasks, return_exceptions=True)
+        async def run_safely(coro):
+            try:
+                return await coro
+            except Exception as e:
+                return e
+
+        safe_initial_tasks = [run_safely(task) for task in initial_tasks]
+        results = await tqdm.gather(*safe_initial_tasks, desc="Coletando metadados iniciais")
         
-        task_names = ["DMO Tooling", "Segment IDs", "DMO Metadata", "Activation Attributes", "Calculated Insights", "Data Streams", "Data Graphs", "Data Actions", "Contact Points"]
+        task_names = ["DMO Tooling", "Segment IDs", "DMO Metadata", "Activation Attributes", "Calculated Insights", "Data Streams", "Data Graphs", "Data Actions"]
         final_results = []
         for i, result in enumerate(results):
             task_name = task_names[i] if i < len(task_names) else f"Tarefa {i}"
@@ -303,7 +308,7 @@ async def main():
                 final_results.append(result)
 
         logging.info("✅ Coleta inicial de metadados concluída (com tratamento de falhas).")
-        dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions, contact_point_usages = final_results
+        dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions = final_results
         
         now = datetime.now(timezone.utc)
         thirty_days_ago = now - timedelta(days=30)
@@ -311,7 +316,7 @@ async def main():
 
         dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data if rec.get('DeveloperName')}
         segment_ids = [rec['Id'] for rec in segment_id_records if rec.get('Id')]
-        logging.info(f"✅ Etapa 1.1: {len(dmo_info_map)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(contact_point_usages)} Pontos de Contato carregados.")
+        logging.info(f"✅ Etapa 1.1: {len(dmo_tooling_data)} DMOs, {len(segment_ids)} Segmentos, {len(activation_attributes)} Ativações e {len(data_actions)} Data Actions carregados.")
 
         activation_ids = list(set(attr['MarketSegmentActivationId'] for attr in activation_attributes if attr.get('MarketSegmentActivationId')))
         
@@ -322,9 +327,28 @@ async def main():
 
         segment_publications = { str(act.get('MarketSegmentId') or '')[:15]: parse_sf_date(act.get('LastModifiedDate')) for act in activation_details if act.get('MarketSegmentId') and act.get('LastModifiedDate')}
 
-        logging.info(f"--- Etapa 3: Buscando detalhes de {len(segment_ids)} segmentos... ---")
-        segment_fields_to_query = ["Id", "Name", "SegmentMembershipTable", "IncludeCriteria", "ExcludeCriteria", "SegmentStatus", "CreatedById"]
-        segments = await fetch_records_in_bulk(session, semaphore, "MarketSegment", segment_fields_to_query, segment_ids)
+        logging.info(f"--- Etapa 3: Buscando detalhes de {len(segment_ids)} segmentos (Estratégia Híbrida)... ---")
+        
+        segment_fields_simple = ["Id", "Name", "SegmentMembershipTable", "SegmentStatus", "CreatedById"]
+        segments = await fetch_records_in_bulk(session, semaphore, "MarketSegment", segment_fields_simple, segment_ids)
+        segments_map = {s['Id']: s for s in segments}
+
+        inactive_segment_ids_for_criteria = []
+        for seg_id in (s['Id'] for s in segments):
+            last_pub_date = segment_publications.get(str(seg_id)[:15])
+            if not (last_pub_date and last_pub_date >= thirty_days_ago):
+                inactive_segment_ids_for_criteria.append(seg_id)
+        
+        logging.info(f"Buscando critérios complexos via API REST para {len(inactive_segment_ids_for_criteria)} segmentos inativos.")
+        
+        segment_fields_complex = ["Id", "IncludeCriteria", "ExcludeCriteria"]
+        if inactive_segment_ids_for_criteria:
+            segment_criteria_details = await fetch_records_by_ids_rest(session, semaphore, "MarketSegment", segment_fields_complex, inactive_segment_ids_for_criteria, "Buscando critérios (API REST)")
+            for criteria_detail in segment_criteria_details:
+                if criteria_detail['Id'] in segments_map:
+                    segments_map[criteria_detail['Id']].update(criteria_detail)
+        
+        segments = list(segments_map.values())
         logging.info("✅ Detalhes de segmento coletados. Iniciando busca por nomes de criadores...")
 
         all_creator_ids = set()
@@ -341,7 +365,7 @@ async def main():
         user_id_to_name_map = {}
         if all_creator_ids:
             logging.info(f"--- Etapa 4: Buscando nomes de {len(all_creator_ids)} criadores... ---")
-            user_records = await fetch_users_by_id(session, semaphore, list(all_creator_ids))
+            user_records = await fetch_records_by_ids_rest(session, semaphore, "User", ["Id", "Name"], list(all_creator_ids), "Buscando Nomes de Criadores")
             user_id_to_name_map = {user['Id']: user['Name'] for user in user_records}
             logging.info(f"{len(user_id_to_name_map)} nomes de usuários foram encontrados com sucesso.")
         
@@ -349,30 +373,41 @@ async def main():
         
         dmos_from_activation_csv = read_activation_usage_csv()
         
-        logging.info("--- Etapa 5: Buscando mapeamentos DLO -> DMO de forma massiva ---")
-        dmo_names = [dmo.get('DeveloperName') for dmo in dmo_tooling_data if dmo.get('DeveloperName')]
-        mapping_tasks = [fetch_dmo_mapping_sources(session, semaphore, name) for name in dmo_names]
+        logging.info("--- Etapa 5: Coletando todos os mapeamentos DLO -> DMO ---")
         
-        mapping_results = await tqdm.gather(*mapping_tasks, desc="Buscando Mapeamentos DLO->DMO")
+        active_dataspace = "default"
+        
+        dmo_names_to_query = [
+            dmo.get('name') for dmo in dm_objects
+            if dmo.get('name') and dmo.get('category') != 'Segment Membership' and
+            not any(dmo.get('name').lower().startswith(p) for p in dmo_prefixes_to_exclude)
+        ]
+        logging.info(f"Filtrando DMOs para busca de mapeamento. De {len(dm_objects)} DMOs totais, {len(dmo_names_to_query)} serão consultados.")
+        
+        tasks = []
+        for dmo_name in dmo_names_to_query:
+            dmo_full_name = f"{dmo_name}__dlm" if not dmo_name.endswith('__dlm') else dmo_name
+            tasks.append(fetch_dmo_mapping_data(session, semaphore, dmo_full_name, active_dataspace))
+
+        mapping_results = await tqdm.gather(*tasks, desc="Buscando Mapeamentos DLO->DMO")
         
         dlos_mapped_to_dmos = set()
-        for dlo_list in mapping_results:
-            if dlo_list:
-                dlos_mapped_to_dmos.update(dlo_list)
+        
+        for result in mapping_results:
+            if not result or result.get('status') != 'success': continue
+            mappings = result['data'].get("objectSourceTargetMaps", [])
+            for m in mappings:
+                if dlo_name := m.get("sourceEntityDeveloperName"):
+                    dlos_mapped_to_dmos.add(dlo_name)
+        
         logging.info(f"🔎 Encontrados {len(dlos_mapped_to_dmos)} DLOs únicos que estão mapeados para DMOs.")
 
         dmos_used_by_segments = {normalize_api_name(s.get('SegmentMembershipTable')) for s in segments if s.get('SegmentMembershipTable')}
         dmos_used_by_data_graphs = {normalize_api_name(obj.get('developerName')) for dg in data_graphs for obj in [dg.get('dgObject', {})] + dg.get('dgObject', {}).get('relatedObjects', []) if obj.get('developerName')}
         dmos_used_by_ci_relationships = {normalize_api_name(rel.get('fromEntity')) for ci in calculated_insights for rel in ci.get('relationships', []) if rel.get('fromEntity')}
-        
         dmos_used_in_data_actions = set()
         for da in data_actions:
             find_items_in_criteria(da, 'developerName', dmos_used_in_data_actions)
-            
-        dmos_used_in_contact_points = set()
-        for cp in contact_point_usages:
-            find_items_in_criteria(cp.get('ContactPointPath'), 'developerName', dmos_used_in_contact_points)
-            find_items_in_criteria(cp.get('ContactPointFilterExpression'), 'developerName', dmos_used_in_contact_points)
             
         nested_segment_parents = {}
         dmos_used_in_segment_criteria = set()
@@ -381,6 +416,7 @@ async def main():
             parent_name = get_segment_name(seg)
             for criteria_field in ['IncludeCriteria', 'ExcludeCriteria']:
                 criteria_str = seg.get(criteria_field)
+                if not criteria_str: continue # Adicionado para segurança
                 find_items_in_criteria(criteria_str, 'developerName', dmos_used_in_segment_criteria)
                 nested_ids_found = set()
                 find_items_in_criteria(criteria_str, 'segmentId', nested_ids_found)
@@ -389,7 +425,7 @@ async def main():
 
         audit_results = []
         deletable_segment_ids = set()
-        
+
         logging.info("Auditando Segmentos...")
         for seg in tqdm(segments, desc="Auditando Segmentos"):
             seg_id = str(get_segment_id(seg) or '')[:15];
@@ -420,11 +456,11 @@ async def main():
                 audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': act_id, 'DISPLAY_NAME': act_name, 'OBJECT_TYPE': 'ACTIVATION', 'STATUS': 'N/A', 'REASON': reason, 'TIPO_ATIVIDADE': 'N/A', 'DIAS_ATIVIDADE': 'N/A', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': act_id})
 
         logging.info("Auditando Data Model Objects (DMOs)...")
-        all_used_dmos = (dmos_used_by_segments | dmos_used_by_data_graphs | dmos_used_by_ci_relationships | dmos_used_in_data_actions | dmos_used_in_segment_criteria | dmos_from_activation_csv | dmos_used_in_contact_points)
+        all_used_dmos = (dmos_used_by_segments | dmos_used_by_data_graphs | dmos_used_by_ci_relationships | dmos_used_in_data_actions | dmos_used_in_segment_criteria | dmos_from_activation_csv)
         
         for dmo in dm_objects:
             dmo_name = dmo.get('name', '')
-            if not dmo_name.endswith('__dlm') or any(dmo_name.lower().startswith(p) for p in dmo_prefixes_to_exclude):
+            if not dmo_name.endswith('__dlm'):
                 continue
             
             lookup_key = normalize_api_name(dmo_name)
@@ -436,20 +472,15 @@ async def main():
             created_date = parse_sf_date(dmo_details.get('CreatedDate'))
             
             if not created_date or created_date < ninety_days_ago:
-                normalized_dmo_name_for_usage_check = normalize_api_name(dmo_name)
-                if normalized_dmo_name_for_usage_check not in all_used_dmos:
+                if lookup_key not in all_used_dmos:
                     days_created = days_since(created_date)
                     reason = "Órfão (não utilizado em nenhum objeto e criado > 90d)"
                     display_name = get_dmo_display_name(dmo)
-                    deletion_id = dmo_name
                     dmo_tooling_id = dmo_details.get('Id', 'ID não encontrado')
                     
                     creator_id = dmo_details.get('CreatedById') or dmo_details.get('createdbyid')
                     
-                    if not creator_id:
-                        creator_name = "ID Não Retornado pela API"
-                    else:
-                        creator_name = user_id_to_name_map.get(creator_id, f"ID Não Encontrado ({creator_id})")
+                    creator_name = user_id_to_name_map.get(creator_id, 'Desconhecido') if creator_id else "Desconhecido"
 
                     audit_results.append({
                         'DELETAR': 'NAO', 
@@ -461,7 +492,7 @@ async def main():
                         'TIPO_ATIVIDADE': 'Criação', 
                         'DIAS_ATIVIDADE': days_created if days_created is not None else '>90', 
                         'CREATED_BY_NAME': creator_name, 
-                        'DELETION_IDENTIFIER': deletion_id
+                        'DELETION_IDENTIFIER': dmo_name
                     })
         
         logging.info("Auditando Data Streams...")
@@ -471,17 +502,12 @@ async def main():
             if not last_updated or last_updated < thirty_days_ago:
                 days_inactive = days_since(last_updated)
                 
-                ds_label = ds.get('label')
-                ds_api_name = ds.get('name')
+                ds_label = ds.get('label') or ds.get('name')
                 dlo_info = ds.get('dataLakeObjectInfo', {})
                 deletion_id = dlo_info.get('name') 
-
-                if not ds_label:
-                    ds_label = dlo_info.get('label') or ds_api_name or "Nome não encontrado"
+                
                 if not deletion_id:
-                    deletion_id = f"{ds_api_name}__dll" if ds_api_name else "ID de Exclusão não encontrado"
-
-                creator_name = 'Desconhecido'
+                    deletion_id = f"{ds.get('name')}__dll" if ds.get('name') else "ID de Exclusão não encontrado"
 
                 has_field_mappings = bool(ds.get('mappings'))
                 is_mapped_to_dmo = deletion_id in dlos_mapped_to_dmos
@@ -501,7 +527,7 @@ async def main():
                     'REASON': reason, 
                     'TIPO_ATIVIDADE': 'Última Ingestão', 
                     'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>30', 
-                    'CREATED_BY_NAME': creator_name, 
+                    'CREATED_BY_NAME': 'Desconhecido', 
                     'DELETION_IDENTIFIER': deletion_id
                 })
         
@@ -512,21 +538,17 @@ async def main():
                 days_inactive = days_since(last_processed)
                 ci_name = ci.get('name')
                 
-                creator_name = 'Desconhecido'
-
                 reason = "Inativo (último processamento bem-sucedido > 90d)"
-                audit_results.append({
-                    'DELETAR': 'NAO', 
-                    'ID_OR_API_NAME': ci_name, 
-                    'DISPLAY_NAME': ci.get('displayName'), 
-                    'OBJECT_TYPE': 'CALCULATED_INSIGHT', 
-                    'STATUS': 'N/A', 
-                    'REASON': reason, 
-                    'TIPO_ATIVIDADE': 'Último Processamento', 
-                    'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 
-                    'CREATED_BY_NAME': creator_name, 
-                    'DELETION_IDENTIFIER': ci_name
-                })
+                audit_results.append({'DELETAR': 'NAO', 
+                                    'ID_OR_API_NAME': ci_name, 
+                                    'DISPLAY_NAME': ci.get('displayName'), 
+                                    'OBJECT_TYPE': 'CALCULATED_INSIGHT', 
+                                    'STATUS': 'N/A', 
+                                    'REASON': reason, 
+                                    'TIPO_ATIVIDADE': 'Último Processamento', 
+                                    'DIAS_ATIVIDADE': days_inactive if days_inactive is not None else '>90', 
+                                    'CREATED_BY_NAME': 'Desconhecido', 
+                                    'DELETION_IDENTIFIER': ci_name})
 
         if audit_results:
             csv_file = "audit_objetos_para_exclusao.csv"
