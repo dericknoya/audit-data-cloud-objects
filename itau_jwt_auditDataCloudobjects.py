@@ -1,18 +1,12 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 15.00 (Lógica Simplificada e Eficiente)
-- REGRAS DE NEGÓCIO (Data Streams): A lógica de mapeamento foi drasticamente
-  simplificada e corrigida. O script agora usa o parâmetro 'includeMappings=true'
-  na chamada da API de Data Streams. A identificação de órfãos/inativos agora é
-  baseada diretamente na presença de dados no array 'mappings' do payload,
-  tornando a auditoria mais rápida e precisa.
-- OTIMIZAÇÃO (API Calls): A busca massiva de mapeamentos por DMO foi removida,
-  eliminando centenas de chamadas de API e resolvendo problemas de limite e
-  performance.
-- CORREÇÃO (Paginação): A função 'fetch_api_data' foi consolidada para lidar
-  corretamente com a paginação 'nextPageUrl', garantindo que todos os Data
-  Streams sejam coletados.
+Versão: 14.04 (Versão Final Estável)
+- BASE ESTÁVEL: Script construído a partir da v14.03.
+- CORREÇÃO (NameError): Corrigido o erro 'NameError: name 'find_segments_in_criteria'
+  is not defined' que ocorria devido à remoção acidental da função auxiliar
+  correspondente, impedindo a execução completa do script.
+- REGRAS DE NEGÓCIO: Mantida a lógica de auditoria redefinida na v14.00.
 
 Gera CSV final: audit_objetos_para_exclusao.csv
 """
@@ -42,7 +36,7 @@ load_dotenv()
 USE_PROXY = True
 PROXY_URL = os.getenv("PROXY_URL")
 VERIFY_SSL = False
-CHUNK_SIZE = 100
+CHUNK_SIZE = 100 
 MAX_RETRIES = 3
 RETRY_DELAY = 5 # segundos
 API_VERSION = "v64.0" 
@@ -59,6 +53,8 @@ def get_access_token():
     sf_login_url = os.getenv("SF_LOGIN_URL")
     if not all([sf_client_id, sf_username, sf_audience, sf_login_url]):
         raise ValueError("Uma ou mais variáveis de ambiente de autenticação (SF_CLIENT_ID, SF_USERNAME, etc.) estão faltando no arquivo .env.")
+    if USE_PROXY and not PROXY_URL:
+        logging.warning("⚠️ USE_PROXY está como True, mas a variável PROXY_URL não foi encontrada no arquivo .env. O script continuará sem proxy.")
     try:
         with open('private.pem', 'r') as f: private_key = f.read()
     except FileNotFoundError:
@@ -116,7 +112,9 @@ async def fetch_api_data(session, relative_url, semaphore, key_name=None):
 
 async def fetch_records_by_ids_rest(session, semaphore, object_name, fields, record_ids, desc_text):
     if not record_ids: return []
-    all_records, tasks, field_str = [], [], ", ".join(fields)
+    all_records = []
+    field_str = ", ".join(fields)
+    tasks = []
     for i in range(0, len(record_ids), CHUNK_SIZE):
         chunk = record_ids[i:i + CHUNK_SIZE]
         formatted_ids = "','".join(chunk)
@@ -142,7 +140,46 @@ def normalize_api_name(name):
     if not isinstance(name, str): return ""
     return name.removesuffix('__dlm').removesuffix('__cio').removesuffix('__dll')
 
+def find_dmos_in_payload(payload, dmo_set):
+    """Busca DMOs em um payload JSON, procurando por várias chaves possíveis."""
+    if not payload: return
+    try:
+        data = json.loads(html.unescape(str(payload))) if isinstance(payload, str) else payload
+        dmo_keys = {'objectName', 'entityName', 'developerName'}
+        def recurse(obj):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    if key in dmo_keys and isinstance(value, str) and value.endswith('__dlm'):
+                        dmo_set.add(normalize_api_name(value))
+                    elif isinstance(value, (dict, list)):
+                        recurse(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    recurse(item)
+        recurse(data)
+    except (json.JSONDecodeError, TypeError): return
+
+def find_segments_in_criteria(criteria_str, segment_set):
+    """Busca IDs de segmentos aninhados nos critérios."""
+    if not criteria_str: return
+    try:
+        criteria_json = json.loads(html.unescape(str(criteria_str))) if isinstance(criteria_str, str) else criteria_str
+        def recurse(obj):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    if key == 'segmentId' and isinstance(value, str):
+                        segment_set.add(value[:15])
+                    elif isinstance(value, (dict, list)):
+                        recurse(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    recurse(item)
+        recurse(criteria_json)
+    except (json.JSONDecodeError, TypeError): return
+
+def get_segment_id(seg): return seg.get('Id')
 def get_segment_name(seg): return seg.get('Name') or '(Sem nome)'
+def get_dmo_display_name(dmo): return dmo.get('displayName') or dmo.get('name') or '(Sem nome)'
 
 # --- Main Audit Logic ---
 async def main():
@@ -153,15 +190,19 @@ async def main():
     async with aiohttp.ClientSession(headers=headers, base_url=instance_url, connector=aiohttp.TCPConnector(ssl=VERIFY_SSL)) as session:
         logging.info("--- Etapa 1: Coletando metadados e listas de objetos ---")
         
-        # Otimizado para buscar apenas os dados essenciais
+        dmo_soql_query = "SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject"
         segment_soql_query = "SELECT Id FROM MarketSegment"
-        activation_attributes_query = "SELECT Id, Name, MarketSegmentActivationId FROM MktSgmntActvtnAudAttribute"
+        activation_attributes_query = "SELECT Id, Name, MarketSegmentActivationId, CreatedById FROM MktSgmntActvtnAudAttribute"
         
         initial_tasks = [
+            fetch_api_data(session, f"/services/data/{API_VERSION}/tooling/query?{urlencode({'q': dmo_soql_query})}", semaphore, 'records'),
             fetch_api_data(session, f"/services/data/{API_VERSION}/query?{urlencode({'q': segment_soql_query})}", semaphore, 'records'),
+            fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/metadata?entityType=DataModelObject", semaphore, 'metadata'),
             fetch_api_data(session, f"/services/data/{API_VERSION}/query?{urlencode({'q': activation_attributes_query})}", semaphore, 'records'),
-            # Busca Data Streams com seus mapeamentos de origem
-            fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/data-streams?includeMappings=true", semaphore, 'dataStreams'),
+            fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/metadata?entityType=CalculatedInsight", semaphore, 'metadata'),
+            fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/data-streams", semaphore, 'dataStreams'),
+            fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/data-graphs/metadata", semaphore, 'dataGraphMetadata'),
+            fetch_api_data(session, f"/services/data/{API_VERSION}/ssot/data-actions", semaphore, 'dataActions'),
         ]
         
         async def run_safely(coro):
@@ -171,20 +212,23 @@ async def main():
         safe_initial_tasks = [run_safely(task) for task in initial_tasks]
         results = await tqdm.gather(*safe_initial_tasks, desc="Coletando metadados iniciais")
         
-        segment_id_records, activation_attributes, data_streams = [
+        task_names = ["DMO Tooling", "Segment IDs", "DMO Metadata", "Activation Attributes", "Calculated Insights", "Data Streams", "Data Graphs", "Data Actions"]
+        dmo_tooling_data, segment_id_records, dm_objects, activation_attributes, calculated_insights, data_streams, data_graphs, data_actions = [
             res if not isinstance(res, Exception) else [] for res in results
         ]
         
         now = datetime.now(timezone.utc)
         thirty_days_ago = now - timedelta(days=30)
+        ninety_days_ago = now - timedelta(days=90)
 
+        dmo_info_map = {rec['DeveloperName']: rec for rec in dmo_tooling_data}
         segment_ids = [rec['Id'] for rec in segment_id_records]
-        
+
         logging.info(f"--- Etapa 2: Buscando detalhes de ativações e segmentos ---")
         activation_ids = list(set(attr['MarketSegmentActivationId'] for attr in activation_attributes))
         
-        activation_fields = ["Id", "MarketSegmentId", "LastModifiedDate"]
-        segment_fields = ["Id", "Name", "IncludeCriteria"]
+        activation_fields = ["Id", "MarketSegmentId", "LastModifiedDate", "CreatedById"]
+        segment_fields = ["Id", "Name", "SegmentMembershipTable", "IncludeCriteria", "ExcludeCriteria", "SegmentStatus", "CreatedById"]
 
         activation_details, segments = await asyncio.gather(
             fetch_records_by_ids_rest(session, semaphore, "MarketSegmentActivation", activation_fields, activation_ids, "Buscando Ativações (API REST)"),
@@ -193,21 +237,43 @@ async def main():
         
         segment_publications = {str(act.get('MarketSegmentId', ''))[:15]: parse_sf_date(act.get('LastModifiedDate')) for act in activation_details if act.get('MarketSegmentId')}
 
-        # --- Etapa 3: Auditoria e Análise de Exclusão ---
+        all_creator_ids = set()
+        for collection in [dmo_tooling_data, activation_attributes, activation_details, segments]:
+            for item in collection:
+                if creator_id := item.get('CreatedById'):
+                    all_creator_ids.add(creator_id)
+
+        user_id_to_name_map = {}
+        if all_creator_ids:
+            logging.info(f"--- Etapa 3: Buscando nomes de {len(all_creator_ids)} criadores... ---")
+            user_records = await fetch_records_by_ids_rest(session, semaphore, "User", ["Id", "Name"], list(all_creator_ids), "Buscando Nomes de Criadores")
+            user_id_to_name_map = {user['Id']: user['Name'] for user in user_records}
+
+        # --- Etapa 4: Auditoria e Análise de Exclusão ---
         audit_results = []
         
-        logging.info("Analisando dependências de Segmentos...")
+        logging.info("Analisando dependências de DMOs...")
+        dmos_used_in_segments = set()
         nested_segment_parents = {}
         for seg in tqdm(segments, desc="Analisando Critérios de Segmentos"):
-            temp_nested_ids = set()
-            find_segments_in_criteria(seg.get('IncludeCriteria'), temp_nested_ids)
-            for nested_id in temp_nested_ids:
-                nested_segment_parents.setdefault(nested_id, []).append(get_segment_name(seg))
+            for field in ['IncludeCriteria', 'ExcludeCriteria']:
+                find_dmos_in_payload(seg.get(field), dmos_used_in_segments)
+                temp_nested_ids = set()
+                find_segments_in_criteria(seg.get(field), temp_nested_ids)
+                for nested_id in temp_nested_ids:
+                    nested_segment_parents.setdefault(nested_id, []).append(get_segment_name(seg))
+
+        dmos_used_in_data_graphs, dmos_used_in_cis, dmos_used_in_data_actions = set(), set(), set()
+        for dg in data_graphs: find_dmos_in_payload(dg, dmos_used_in_data_graphs)
+        for ci in calculated_insights: find_dmos_in_payload(ci, dmos_used_in_cis)
+        for da in data_actions: find_dmos_in_payload(da, dmos_used_in_data_actions)
+            
+        all_used_dmos = dmos_used_in_segments.union(dmos_used_in_data_graphs, dmos_used_in_cis, dmos_used_in_data_actions)
 
         logging.info("Auditando Segmentos e Ativações...")
         deletable_segment_ids = set()
-        for seg in segments:
-            seg_id_short = str(seg.get('Id', ''))[:15]
+        for seg in tqdm(segments, desc="Auditando Segmentos"):
+            seg_id_short = str(get_segment_id(seg) or '')[:15]
             if not seg_id_short: continue
             
             last_pub_date = segment_publications.get(seg_id_short)
@@ -223,8 +289,11 @@ async def main():
                     status = "Inativo"
                 
                 audit_results.append({
-                    'OBJECT_TYPE': 'SEGMENT', 'STATUS': status, 'REASON': reason,
-                    'DISPLAY_NAME': get_segment_name(seg),
+                    'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id_short,
+                    'DISPLAY_NAME': get_segment_name(seg), 'OBJECT_TYPE': 'SEGMENT', 'STATUS': status,
+                    'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação',
+                    'DIAS_ATIVIDADE': days_since(last_pub_date) if last_pub_date else '>30',
+                    'CREATED_BY_NAME': user_id_to_name_map.get(seg.get('CreatedById'), 'Desconhecido'),
                     'DELETION_IDENTIFIER': get_segment_name(seg)
                 })
 
@@ -234,40 +303,79 @@ async def main():
                 act_id = act_detail.get('Id')
                 act_name = next((attr.get('Name') for attr in activation_attributes if attr.get('MarketSegmentActivationId') == act_id), act_id)
                 audit_results.append({
-                    'OBJECT_TYPE': 'ACTIVATION', 'STATUS': 'Órfã',
-                    'REASON': f'Órfã: Associada a um segmento que foi identificado como órfão ({seg_id_short}).',
-                    'DISPLAY_NAME': act_name, 'DELETION_IDENTIFIER': act_id
+                    'DELETAR': 'NAO', 'ID_OR_API_NAME': act_id,
+                    'DISPLAY_NAME': act_name, 'OBJECT_TYPE': 'ACTIVATION', 'STATUS': 'Órfã',
+                    'REASON': f'Órfã: Associada a um segmento que foi identificado como órfão ({seg_id_short}).', 'TIPO_ATIVIDADE': 'N/A',
+                    'DIAS_ATIVIDADE': 'N/A', 'CREATED_BY_NAME': user_id_to_name_map.get(act_detail.get('CreatedById'), 'Desconhecido'),
+                    'DELETION_IDENTIFIER': act_name
                 })
 
+        logging.info("Auditando Data Model Objects (DMOs)...")
+        for dmo in dm_objects:
+            dmo_name = dmo.get('name')
+            if not dmo_name or not dmo_name.endswith('__dlm'): continue
+            
+            normalized_dmo_name = normalize_api_name(dmo_name)
+            dmo_details = dmo_info_map.get(dmo_name, {})
+            created_date = parse_sf_date(dmo_details.get('CreatedDate'))
+            
+            if (not created_date or created_date < ninety_days_ago) and normalized_dmo_name not in all_used_dmos:
+                audit_results.append({
+                    'DELETAR': 'NAO', 'ID_OR_API_NAME': dmo_details.get('Id', dmo_name),
+                    'DISPLAY_NAME': get_dmo_display_name(dmo), 'OBJECT_TYPE': 'DMO', 'STATUS': 'Órfão',
+                    'REASON': "Órfão: Criado > 90 dias (ou data desconhecida) e não utilizado em Segmentos, Data Graphs, CIs ou Data Actions.", 
+                    'TIPO_ATIVIDADE': 'Criação',
+                    'DIAS_ATIVIDADE': days_since(created_date) if created_date else '>90',
+                    'CREATED_BY_NAME': user_id_to_name_map.get(dmo_details.get('CreatedById'), 'Desconhecido'),
+                    'DELETION_IDENTIFIER': dmo_name
+                })
+        
         logging.info("Auditando Data Streams...")
         for ds in data_streams:
             last_updated = parse_sf_date(ds.get('lastIngestDate'))
             if not last_updated or last_updated < thirty_days_ago:
                 has_mappings = bool(ds.get('mappings'))
                 reason, status = "", ""
+                dlo_name = ds.get('dataLakeObjectInfo', {}).get('name', 'N/A')
                 if not has_mappings:
-                    reason = "Órfão: Última atualização > 30 dias e o array 'mappings' de origem está vazio."
+                    reason = "Órfão: A última atualização foi > 30 dias e o array 'mappings' está vazio."
                     status = "Órfão"
                 else:
-                    reason = "Inativo: Última atualização > 30 dias, mas possui mapeamentos de origem."
+                    reason = f"Inativo: A última atualização foi > 30 dias, mas possui mapeamentos para o DLO: {dlo_name}"
                     status = "Inativo"
                 
                 audit_results.append({
-                    'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': status, 'REASON': reason,
-                    'DISPLAY_NAME': ds.get('label'), 
-                    'DELETION_IDENTIFIER': ds.get('dataLakeObjectInfo', {}).get('name', ds.get('name'))
+                    'DELETAR': 'NAO', 'ID_OR_API_NAME': ds.get('name'),
+                    'DISPLAY_NAME': ds.get('label'), 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': status,
+                    'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão',
+                    'DIAS_ATIVIDADE': days_since(last_updated) if last_updated else ">30",
+                    'CREATED_BY_NAME': 'Desconhecido',
+                    'DELETION_IDENTIFIER': dlo_name or ds.get('name')
+                })
+
+        logging.info("Auditando Calculated Insights...")
+        for ci in calculated_insights:
+            last_processed = parse_sf_date(ci.get('lastSuccessfulProcessingDate'))
+            if not last_processed or last_processed < ninety_days_ago:
+                 audit_results.append({
+                    'DELETAR': 'NAO', 'ID_OR_API_NAME': ci.get('name'),
+                    'DISPLAY_NAME': ci.get('displayName'), 'OBJECT_TYPE': 'CALCULATED_INSIGHT', 'STATUS': 'Inativo',
+                    'REASON': "Inativo: Último processamento bem-sucedido > 90 dias.", 'TIPO_ATIVIDADE': 'Último Processamento',
+                    'DIAS_ATIVIDADE': days_since(last_processed) if last_processed else '>90',
+                    'CREATED_BY_NAME': 'Desconhecido',
+                    'DELETION_IDENTIFIER': ci.get('name')
                 })
 
         if audit_results:
             csv_file = "audit_objetos_para_exclusao.csv"
             with open(csv_file, mode='w', newline='', encoding='utf-8') as f:
-                fieldnames = ['OBJECT_TYPE', 'STATUS', 'REASON', 'DISPLAY_NAME', 'DELETION_IDENTIFIER']
+                fieldnames = ['DELETAR', 'ID_OR_API_NAME', 'DISPLAY_NAME', 'OBJECT_TYPE', 'STATUS', 'REASON', 'TIPO_ATIVIDADE', 'DIAS_ATIVIDADE', 'CREATED_BY_NAME', 'DELETION_IDENTIFIER']
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(audit_results)
             logging.info(f"✅ Auditoria concluída. CSV gerado: {csv_file}")
             
-            counts = {t: 0 for t in ['DATA_STREAM', 'SEGMENT', 'ACTIVATION']}
+            counts = {t: 0 for t in ['DMO', 'DATA_STREAM', 'CALCULATED_INSIGHT', 'SEGMENT', 'ACTIVATION']}
             for result in audit_results:
                  if result.get('OBJECT_TYPE') in counts:
                     counts[result['OBJECT_TYPE']] += 1
