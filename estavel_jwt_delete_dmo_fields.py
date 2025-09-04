@@ -3,17 +3,21 @@
 Este script realiza a exclusão em massa de campos de DMOs (Data Model Objects)
 baseado em um arquivo CSV de auditoria.
 
-Versão: 1.5 - Deleção em Massa (Autenticação JWT)
+Versão: 3.1 - Adiciona verificação pós-exclusão para erros 500.
 
 Metodologia:
 - Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
-- Lê um arquivo CSV (padrão: 'audit_campos_dmo_nao_utilizados.csv').
-- Filtra as linhas onde a coluna 'DELETAR' está marcada como 'SIM'.
-- Para cada campo a ser excluído, faz uma consulta SOQL individual e específica na 
-  Tooling API para obter seu ID, aumentando a confiabilidade.
+- Suporta o uso de proxy através da variável de ambiente 'PROXY_URL'.
+- Lê um arquivo CSV e o ID técnico de deleção da coluna 'DELETION_IDENTIFIER'.
+- Para cada campo a ser excluído:
+  - Remove o mapeamento associado, se houver.
+  - Tenta deletar o campo usando seu ID técnico.
+  - MELHORIA: Se a API retornar um erro 500 (Internal Server Error), o script
+    faz uma pausa e executa uma consulta de verificação para confirmar se o campo
+    foi realmente deletado. Se a verificação mostrar que o campo não existe mais,
+    a operação é marcada como SUCESSO.
 - Pede uma confirmação explícita ao usuário antes de iniciar a exclusão.
-- Realiza as chamadas de exclusão de forma assíncrona.
-- Suporta um modo de simulação ('--dry-run') para verificar a operação sem deletar.
+- Suporta um modo de simulação ('--dry-run').
 
 !! ATENÇÃO !!
 !! ESTE SCRIPT É DESTRUTIVO E DELETA METADADOS PERMANENTEMENTE. !!
@@ -31,7 +35,7 @@ import requests
 import aiohttp
 from dotenv import load_dotenv
 
-# --- MUDANÇA: Autenticação revertida para JWT Bearer Flow ---
+# --- Configuração de Autenticação e Proxy ---
 
 def get_access_token():
     """Autentica com o Salesforce usando o fluxo JWT Bearer Flow."""
@@ -42,6 +46,12 @@ def get_access_token():
     sf_username = os.getenv("SF_USERNAME")
     sf_audience = os.getenv("SF_AUDIENCE")
     sf_login_url = os.getenv("SF_LOGIN_URL")
+
+    proxy_url = os.getenv("PROXY_URL")
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    
+    if proxies:
+        print(f"🌍 Usando proxy para autenticação: {proxy_url}")
 
     if not all([sf_client_id, sf_username, sf_audience, sf_login_url]):
         raise ValueError("Uma ou mais variáveis de ambiente para o fluxo JWT estão faltando.")
@@ -58,7 +68,7 @@ def get_access_token():
     token_url = f"{sf_login_url}/services/oauth2/token"
     
     try:
-        res = requests.post(token_url, data=params)
+        res = requests.post(token_url, data=params, proxies=proxies)
         res.raise_for_status()
         print("✅ Autenticação bem-sucedida.")
         return res.json()
@@ -68,48 +78,133 @@ def get_access_token():
 
 # --- Funções da API ---
 
-async def fetch_tooling_api_query(session, base_url, soql_query):
-    """Busca dados da Tooling API usando uma consulta SOQL."""
+async def delete_field_mapping(session, instance_url, obj_mapping_id, field_mapping_id, field_name_for_log, dry_run=False):
+    """Deleta o mapeamento de um campo de DMO."""
+    delete_url = (f"{instance_url}/services/data/v64.0/ssot/data-model-object-mappings/"
+                  f"{obj_mapping_id}/field-mappings/{field_mapping_id}")
+
+    if dry_run:
+        print(f"🐫 [SIMULAÇÃO] Removeria o mapeamento do campo: {field_name_for_log}")
+        return True, "Modo de Simulação (Dry Run)"
+    
+    try:
+        async with session.delete(delete_url) as response:
+            if response.status == 204:
+                print(f"✅ Mapeamento do campo '{field_name_for_log}' removido com sucesso.")
+                return True, "Mapeamento Removido"
+            else:
+                error_text = await response.text()
+                print(f"❌ Falha ao remover mapeamento de {field_name_for_log}: {response.status} - {error_text}")
+                return False, f"Erro ao remover mapeamento {response.status}: {error_text}"
+    except aiohttp.ClientError as e:
+        print(f"❌ Erro de conexão ao remover mapeamento de {field_name_for_log}: {e}")
+        return False, f"Erro de conexão: {e}"
+
+# NOVA FUNÇÃO DE VERIFICAÇÃO
+async def verify_field_deletion(session, instance_url, field_id):
+    """Verifica se um campo ainda existe consultando seu ID via Tooling API."""
+    soql_query = f"SELECT Id FROM MktDataModelField WHERE Id = '{field_id}'"
     params = {'q': soql_query}
-    url = f"{base_url}/services/data/v64.0/tooling/query?{urlencode(params)}"
+    url = f"{instance_url}/services/data/v64.0/tooling/query?{urlencode(params)}"
     try:
         async with session.get(url) as response:
             response.raise_for_status()
             data = await response.json()
-            return data.get('records', [])
+            # Se a lista de 'records' estiver vazia, o campo foi deletado com sucesso.
+            return not data.get('records')
     except aiohttp.ClientError as e:
-        print(f"❌ Erro ao consultar a Tooling API {url}: {e}")
-        return []
+        print(f"❌ Erro durante a verificação da exclusão: {e}")
+        # Por segurança, se a verificação falhar, assumimos que a exclusão falhou.
+        return False
 
 async def delete_dmo_field(session, instance_url, field_id, field_name_for_log, dry_run=False):
-    """Deleta um único campo de DMO usando seu ID técnico."""
+    """Deleta um único campo de DMO, com lógica de verificação para erro 500."""
     delete_url = f"{instance_url}/services/data/v64.0/tooling/sobjects/MktDataModelField/{field_id}"
     
     if dry_run:
         print(f"🐫 [SIMULAÇÃO] Deletaria o campo: {field_name_for_log} (ID: {field_id})")
-        return field_name_for_log, True, "Modo de Simulação (Dry Run)"
+        return True, "Modo de Simulação (Dry Run)"
 
     try:
         async with session.delete(delete_url) as response:
+            # Captura o texto do erro no início para usar depois, se necessário
+            error_text = await response.text()
+
             if response.status == 204: # 204 No Content é o sucesso para DELETE
                 print(f"✅ Campo deletado com sucesso: {field_name_for_log}")
-                return field_name_for_log, True, "Deletado com Sucesso"
-            else:
-                error_text = await response.text()
+                return True, "Deletado com Sucesso"
+            
+            # LÓGICA DE VERIFICAÇÃO PARA ERRO 500
+            elif response.status == 500:
+                print(f"⚠️  Recebido erro 500 para o campo '{field_name_for_log}'. Tentando verificar o status da exclusão...")
+                await asyncio.sleep(3) # Pausa estratégica para dar tempo à plataforma
+                
+                is_truly_deleted = await verify_field_deletion(session, instance_url, field_id)
+                
+                if is_truly_deleted:
+                    print(f"✅ Verificação confirmou que o campo '{field_name_for_log}' foi deletado com sucesso.")
+                    return True, "Deletado com Sucesso (Após verificação do erro 500)"
+                else:
+                    print(f"❌ Verificação mostrou que o campo '{field_name_for_log}' ainda existe. A exclusão falhou.")
+                    return False, f"Erro 500 e verificação confirmou falha: {error_text}"
+            
+            else: # Trata outros erros (400, 403, 404, etc.)
                 print(f"❌ Falha ao deletar o campo {field_name_for_log}: {response.status} - {error_text}")
-                return field_name_for_log, False, f"Erro {response.status}: {error_text}"
+                return False, f"Erro {response.status}: {error_text}"
+                
     except aiohttp.ClientError as e:
         print(f"❌ Erro de conexão ao deletar o campo {field_name_for_log}: {e}")
-        return field_name_for_log, False, f"Erro de conexão: {e}"
+        return False, f"Erro de conexão: {e}"
 
-# --- Lógica Principal de Deleção ---
+# --- Lógica de Orquestração --- (sem alterações daqui para baixo)
+
+async def process_single_field_deletion(session, instance_url, row_data, dry_run):
+    """
+    Processa a exclusão de um único campo, lendo o ID diretamente do CSV.
+    Retorna uma tupla (nome_do_campo, sucesso, mensagem).
+    """
+    field_log_name = f"{row_data['DMO_DISPLAY_NAME']}.{row_data['FIELD_DISPLAY_NAME']}"
+    obj_mapping_id = row_data.get("OBJECT_MAPPING_ID")
+    field_mapping_id = row_data.get("FIELD_MAPPING_ID")
+
+    # Etapa 1: Remover mapeamento, se existir
+    has_mapping = obj_mapping_id and obj_mapping_id != "Não possui mapeamento"
+    if has_mapping:
+        print(f"   - Campo '{field_log_name}' possui mapeamento. Removendo primeiro...")
+        map_success, map_reason = await delete_field_mapping(
+            session, instance_url, obj_mapping_id, field_mapping_id, field_log_name, dry_run
+        )
+        if not map_success:
+            return field_log_name, False, f"Falha na remoção do mapeamento: {map_reason}"
+    
+    # Etapa 2: Ler o ID técnico diretamente da coluna do CSV
+    field_id = row_data.get('DELETION_IDENTIFIER')
+    if not field_id or len(field_id) < 15: # Validação básica do ID
+        msg = f"Coluna 'DELETION_IDENTIFIER' está vazia ou contém um ID inválido ('{field_id}')."
+        print(f"❌ Erro: {msg} ({field_log_name})")
+        return field_log_name, False, msg
+    
+    print(f"   - ID técnico lido do arquivo para {field_log_name}: {field_id}")
+    
+    # Etapa 3: Deletar o campo (agora com a lógica de verificação embutida)
+    delete_success, delete_reason = await delete_dmo_field(
+        session, instance_url, field_id, field_log_name, dry_run
+    )
+    return field_log_name, delete_success, delete_reason
+
 
 async def mass_delete_fields(file_path, dry_run):
     """Orquestra o processo de leitura, confirmação e exclusão de campos."""
     
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(file_path, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
+            required_cols = ['DELETAR', 'DMO_DISPLAY_NAME', 'FIELD_DISPLAY_NAME', 
+                             'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER']
+            if not all(col in reader.fieldnames for col in required_cols):
+                missing = [col for col in required_cols if col not in reader.fieldnames]
+                print(f"❌ Erro: O arquivo CSV '{file_path}' não contém as colunas necessárias: {', '.join(missing)}")
+                return
             all_rows = list(reader)
     except FileNotFoundError:
         print(f"❌ Erro: O arquivo de auditoria '{file_path}' não foi encontrado.")
@@ -127,13 +222,14 @@ async def mass_delete_fields(file_path, dry_run):
     print("⚠️ ATENÇÃO: Os seguintes campos estão marcados para DELEÇÃO PERMANENTE:")
     print("="*60)
     for row in fields_to_delete:
-        print(f"- DMO: {row['DMO_DISPLAY_NAME']} | Campo: {row['FIELD_DISPLAY_NAME']} ({row['FIELD_API_NAME']})")
+        has_map_str = " (COM MAPEAMENTO)" if row.get("OBJECT_MAPPING_ID") != "Não possui mapeamento" else ""
+        print(f"- DMO: {row['DMO_DISPLAY_NAME']} | Campo: {row['FIELD_DISPLAY_NAME']}{has_map_str}")
     
     if dry_run:
-        print("\n🐫 EXECUTANDO EM MODO DE SIMULAÇÃO (DRY RUN). NENHUM CAMPO SERÁ DELETADO.")
+        print("\n🐫 EXECUTANDO EM MODO DE SIMULAÇÃO (DRY RUN). NENHUM METADADO SERÁ ALTERADO.")
     else:
         print("\n" + "!"*60)
-        print("Esta ação é IRREVERSÍVEL. Uma vez deletados, os campos não podem ser recuperados.")
+        print("Esta ação é IRREVERSÍVEL. Uma vez deletados, os metadados não podem ser recuperados.")
         confirm = input("👉 Para confirmar a exclusão, digite 'CONFIRMAR' e pressione Enter: ")
         if confirm != 'CONFIRMAR':
             print("\n🚫 Exclusão cancelada pelo usuário.")
@@ -144,32 +240,22 @@ async def mass_delete_fields(file_path, dry_run):
     access_token = auth_data['access_token']
     instance_url = auth_data['instance_url']
     headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
+    
+    proxy_url = os.getenv("PROXY_URL")
+    if proxy_url:
+        print(f"🌍 Usando proxy para chamadas de API: {proxy_url}")
 
-    async with aiohttp.ClientSession(headers=headers) as session:
-        delete_tasks = []
-        print("\n🔎 Buscando IDs técnicos e preparando para exclusão (um por um)...")
-        
+    async with aiohttp.ClientSession(headers=headers, proxy=proxy_url) as session:
+        tasks = []
+        print("\n🔎 Iniciando processamento dos campos para exclusão...")
         for row in fields_to_delete:
-            dmo_api_name = row['DMO_API_NAME']
-            field_api_name = row['FIELD_API_NAME']
-            
-            soql = f"SELECT Id FROM MktDataModelField WHERE DeveloperName = '{field_api_name}' AND MktDataModelObject.DeveloperName = '{dmo_api_name}'"
-            field_records = await fetch_tooling_api_query(session, instance_url, soql)
-            
-            field_log_name = f"{row['DMO_DISPLAY_NAME']}.{row['FIELD_DISPLAY_NAME']}"
+            tasks.append(process_single_field_deletion(session, instance_url, row, dry_run))
 
-            if field_records and len(field_records) > 0:
-                field_id = field_records[0]['Id']
-                print(f"   - ID encontrado para {field_log_name}: {field_id}")
-                delete_tasks.append(delete_dmo_field(session, instance_url, field_id, field_log_name, dry_run))
-            else:
-                print(f"⚠️ Aviso: Não foi possível encontrar um ID para o campo {field_log_name}. Ele será ignorado.")
-
-        if not delete_tasks:
-            print("\nNenhum campo pôde ser processado para exclusão após a busca de IDs.")
+        if not tasks:
+            print("\nNenhum campo pôde ser processado para exclusão.")
             return
         
-        results = await asyncio.gather(*delete_tasks)
+        results = await asyncio.gather(*tasks)
     
         # Apresentar o resumo
         success_count = sum(1 for _, success, _ in results if success)
@@ -200,7 +286,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--dry-run', 
         action='store_true', 
-        help="Executa o script em modo de simulação, sem deletar nenhum campo."
+        help="Executa o script em modo de simulação, sem deletar nenhum metadado."
     )
     args = parser.parse_args()
 
@@ -208,7 +294,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(mass_delete_fields(args.file, args.dry_run))
     except Exception as e:
-        print(f"Ocorreu um erro inesperado durante o processo de exclusão: {e}")
+        print(f"\n❌ Ocorreu um erro inesperado e fatal durante a execução: {e}")
     finally:
         end_time = time.time()
         duration = end_time - start_time

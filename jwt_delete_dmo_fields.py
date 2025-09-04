@@ -3,19 +3,21 @@
 Este script realiza a exclusão em massa de campos de DMOs (Data Model Objects)
 baseado em um arquivo CSV de auditoria.
 
-Versão: 3.1 - Adiciona verificação pós-exclusão para erros 500.
+Versão: 5.0 - Ajuste para CSV Delimitado por Ponto e Vírgula (Padrão Excel Brasil)
 
 Metodologia:
 - Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
 - Suporta o uso de proxy através da variável de ambiente 'PROXY_URL'.
-- Lê um arquivo CSV e o ID técnico de deleção da coluna 'DELETION_IDENTIFIER'.
+- Lê um arquivo CSV delimitado por PONTO E VÍRGULA (';'), formato padrão de salvamento
+  do Microsoft Excel em regiões como o Brasil.
+- Lê o ID técnico de deleção da coluna 'DELETION_IDENTIFIER'.
 - Para cada campo a ser excluído:
   - Remove o mapeamento associado, se houver.
   - Tenta deletar o campo usando seu ID técnico.
-  - MELHORIA: Se a API retornar um erro 500 (Internal Server Error), o script
-    faz uma pausa e executa uma consulta de verificação para confirmar se o campo
-    foi realmente deletado. Se a verificação mostrar que o campo não existe mais,
-    a operação é marcada como SUCESSO.
+  - Lógica Robusta de Erro: Se a API retornar um erro 500 (Internal Server Error),
+    o script faz uma pausa e executa uma consulta de verificação para confirmar
+    se o campo foi realmente deletado. Se a verificação for positiva, a operação
+    é marcada como SUCESSO.
 - Pede uma confirmação explícita ao usuário antes de iniciar a exclusão.
 - Suporta um modo de simulação ('--dry-run').
 
@@ -100,7 +102,6 @@ async def delete_field_mapping(session, instance_url, obj_mapping_id, field_mapp
         print(f"❌ Erro de conexão ao remover mapeamento de {field_name_for_log}: {e}")
         return False, f"Erro de conexão: {e}"
 
-# NOVA FUNÇÃO DE VERIFICAÇÃO
 async def verify_field_deletion(session, instance_url, field_id):
     """Verifica se um campo ainda existe consultando seu ID via Tooling API."""
     soql_query = f"SELECT Id FROM MktDataModelField WHERE Id = '{field_id}'"
@@ -134,7 +135,6 @@ async def delete_dmo_field(session, instance_url, field_id, field_name_for_log, 
                 print(f"✅ Campo deletado com sucesso: {field_name_for_log}")
                 return True, "Deletado com Sucesso"
             
-            # LÓGICA DE VERIFICAÇÃO PARA ERRO 500
             elif response.status == 500:
                 print(f"⚠️  Recebido erro 500 para o campo '{field_name_for_log}'. Tentando verificar o status da exclusão...")
                 await asyncio.sleep(3) # Pausa estratégica para dar tempo à plataforma
@@ -156,7 +156,7 @@ async def delete_dmo_field(session, instance_url, field_id, field_name_for_log, 
         print(f"❌ Erro de conexão ao deletar o campo {field_name_for_log}: {e}")
         return False, f"Erro de conexão: {e}"
 
-# --- Lógica de Orquestração --- (sem alterações daqui para baixo)
+# --- Lógica de Orquestração ---
 
 async def process_single_field_deletion(session, instance_url, row_data, dry_run):
     """
@@ -186,9 +186,9 @@ async def process_single_field_deletion(session, instance_url, row_data, dry_run
     
     print(f"   - ID técnico lido do arquivo para {field_log_name}: {field_id}")
     
-    # Etapa 3: Deletar o campo (agora com a lógica de verificação embutida)
+    # Etapa 3: Deletar o campo
     delete_success, delete_reason = await delete_dmo_field(
-        session, instance_url, field_id, field_log_name, dry_run
+        session, instance_url, field_id, field_name_for_log, dry_run
     )
     return field_log_name, delete_success, delete_reason
 
@@ -198,7 +198,9 @@ async def mass_delete_fields(file_path, dry_run):
     
     try:
         with open(file_path, 'r', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f)
+            # AJUSTE: Adicionado delimiter=';' para ler arquivos salvos pelo Excel no padrão Brasil/Europa.
+            reader = csv.DictReader(f, delimiter=';')
+            
             required_cols = ['DELETAR', 'DMO_DISPLAY_NAME', 'FIELD_DISPLAY_NAME', 
                              'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER']
             if not all(col in reader.fieldnames for col in required_cols):
