@@ -2,17 +2,12 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 21.00 (Refinamento Final de Lógica)
-- BASE: v20.01 (estável)
-- CORREÇÃO (Mapeamento de Data Stream): A lógica de associação entre Data Streams
-  e DMOs foi aprimorada com a normalização dos nomes de DLOs, garantindo a
-  correta identificação dos mapeamentos.
-- CORREÇÃO (Filtro de DMOs de Sistema): O filtro para ignorar DMOs de sistema
-  agora utiliza o API Name completo (ex: 'ssot_...'), tornando-o mais eficaz.
-  A fonte dos nomes dos DMOs no relatório foi ajustada para usar os metadados
-  da SSOT API, garantindo 'Display Name' e 'API Name' corretos.
-- CORREÇÃO (Deletion Identifier): O identificador para Data Streams no relatório
-  agora é preenchido corretamente com o nome do Data Stream.
+Versão: 21.01 (Leitura de CSV Robusta)
+- BASE: v21.00 (estável)
+- CORREÇÃO (Leitura de CSV Robusta): A função que lê o 'ativacoes_campos.csv'
+  foi corrigida para lidar com linhas de dados que contêm colunas extras
+  (mais valores que o cabeçalho), o que causava um erro de 
+  "AttributeError: 'NoneType' object has no attribute 'lower'".
 """
 import os
 import time
@@ -179,7 +174,9 @@ def load_dmos_from_activations_csv(config: Config) -> set:
         with open(config.ACTIVATION_FIELDS_CSV, mode='r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                row_lower = {k.lower(): v for k, v in row.items()}
+                # CORREÇÃO: Garante que a chave do cabeçalho não seja Nula antes de processar,
+                # o que pode acontecer em linhas com colunas a mais que o cabeçalho.
+                row_lower = {k.lower(): v for k, v in row.items() if k is not None}
                 if entity_name := row_lower.get('entityname'):
                     if '__dlm' in entity_name:
                         dmo_set.add(normalize_api_name(entity_name))
@@ -229,7 +226,7 @@ async def main():
     config = Config()
     setup_logging(config.LOG_FILE)
     
-    logging.info("🚀 Iniciando auditoria de objetos v21.00 (Final Estável)...")
+    logging.info("🚀 Iniciando auditoria de objetos v21.01...")
     auth_data = get_access_token(config)
     
     async with SalesforceClient(config, auth_data) as client:
@@ -290,6 +287,7 @@ async def main():
         
         dmo_details_map = {rec.get('DeveloperName'): rec for rec in data.get('dmo_tooling', [])}
         datastream_details_map = {rec.get('Name'): rec for rec in data.get('datastream_sobjects', [])}
+        dmo_metadata_map = {dmo.get('name'): dmo for dmo in data.get('dmo_metadata', [])}
 
         dmos_used = defaultdict(list)
         if dmos_from_csv := load_dmos_from_activations_csv(config):
