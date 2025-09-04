@@ -2,14 +2,17 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 21.04 (Debug Integrado)
-- BASE: v21.03 (estável)
-- RECURSO DE DEBUG: Adicionada instrumentação para diagnosticar o problema de
-  mapeamentos não encontrados. O script agora é totalmente funcional E TAMBÉM
-  gera os seguintes arquivos para análise:
-  - 'debug_mapping_calls.csv': Registra cada URL consultada na API de mapeamentos.
-  - 'debug_mapping_responses.json': Salva a resposta bruta da API para cada
-    consulta de mapeamento, permitindo a análise da estrutura do JSON.
+Versão: 22.00 (Correção de Filtro e Chamada de Mapeamento)
+- BASE: v21.04
+- CORREÇÃO CRÍTICA (Mapeamentos): A lógica para construir a lista de DMOs a
+  serem verificados foi corrigida. O script agora usa os metadados da SSOT API
+  como fonte da verdade, garantindo que:
+  1. O filtro de exclusão de DMOs de sistema seja aplicado ao API Name completo
+     (ex: 'ssot_...'), funcionando corretamente.
+  2. A chamada à API de mapeamentos utilize o API Name completo, permitindo
+     que os mapeamentos sejam encontrados.
+- OBJETIVO: Garantir que a detecção de mapeamentos funcione corretamente,
+  resolvendo a principal inconsistência das versões anteriores.
 """
 import os
 import time
@@ -52,9 +55,6 @@ class Config:
     OUTPUT_CSV_FILE = 'audit_objetos_para_exclusao.csv'
     ACTIVATION_FIELDS_CSV = 'ativacoes_campos.csv'
     LOG_FILE = 'audit_data_cloud_objects.log'
-    ### ARQUIVOS DE DEBUG ###
-    DEBUG_MAPPING_CALLS_CSV = 'debug_mapping_calls.csv'
-    DEBUG_MAPPING_RESPONSES_JSON = 'debug_mapping_responses.json'
 
 # ==============================================================================
 # --- 헬 FUNÇÕES AUXILIARES E LOGGING ---
@@ -167,18 +167,8 @@ class SalesforceClient:
     
     async def fetch_dmo_mapping_details(self, dmo_name: str):
         params = {'dataspace': 'default', 'dmoDeveloperName': dmo_name}
-        url_path = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings?{urlencode(params)}"
-        
-        ### DEBUG: Registra a chamada que será feita ###
-        try:
-            with open(self.config.DEBUG_MAPPING_CALLS_CSV, 'a', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                full_url = urljoin(self.instance_url, url_path)
-                writer.writerow([datetime.now().isoformat(), dmo_name, full_url])
-        except Exception as e:
-            logging.error(f"Falha ao escrever no arquivo de debug de chamadas: {e}")
-
-        return await self._fetch_with_retry(url_path)
+        url = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings?{urlencode(params)}"
+        return await self._fetch_with_retry(url)
 
 # ==============================================================================
 # --- 📊 FUNÇÕES DE ANÁLISE DE DEPENDÊNCIA ---
@@ -239,7 +229,7 @@ async def main():
     config = Config()
     setup_logging(config.LOG_FILE)
     
-    logging.info("🚀 Iniciando auditoria de objetos v21.04 (Debug Integrado)...")
+    logging.info("🚀 Iniciando auditoria de objetos v22.00...")
     auth_data = get_access_token(config)
     
     async with SalesforceClient(config, auth_data) as client:
@@ -263,33 +253,15 @@ async def main():
         # ETAPA 2: Coleta Segura de Mapeamentos e Processamento
         logging.info("--- Etapa 2/4: Processando dados e coletando mapeamentos... ---")
 
+        ### CORREÇÃO: Usa 'dmo_metadata' para filtrar e obter o nome completo para a chamada ###
         dmos_to_check_for_mappings = [
-            dmo.get('DeveloperName') for dmo in data.get('dmo_tooling', []) 
-            if dmo.get('DeveloperName') and not any(dmo.get('DeveloperName').lower().startswith(p) for p in config.DMO_PREFIXES_TO_EXCLUDE)
+            dmo_meta.get('name') for dmo_meta in data.get('dmo_metadata', [])
+            if (dmo_api_name := dmo_meta.get('name')) and not any(dmo_api_name.lower().startswith(p) for p in config.DMO_PREFIXES_TO_EXCLUDE)
         ]
         logging.info(f"Identificados {len(dmos_to_check_for_mappings)} DMOs customizados para verificação de mapeamentos.")
         
-        ### DEBUG: Inicializa o arquivo de log de chamadas ###
-        try:
-            with open(config.DEBUG_MAPPING_CALLS_CSV, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(['timestamp', 'dmo_name_passed_to_api', 'full_url_called'])
-            logging.info(f"Arquivo de debug de chamadas '{config.DEBUG_MAPPING_CALLS_CSV}' inicializado.")
-        except Exception as e:
-            logging.error(f"Não foi possível criar o arquivo de debug de chamadas: {e}")
-
         mapping_tasks = [client.fetch_dmo_mapping_details(dmo_name) for dmo_name in dmos_to_check_for_mappings]
         all_mappings_results = await tqdm.gather(*mapping_tasks, desc="Coletando mapeamentos de DMOs")
-
-        ### DEBUG: Salva as respostas brutas em um arquivo JSON ###
-        logging.info(f"Recebidas {len(all_mappings_results)} respostas da API de mapeamentos.")
-        try:
-            responses_with_dmo_names = dict(zip(dmos_to_check_for_mappings, all_mappings_results))
-            with open(config.DEBUG_MAPPING_RESPONSES_JSON, 'w', encoding='utf-8') as f:
-                json.dump(responses_with_dmo_names, f, indent=4, ensure_ascii=False)
-            logging.info(f"Respostas brutas da API de mapeamento salvas em '{config.DEBUG_MAPPING_RESPONSES_JSON}'.")
-        except Exception as e:
-            logging.error(f"Não foi possível salvar o arquivo de debug de respostas: {e}")
 
         dlo_to_dmos_map = defaultdict(list)
         dmos_with_mappings = set()
