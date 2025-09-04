@@ -2,17 +2,16 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 17.01 (Correção Final de CreatedById)
-- BASE: v17.00
-- CORREÇÃO (CreatedById para DMOs e Data Streams): O script foi ajustado para
-  utilizar as fontes de dados corretas para obter o ID do criador de DMOs
-  (via Tooling API, objeto MktDataModelObject) e Data Streams (via Query API,
-  objeto DataStream).
-- COLETA DE DADOS OTIMIZADA: As consultas necessárias foram adicionadas, e a
-  coleta de IDs de usuários foi unificada para garantir que todos os nomes
-  sejam buscados corretamente em uma única chamada.
-- RESULTADO: A coluna 'CREATED_BY_NAME' agora é preenchida corretamente para
-  todos os tipos de objeto no relatório final.
+Versão: 17.03 (Refinamento de Lógica de Data Streams)
+- BASE: v17.01 estável.
+- CORREÇÃO (Leitura de CSV): Aplicado ajuste pontual para ler o cabeçalho
+  'entityname' em minúsculo no arquivo de ativações.
+- REFINAMENTO (Razão de Data Stream): A mensagem para Data Streams inativos
+  agora exibe o nome do DMO de destino (não o DLO) e usa a palavra "mapeado".
+- NOVA LÓGICA (Órfão por Herança): Data Streams inativos agora são reclassificados
+  como "Órfãos" se o DMO para o qual eles mapeiam também for identificado
+  como órfão na mesma execução. A ordem da auditoria foi ajustada para
+  suportar essa dependência.
 """
 import os
 import time
@@ -182,14 +181,19 @@ class SalesforceClient:
 def load_dmos_from_activations_csv(config: Config) -> set:
     dmo_set = set()
     try:
-        with open(config.ACTIVATION_FIELDS_CSV, mode='r', encoding='utf-8') as f:
+        with open(config.ACTIVATION_FIELDS_CSV, mode='r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                if entity_name := row.get('entityName'):
-                    if '__dlm' in entity_name: dmo_set.add(normalize_api_name(entity_name))
+                ### AJUSTE: Alterado para 'entityname' (minúsculo) ###
+                if entity_name := row.get('entityname'):
+                    if '__dlm' in entity_name:
+                        dmo_set.add(normalize_api_name(entity_name))
+
         logging.info(f"✅ Encontrados {len(dmo_set)} DMOs únicos no CSV de ativações.")
     except FileNotFoundError:
         logging.warning(f"⚠️ Arquivo '{config.ACTIVATION_FIELDS_CSV}' não encontrado.")
+    except Exception as e:
+        logging.error(f"❌ Erro inesperado ao ler o CSV de ativações: {e}")
     return dmo_set
 
 def find_dmos_in_payload(payload, dmos_used: defaultdict, source_type: str):
@@ -231,7 +235,7 @@ async def main():
     config = Config()
     setup_logging(config.LOG_FILE)
     
-    logging.info("🚀 Iniciando auditoria de objetos v17.01...")
+    logging.info("🚀 Iniciando auditoria de objetos v17.03...")
     auth_data = get_access_token(config)
     
     async with SalesforceClient(config, auth_data) as client:
@@ -241,10 +245,10 @@ async def main():
         dmos_from_csv = load_dmos_from_activations_csv(config)
         
         tasks = {
-            "dmo_tooling": client.query_api("SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject", tooling=True),
+            "dmo_tooling": client.query_api("SELECT Id, DeveloperName, CreatedDate, CreatedById, DataLakeObjectApiName FROM MktDataModelObject", tooling=True),
             "all_segments": client.query_api("SELECT Id, Name, IncludeCriteria, ExcludeCriteria, CreatedById FROM MarketSegment"),
             "all_activations": client.query_api("SELECT Id, Name, MarketSegmentId, LastModifiedDate, CreatedById FROM MarketSegmentActivation"),
-            "datastream_sobjects": client.query_api("SELECT Id, Name, CreatedById FROM DataStream"), # <--- NOVA CONSULTA
+            "datastream_sobjects": client.query_api("SELECT Id, Name, CreatedById FROM DataStream"),
             "dmo_metadata": client.get_ssot_metadata("DataModelObject"),
             "calculated_insights": client.get_ssot_metadata("CalculatedInsight", key_name='records'),
             "data_graphs": client.get_ssot_endpoint("data-graphs/metadata", key_name='dataGraphMetadata'),
@@ -257,7 +261,6 @@ async def main():
         # ETAPA 2: Processamento e Mapeamento de Dependências
         logging.info("--- Etapa 2/4: Processando dados e mapeando dependências... ---")
 
-        ### LÓGICA CORRIGIDA: Coleta unificada de IDs de criadores ###
         all_creator_ids = set()
         for key in ["dmo_tooling", "all_segments", "all_activations", "datastream_sobjects"]:
             if data.get(key):
@@ -270,8 +273,7 @@ async def main():
             logging.info(f"Buscando nomes para {len(all_creator_ids)} criadores únicos...")
             user_ids_str = "','".join(list(all_creator_ids))
             user_records = await client.query_api(f"SELECT Id, Name FROM User WHERE Id IN ('{user_ids_str}')")
-            if user_records:
-                user_id_to_name_map = {user['Id']: user['Name'] for user in user_records}
+            if user_records: user_id_to_name_map = {user['Id']: user['Name'] for user in user_records}
         
         dmo_details_map = {rec.get('DeveloperName'): rec for rec in data.get('dmo_tooling', [])}
         datastream_details_map = {rec.get('Name'): rec for rec in data.get('datastream_sobjects', [])}
@@ -281,6 +283,9 @@ async def main():
         if cis := data.get('calculated_insights'): find_dmos_in_payload(cis, dmos_used, "Calculated Insight")
         if dgs := data.get('data_graphs'): find_dmos_in_payload(dgs, dmos_used, "Data Graph")
         if das := data.get('data_actions'): find_dmos_in_payload(das, dmos_used, "Data Action")
+
+        ### REFINAMENTO: Cria mapa de DLO para DMO ###
+        dlo_to_dmo_map = {dmo.get('DataLakeObjectApiName'): dmo.get('DeveloperName') for dmo in data.get('dmo_tooling', []) if dmo.get('DataLakeObjectApiName')}
 
         nested_segment_parents = defaultdict(list)
         if segments_data := data.get('all_segments'):
@@ -295,12 +300,14 @@ async def main():
         
         segment_publications = {str(act.get('MarketSegmentId', ''))[:15]: parse_sf_date(act.get('LastModifiedDate')) for act in data.get('all_activations', []) if act.get('MarketSegmentId')}
 
-        # ETAPA 3: Lógica de Auditoria
+        # ETAPA 3: Lógica de Auditoria (em duas passagens)
         logging.info("--- Etapa 3/4: Executando lógica de auditoria... ---")
         audit_results = []
         
-        logging.info("Auditando Segmentos, Ativações e Data Streams...")
-        deletable_segment_ids = set()
+        # PASSAGEM 1: Avalia objetos primários (Segmentos e DMOs)
+        deletable_segment_ids, deletable_dmo_names = set(), set()
+        dmo_audit_buffer = []
+
         if segments_data:
             for seg in segments_data:
                 seg_id = str(seg.get('Id', ''))[:15]
@@ -315,32 +322,8 @@ async def main():
                         status, reason = "Inativo", f"Não publicado, mas usado como filtro em: {', '.join(nested_segment_parents[seg_id])}"
                     audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': seg_id, 'DISPLAY_NAME': seg.get('Name'), 'OBJECT_TYPE': 'SEGMENT', 'STATUS': status, 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Publicação', 'DIAS_ATIVIDADE': days_since(last_pub_date) or f'>{config.INACTIVE_SEGMENT_DAYS}', 'CREATED_BY_NAME': user_id_to_name_map.get(seg.get('CreatedById'), 'Desconhecido'), 'DELETION_IDENTIFIER': seg.get('Id')})
 
-        if activations_data := data.get('all_activations'):
-            for act in activations_data:
-                if str(act.get('MarketSegmentId', ''))[:15] in deletable_segment_ids:
-                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': act.get('Id'), 'DISPLAY_NAME': act.get('Name'), 'OBJECT_TYPE': 'ACTIVATION', 'STATUS': 'Órfã', 'REASON': 'Associada a um segmento órfão.', 'TIPO_ATIVIDADE': 'N/A', 'DIAS_ATIVIDADE': 'N/A', 'CREATED_BY_NAME': user_id_to_name_map.get(act.get('CreatedById'), 'Desconhecido'), 'DELETION_IDENTIFIER': act.get('Id')})
-
-        if streams_data_ssot := data.get('data_streams_ssot'):
-            for ds in streams_data_ssot:
-                last_ingest = parse_sf_date(ds.get('lastIngestDate'))
-                if not last_ingest or days_since(last_ingest) > config.INACTIVE_STREAM_DAYS:
-                    has_dlo_connection = bool(ds.get('dataLakeObjectInfo'))
-                    status, reason = "", ""
-                    dlo_name = ds.get('dataLakeObjectInfo', {}).get('name', 'N/A')
-                    if not has_dlo_connection: 
-                        status, reason = "Órfão", f"Última ingestão > {config.INACTIVE_STREAM_DAYS} dias e sem conexão com um DLO."
-                    else: 
-                        status, reason = "Inativo", f"Última ingestão > {config.INACTIVE_STREAM_DAYS} dias, mas possui conexão com DLO: {dlo_name}."
-                    
-                    ### LÓGICA CORRIGIDA: Busca o criador no mapa de Data Streams ###
-                    ds_details = datastream_details_map.get(ds.get('name'), {})
-                    creator_name = user_id_to_name_map.get(ds_details.get('CreatedById'), 'Desconhecido')
-                    
-                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds.get('name'), 'DISPLAY_NAME': ds.get('label'), 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': status, 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_since(last_ingest) or f'>{config.INACTIVE_STREAM_DAYS}', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds.get('id')})
-        
-        logging.info("Auditando DMOs...")
         if dmo_metadata := data.get('dmo_metadata'):
-            for dmo in tqdm(dmo_metadata, desc="Auditando DMOs"):
+            for dmo in tqdm(dmo_metadata, desc="Auditando DMOs (Passagem 1)"):
                 dmo_api_name = dmo.get('name')
                 if not dmo_api_name or not dmo_api_name.endswith('__dlm') or any(dmo_api_name.lower().startswith(p) for p in config.DMO_PREFIXES_TO_EXCLUDE):
                     continue
@@ -351,9 +334,37 @@ async def main():
                 if not is_in_use and is_old_enough:
                     has_mappings = await client.check_dmo_mappings(dmo_api_name)
                     if not has_mappings:
-                        ### LÓGICA CORRIGIDA: Busca o criador no mapa de DMOs ###
                         creator_name = user_id_to_name_map.get(dmo_details.get('CreatedById'), 'Desconhecido')
-                        audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': dmo_api_name, 'DISPLAY_NAME': dmo.get('displayName', dmo_api_name), 'OBJECT_TYPE': 'DMO', 'STATUS': 'Órfão', 'REASON': f"Criado > {config.ORPHAN_DMO_DAYS} dias, sem uso conhecido e sem mapeamentos de ingestão.", 'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_since(created_date) or f'>{config.ORPHAN_DMO_DAYS}', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': dmo_details.get('Id', 'ID não encontrado')})
+                        dmo_audit_buffer.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': dmo_api_name, 'DISPLAY_NAME': dmo.get('displayName', dmo_api_name), 'OBJECT_TYPE': 'DMO', 'STATUS': 'Órfão', 'REASON': f"Criado > {config.ORPHAN_DMO_DAYS} dias, sem uso conhecido e sem mapeamentos de ingestão.", 'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_since(created_date) or f'>{config.ORPHAN_DMO_DAYS}', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': dmo_details.get('Id', 'ID não encontrado')})
+                        deletable_dmo_names.add(dmo_api_name)
+        
+        # PASSAGEM 2: Avalia objetos dependentes (Ativações e Data Streams)
+        if activations_data := data.get('all_activations'):
+            for act in activations_data:
+                if str(act.get('MarketSegmentId', ''))[:15] in deletable_segment_ids:
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': act.get('Id'), 'DISPLAY_NAME': act.get('Name'), 'OBJECT_TYPE': 'ACTIVATION', 'STATUS': 'Órfã', 'REASON': 'Associada a um segmento órfão.', 'TIPO_ATIVIDADE': 'N/A', 'DIAS_ATIVIDADE': 'N/A', 'CREATED_BY_NAME': user_id_to_name_map.get(act.get('CreatedById'), 'Desconhecido'), 'DELETION_IDENTIFIER': act.get('Id')})
+
+        if streams_data_ssot := data.get('data_streams_ssot'):
+            for ds in tqdm(streams_data_ssot, desc="Auditando Data Streams (Passagem 2)"):
+                last_ingest = parse_sf_date(ds.get('lastIngestDate'))
+                if not last_ingest or days_since(last_ingest) > config.INACTIVE_STREAM_DAYS:
+                    ds_details = datastream_details_map.get(ds.get('name'), {})
+                    creator_name = user_id_to_name_map.get(ds_details.get('CreatedById'), 'Desconhecido')
+                    dlo_info = ds.get('dataLakeObjectInfo')
+                    dlo_name = dlo_info.get('name') if dlo_info else None
+                    target_dmo_name = dlo_to_dmo_map.get(dlo_name)
+                    
+                    if not dlo_info or not target_dmo_name:
+                        status, reason = "Órfão", f"Última ingestão > {config.INACTIVE_STREAM_DAYS} dias e sem mapeamento para um DMO."
+                    elif target_dmo_name in deletable_dmo_names:
+                        status, reason = "Órfão", f"Mapeado apenas para o DMO órfão: {target_dmo_name}."
+                    else:
+                        status, reason = "Inativo", f"Última ingestão > {config.INACTIVE_STREAM_DAYS} dias, mas está mapeado para o DMO ativo: {target_dmo_name}."
+                    
+                    audit_results.append({'DELETAR': 'NAO', 'ID_OR_API_NAME': ds.get('name'), 'DISPLAY_NAME': ds.get('label'), 'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': status, 'REASON': reason, 'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_since(last_ingest) or f'>{config.INACTIVE_STREAM_DAYS}', 'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': ds.get('id')})
+        
+        # Adiciona os DMOs órfãos à lista final
+        audit_results.extend(dmo_audit_buffer)
         
         # ETAPA 4: Geração do Relatório
         logging.info("--- Etapa 4/4: Gerando relatório CSV... ---")
