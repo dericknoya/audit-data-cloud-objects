@@ -2,12 +2,12 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 21.01 (Leitura de CSV Robusta)
-- BASE: v21.00 (estável)
-- CORREÇÃO (Leitura de CSV Robusta): A função que lê o 'ativacoes_campos.csv'
-  foi corrigida para lidar com linhas de dados que contêm colunas extras
-  (mais valores que o cabeçalho), o que causava um erro de 
-  "AttributeError: 'NoneType' object has no attribute 'lower'".
+Versão: 21.03 (Ajuste Final de Payload)
+- BASE: v21.02 (estável)
+- CORREÇÃO (Leitura de Payload de Data Stream): Ajustada a lógica para extrair
+  corretamente o nome do DLO de dentro do objeto 'dataLakeObjectInfo' no
+  payload de Data Streams. Isso garante que a associação entre Data Stream
+  e DMO seja feita com o identificador correto.
 """
 import os
 import time
@@ -174,8 +174,6 @@ def load_dmos_from_activations_csv(config: Config) -> set:
         with open(config.ACTIVATION_FIELDS_CSV, mode='r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                # CORREÇÃO: Garante que a chave do cabeçalho não seja Nula antes de processar,
-                # o que pode acontecer em linhas com colunas a mais que o cabeçalho.
                 row_lower = {k.lower(): v for k, v in row.items() if k is not None}
                 if entity_name := row_lower.get('entityname'):
                     if '__dlm' in entity_name:
@@ -226,7 +224,7 @@ async def main():
     config = Config()
     setup_logging(config.LOG_FILE)
     
-    logging.info("🚀 Iniciando auditoria de objetos v21.01...")
+    logging.info("🚀 Iniciando auditoria de objetos v21.03...")
     auth_data = get_access_token(config)
     
     async with SalesforceClient(config, auth_data) as client:
@@ -262,14 +260,19 @@ async def main():
         dlo_to_dmos_map = defaultdict(list)
         dmos_with_mappings = set()
         for payload in all_mappings_results:
-            if payload and (mappings := payload.get('objectSourceTargetMaps')):
-                for mapping in mappings:
-                    source_dlo = mapping.get('sourceEntityDeveloperName')
-                    target_dmo = mapping.get('targetEntityDeveloperName')
-                    if source_dlo and target_dmo:
-                        normalized_dlo = normalize_api_name(source_dlo)
-                        dlo_to_dmos_map[normalized_dlo].append(target_dmo)
-                        dmos_with_mappings.add(target_dmo)
+            mappings = []
+            if isinstance(payload, dict):
+                mappings = payload.get('objectSourceTargetMaps', [])
+            elif isinstance(payload, list):
+                mappings = payload
+            
+            for mapping in mappings:
+                source_dlo = mapping.get('sourceEntityDeveloperName')
+                target_dmo = mapping.get('targetEntityDeveloperName')
+                if source_dlo and target_dmo:
+                    normalized_dlo = normalize_api_name(source_dlo)
+                    dlo_to_dmos_map[normalized_dlo].append(target_dmo)
+                    dmos_with_mappings.add(target_dmo)
         logging.info(f"Processados {len(dmos_with_mappings)} DMOs com mapeamentos.")
 
         all_creator_ids = set()
@@ -287,7 +290,6 @@ async def main():
         
         dmo_details_map = {rec.get('DeveloperName'): rec for rec in data.get('dmo_tooling', [])}
         datastream_details_map = {rec.get('Name'): rec for rec in data.get('datastream_sobjects', [])}
-        dmo_metadata_map = {dmo.get('name'): dmo for dmo in data.get('dmo_metadata', [])}
 
         dmos_used = defaultdict(list)
         if dmos_from_csv := load_dmos_from_activations_csv(config):
@@ -348,15 +350,10 @@ async def main():
                     if not has_mappings:
                         creator_name = user_id_to_name_map.get(dmo_details.get('CreatedById'), 'Desconhecido')
                         dmo_audit_buffer.append({
-                            'DELETAR': 'NAO', 
-                            'ID_OR_API_NAME': dmo_api_name, 
-                            'DISPLAY_NAME': dmo_meta.get('displayName', dmo_api_name),
-                            'OBJECT_TYPE': 'DMO', 'STATUS': 'Órfão', 
-                            'REASON': f"Criado > {config.ORPHAN_DMO_DAYS} dias, sem uso conhecido e sem mapeamentos de ingestão.", 
-                            'TIPO_ATIVIDADE': 'Criação', 
-                            'DIAS_ATIVIDADE': days_since(created_date) or f'>{config.ORPHAN_DMO_DAYS}', 
-                            'CREATED_BY_NAME': creator_name, 
-                            'DELETION_IDENTIFIER': dmo_details.get('Id', 'ID não encontrado')
+                            'DELETAR': 'NAO', 'ID_OR_API_NAME': dmo_api_name, 'DISPLAY_NAME': dmo_meta.get('displayName', dmo_api_name),
+                            'OBJECT_TYPE': 'DMO', 'STATUS': 'Órfão', 'REASON': f"Criado > {config.ORPHAN_DMO_DAYS} dias, sem uso conhecido e sem mapeamentos de ingestão.", 
+                            'TIPO_ATIVIDADE': 'Criação', 'DIAS_ATIVIDADE': days_since(created_date) or f'>{config.ORPHAN_DMO_DAYS}', 
+                            'CREATED_BY_NAME': creator_name, 'DELETION_IDENTIFIER': dmo_details.get('Id', 'ID não encontrado')
                         })
                         deletable_dmo_names.add(dmo_api_name)
         
@@ -371,6 +368,8 @@ async def main():
                 if not last_ingest or days_since(last_ingest) > config.INACTIVE_STREAM_DAYS:
                     ds_details = datastream_details_map.get(ds.get('name'), {})
                     creator_name = user_id_to_name_map.get(ds_details.get('CreatedById'), 'Desconhecido')
+                    
+                    ### CORREÇÃO: Busca o nome do DLO de dentro do objeto 'dataLakeObjectInfo' ###
                     dlo_name = ds.get('dataLakeObjectInfo', {}).get('name')
                     
                     normalized_dlo_name = normalize_api_name(dlo_name)
@@ -391,7 +390,7 @@ async def main():
                         'OBJECT_TYPE': 'DATA_STREAM', 'STATUS': status, 'REASON': reason, 
                         'TIPO_ATIVIDADE': 'Última Ingestão', 'DIAS_ATIVIDADE': days_since(last_ingest) or f'>{config.INACTIVE_STREAM_DAYS}', 
                         'CREATED_BY_NAME': creator_name, 
-                        'DELETION_IDENTIFIER': ds.get('name')
+                        'DELETION_IDENTIFIER': dlo_name or ds.get('name')
                     })
         
         audit_results.extend(dmo_audit_buffer)
