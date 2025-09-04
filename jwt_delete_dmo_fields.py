@@ -3,23 +3,21 @@
 Este script realiza a exclusão em massa de campos de DMOs (Data Model Objects)
 baseado em um arquivo CSV de auditoria.
 
-Versão: 5.0 - Ajuste para CSV Delimitado por Ponto e Vírgula (Padrão Excel Brasil)
+Versão: 6.0 - Relatório Detalhado e Resiliência a Mapeamentos Já Excluídos
 
 Metodologia:
 - Utiliza o fluxo de autenticação JWT Bearer Flow (com certificado).
 - Suporta o uso de proxy através da variável de ambiente 'PROXY_URL'.
-- Lê um arquivo CSV delimitado por PONTO E VÍRGULA (';'), formato padrão de salvamento
-  do Microsoft Excel em regiões como o Brasil.
-- Lê o ID técnico de deleção da coluna 'DELETION_IDENTIFIER'.
+- Lê um arquivo CSV delimitado por PONTO E VÍRGULA (';').
 - Para cada campo a ser excluído:
-  - Remove o mapeamento associado, se houver.
-  - Tenta deletar o campo usando seu ID técnico.
-  - Lógica Robusta de Erro: Se a API retornar um erro 500 (Internal Server Error),
-    o script faz uma pausa e executa uma consulta de verificação para confirmar
-    se o campo foi realmente deletado. Se a verificação for positiva, a operação
-    é marcada como SUCESSO.
-- Pede uma confirmação explícita ao usuário antes de iniciar a exclusão.
-- Suporta um modo de simulação ('--dry-run').
+  - Remove o mapeamento associado. Se o mapeamento já foi removido (erro 404),
+    a operação é considerada um sucesso e o script continua sem logar erro.
+  - Tenta deletar o campo usando o ID da coluna 'DELETION_IDENTIFIER'.
+  - Lógica Robusta de Erro 500: Se a API retornar um erro 500 na exclusão do campo,
+    o script faz uma verificação para confirmar se a operação foi bem-sucedida em
+    segundo plano.
+- Relatório Final: Ao final da execução, exibe duas listas claras: uma com todos os
+  campos deletados com sucesso e outra com todas as falhas e seus respectivos motivos.
 
 !! ATENÇÃO !!
 !! ESTE SCRIPT É DESTRUTIVO E DELETA METADADOS PERMANENTEMENTE. !!
@@ -81,7 +79,7 @@ def get_access_token():
 # --- Funções da API ---
 
 async def delete_field_mapping(session, instance_url, obj_mapping_id, field_mapping_id, field_name_for_log, dry_run=False):
-    """Deleta o mapeamento de um campo de DMO."""
+    """Deleta o mapeamento de um campo, tratando o caso de já ter sido deletado (404) como sucesso."""
     delete_url = (f"{instance_url}/services/data/v64.0/ssot/data-model-object-mappings/"
                   f"{obj_mapping_id}/field-mappings/{field_mapping_id}")
 
@@ -91,9 +89,12 @@ async def delete_field_mapping(session, instance_url, obj_mapping_id, field_mapp
     
     try:
         async with session.delete(delete_url) as response:
-            if response.status == 204:
-                print(f"✅ Mapeamento do campo '{field_name_for_log}' removido com sucesso.")
-                return True, "Mapeamento Removido"
+            # AJUSTE: Trata 204 (sucesso) e 404 (já removido) como sucesso na operação.
+            if response.status in [204, 404]:
+                if response.status == 204:
+                    print(f"✅ Mapeamento do campo '{field_name_for_log}' removido com sucesso.")
+                # Se for 404, não loga nada, apenas continua.
+                return True, "Mapeamento removido ou já inexistente"
             else:
                 error_text = await response.text()
                 print(f"❌ Falha ao remover mapeamento de {field_name_for_log}: {response.status} - {error_text}")
@@ -111,11 +112,9 @@ async def verify_field_deletion(session, instance_url, field_id):
         async with session.get(url) as response:
             response.raise_for_status()
             data = await response.json()
-            # Se a lista de 'records' estiver vazia, o campo foi deletado com sucesso.
             return not data.get('records')
     except aiohttp.ClientError as e:
         print(f"❌ Erro durante a verificação da exclusão: {e}")
-        # Por segurança, se a verificação falhar, assumimos que a exclusão falhou.
         return False
 
 async def delete_dmo_field(session, instance_url, field_id, field_name_for_log, dry_run=False):
@@ -128,16 +127,15 @@ async def delete_dmo_field(session, instance_url, field_id, field_name_for_log, 
 
     try:
         async with session.delete(delete_url) as response:
-            # Captura o texto do erro no início para usar depois, se necessário
             error_text = await response.text()
 
-            if response.status == 204: # 204 No Content é o sucesso para DELETE
+            if response.status == 204:
                 print(f"✅ Campo deletado com sucesso: {field_name_for_log}")
                 return True, "Deletado com Sucesso"
             
             elif response.status == 500:
                 print(f"⚠️  Recebido erro 500 para o campo '{field_name_for_log}'. Tentando verificar o status da exclusão...")
-                await asyncio.sleep(3) # Pausa estratégica para dar tempo à plataforma
+                await asyncio.sleep(3)
                 
                 is_truly_deleted = await verify_field_deletion(session, instance_url, field_id)
                 
@@ -148,7 +146,7 @@ async def delete_dmo_field(session, instance_url, field_id, field_name_for_log, 
                     print(f"❌ Verificação mostrou que o campo '{field_name_for_log}' ainda existe. A exclusão falhou.")
                     return False, f"Erro 500 e verificação confirmou falha: {error_text}"
             
-            else: # Trata outros erros (400, 403, 404, etc.)
+            else:
                 print(f"❌ Falha ao deletar o campo {field_name_for_log}: {response.status} - {error_text}")
                 return False, f"Erro {response.status}: {error_text}"
                 
@@ -159,36 +157,29 @@ async def delete_dmo_field(session, instance_url, field_id, field_name_for_log, 
 # --- Lógica de Orquestração ---
 
 async def process_single_field_deletion(session, instance_url, row_data, dry_run):
-    """
-    Processa a exclusão de um único campo, lendo o ID diretamente do CSV.
-    Retorna uma tupla (nome_do_campo, sucesso, mensagem).
-    """
     field_log_name = f"{row_data['DMO_DISPLAY_NAME']}.{row_data['FIELD_DISPLAY_NAME']}"
     obj_mapping_id = row_data.get("OBJECT_MAPPING_ID")
     field_mapping_id = row_data.get("FIELD_MAPPING_ID")
 
-    # Etapa 1: Remover mapeamento, se existir
     has_mapping = obj_mapping_id and obj_mapping_id != "Não possui mapeamento"
     if has_mapping:
-        print(f"   - Campo '{field_log_name}' possui mapeamento. Removendo primeiro...")
+        print(f"   - Campo '{field_log_name}' possui mapeamento. Processando remoção...")
         map_success, map_reason = await delete_field_mapping(
             session, instance_url, obj_mapping_id, field_mapping_id, field_log_name, dry_run
         )
         if not map_success:
             return field_log_name, False, f"Falha na remoção do mapeamento: {map_reason}"
     
-    # Etapa 2: Ler o ID técnico diretamente da coluna do CSV
     field_id = row_data.get('DELETION_IDENTIFIER')
-    if not field_id or len(field_id) < 15: # Validação básica do ID
+    if not field_id or len(field_id) < 15:
         msg = f"Coluna 'DELETION_IDENTIFIER' está vazia ou contém um ID inválido ('{field_id}')."
         print(f"❌ Erro: {msg} ({field_log_name})")
         return field_log_name, False, msg
     
     print(f"   - ID técnico lido do arquivo para {field_log_name}: {field_id}")
     
-    # Etapa 3: Deletar o campo
     delete_success, delete_reason = await delete_dmo_field(
-        session, instance_url, field_id, field_name_for_log, dry_run
+        session, instance_url, field_id, field_log_name, dry_run
     )
     return field_log_name, delete_success, delete_reason
 
@@ -198,9 +189,7 @@ async def mass_delete_fields(file_path, dry_run):
     
     try:
         with open(file_path, 'r', encoding='utf-8-sig') as f:
-            # AJUSTE: Adicionado delimiter=';' para ler arquivos salvos pelo Excel no padrão Brasil/Europa.
             reader = csv.DictReader(f, delimiter=';')
-            
             required_cols = ['DELETAR', 'DMO_DISPLAY_NAME', 'FIELD_DISPLAY_NAME', 
                              'OBJECT_MAPPING_ID', 'FIELD_MAPPING_ID', 'DELETION_IDENTIFIER']
             if not all(col in reader.fieldnames for col in required_cols):
@@ -259,24 +248,36 @@ async def mass_delete_fields(file_path, dry_run):
         
         results = await asyncio.gather(*tasks)
     
-        # Apresentar o resumo
-        success_count = sum(1 for _, success, _ in results if success)
-        failure_count = len(results) - success_count
+        # AJUSTE: Apresentar o resumo detalhado com listas de sucesso e falha.
+        successful_deletions = []
+        failed_deletions = []
+        for field, success, reason in results:
+            if success:
+                successful_deletions.append(field)
+            else:
+                failed_deletions.append({'field': field, 'reason': reason})
+
+        print("\n" + "="*60)
+        print("📊 RELATÓRIO FINAL DE EXCLUSÃO")
+        print("="*60)
+
+        # Lista de Sucessos
+        print(f"\n✅ Campos Deletados com Sucesso: {len(successful_deletions)}")
+        if successful_deletions:
+            for field_name in successful_deletions:
+                print(f"  - {field_name}")
+        
+        # Lista de Falhas
+        print(f"\n❌ Falhas na Deleção: {len(failed_deletions)}")
+        if failed_deletions:
+            for failure in failed_deletions:
+                print(f"  - Campo: {failure['field']}")
+                print(f"    Motivo: {failure['reason']}")
         
         print("\n" + "="*60)
-        print("✅ PROCESSO DE EXCLUSÃO FINALIZADO")
-        print("="*60)
-        print(f"Sucessos: {success_count}")
-        print(f"Falhas: {failure_count}")
 
-        if failure_count > 0:
-            print("\nDetalhes das falhas:")
-            for field, success, reason in results:
-                if not success:
-                    print(f"- Campo: {field} | Motivo: {reason}")
-    
         if dry_run:
-            print("\n🐫 Simulação (Dry Run) concluída. Nenhum dado foi alterado.")
+            print("🐫 Simulação (Dry Run) concluída. Nenhum dado foi alterado.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Deleta em massa campos de DMOs baseados em um arquivo CSV.")
