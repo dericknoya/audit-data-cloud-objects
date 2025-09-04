@@ -2,16 +2,15 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 17.03 (Refinamento de Lógica de Data Streams)
-- BASE: v17.01 estável.
-- CORREÇÃO (Leitura de CSV): Aplicado ajuste pontual para ler o cabeçalho
-  'entityname' em minúsculo no arquivo de ativações.
-- REFINAMENTO (Razão de Data Stream): A mensagem para Data Streams inativos
-  agora exibe o nome do DMO de destino (não o DLO) e usa a palavra "mapeado".
-- NOVA LÓGICA (Órfão por Herança): Data Streams inativos agora são reclassificados
-  como "Órfãos" se o DMO para o qual eles mapeiam também for identificado
-  como órfão na mesma execução. A ordem da auditoria foi ajustada para
-  suportar essa dependência.
+Versão: 17.04 (Correção de Fonte de Dados)
+- BASE: v17.03
+- CORREÇÃO (INVALID_FIELD): Removido o campo inexistente 'DataLakeObjectApiName'
+  da consulta ao objeto 'MktDataModelObject' na Tooling API, o que causava
+  um erro fatal na execução.
+- CORREÇÃO (Lógica de Mapeamento DLO->DMO): A criação do mapa que associa DLOs
+  a DMOs agora utiliza a fonte de dados correta (metadados dos DMOs via SSOT API),
+  que já continha a informação, tornando a consulta anterior desnecessária e
+  resolvendo o problema de forma limpa.
 """
 import os
 import time
@@ -184,11 +183,9 @@ def load_dmos_from_activations_csv(config: Config) -> set:
         with open(config.ACTIVATION_FIELDS_CSV, mode='r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                ### AJUSTE: Alterado para 'entityname' (minúsculo) ###
                 if entity_name := row.get('entityname'):
                     if '__dlm' in entity_name:
                         dmo_set.add(normalize_api_name(entity_name))
-
         logging.info(f"✅ Encontrados {len(dmo_set)} DMOs únicos no CSV de ativações.")
     except FileNotFoundError:
         logging.warning(f"⚠️ Arquivo '{config.ACTIVATION_FIELDS_CSV}' não encontrado.")
@@ -235,7 +232,7 @@ async def main():
     config = Config()
     setup_logging(config.LOG_FILE)
     
-    logging.info("🚀 Iniciando auditoria de objetos v17.03...")
+    logging.info("🚀 Iniciando auditoria de objetos v17.04...")
     auth_data = get_access_token(config)
     
     async with SalesforceClient(config, auth_data) as client:
@@ -245,7 +242,8 @@ async def main():
         dmos_from_csv = load_dmos_from_activations_csv(config)
         
         tasks = {
-            "dmo_tooling": client.query_api("SELECT Id, DeveloperName, CreatedDate, CreatedById, DataLakeObjectApiName FROM MktDataModelObject", tooling=True),
+            ### CORREÇÃO: Removido o campo inválido 'DataLakeObjectApiName' ###
+            "dmo_tooling": client.query_api("SELECT Id, DeveloperName, CreatedDate, CreatedById FROM MktDataModelObject", tooling=True),
             "all_segments": client.query_api("SELECT Id, Name, IncludeCriteria, ExcludeCriteria, CreatedById FROM MarketSegment"),
             "all_activations": client.query_api("SELECT Id, Name, MarketSegmentId, LastModifiedDate, CreatedById FROM MarketSegmentActivation"),
             "datastream_sobjects": client.query_api("SELECT Id, Name, CreatedById FROM DataStream"),
@@ -284,8 +282,8 @@ async def main():
         if dgs := data.get('data_graphs'): find_dmos_in_payload(dgs, dmos_used, "Data Graph")
         if das := data.get('data_actions'): find_dmos_in_payload(das, dmos_used, "Data Action")
 
-        ### REFINAMENTO: Cria mapa de DLO para DMO ###
-        dlo_to_dmo_map = {dmo.get('DataLakeObjectApiName'): dmo.get('DeveloperName') for dmo in data.get('dmo_tooling', []) if dmo.get('DataLakeObjectApiName')}
+        ### CORREÇÃO: Mapa de DLO para DMO criado a partir da fonte correta (dmo_metadata) ###
+        dlo_to_dmo_map = {dmo.get('dataLakeObjectApiName'): dmo.get('name') for dmo in data.get('dmo_metadata', []) if dmo.get('dataLakeObjectApiName')}
 
         nested_segment_parents = defaultdict(list)
         if segments_data := data.get('all_segments'):
