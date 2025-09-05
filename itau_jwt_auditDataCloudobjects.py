@@ -418,7 +418,7 @@ async def main():
 
         if streams_data_ssot := data.get('data_streams_ssot'):
             for ds in tqdm(streams_data_ssot, desc="Auditando Data Streams (Passagem 2)"):
-                last_ingest = parse_sf_date(ds.get('lastIngestDate'))
+                last_ingest = parse_sf_date(ds.get('lastRefreshDate'))
                 if not last_ingest or days_since(last_ingest) > config.INACTIVE_STREAM_DAYS:
                     ds_details = datastream_details_map.get(ds.get('name'), {})
                     creator_name = user_id_to_name_map.get(ds_details.get('CreatedById'), 'Desconhecido')
