@@ -2,11 +2,8 @@
 """
 Script para extrair mapeamentos de DMOs (Data Model Objects) do Salesforce Data Cloud.
 
-Este script executa as seguintes ações:
-1. Autentica-se na organização Salesforce usando JWT.
-2. Obtém a lista de todos os DMOs disponíveis via API.
-3. Para cada DMO, busca seus mapeamentos de ingestão (DLO -> DMO).
-4. Gera um arquivo CSV ('dmo_mappings.csv') com os detalhes de cada mapeamento encontrado.
+Versão Corrigida: Garante premissas de configuração de rede idênticas ao script original.
+- Valores padrão de USE_PROXY e VERIFY_SSL restaurados para o comportamento original.
 """
 import os
 import time
@@ -22,26 +19,26 @@ from dotenv import load_dotenv
 from tqdm.asyncio import tqdm
 
 # ==============================================================================
-# --- ⚙️ CONFIGURAÇÃO CENTRALIZADA ---
+# --- ⚙️ CONFIGURAÇÃO CENTRALIZADA (LÓGICA IDÊNTICA AO ORIGINAL) ---
 # ==============================================================================
 load_dotenv()
 
 class Config:
     """Classe de configuração para centralizar os parâmetros do script."""
-    # Configurações de Conexão
-    USE_PROXY = os.getenv("USE_PROXY", "False").lower() == "true"
+    # Configurações de Conexão com os MESMOS PADRÕES do script original
+    USE_PROXY = os.getenv("USE_PROXY", "True").lower() == "true"
     PROXY_URL = os.getenv("PROXY_URL")
-    VERIFY_SSL = os.getenv("VERIFY_SSL", "True").lower() == "true"
+    VERIFY_SSL = os.getenv("VERIFY_SSL", "False").lower() == "true"
     
     # Credenciais e Endpoints Salesforce
-    API_VERSION = "v60.0" # Mantenha a versão mais recente compatível
+    API_VERSION = "v60.0"
     SF_CLIENT_ID = os.getenv("SF_CLIENT_ID")
     SF_USERNAME = os.getenv("SF_USERNAME")
     SF_AUDIENCE = os.getenv("SF_AUDIENCE")
     SF_LOGIN_URL = os.getenv("SF_LOGIN_URL")
     
     # Configurações de Execução
-    SEMAPHORE_LIMIT = 10 # Limite de chamadas concorrentes à API
+    SEMAPHORE_LIMIT = 10
     MAX_RETRIES = 3
     RETRY_DELAY_SECONDS = 5
     
@@ -58,13 +55,9 @@ def setup_logging(log_file):
     if logger.hasHandlers(): logger.handlers.clear()
     logger.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    
-    # Handler para arquivo
     file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-    
-    # Handler para console
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
@@ -79,17 +72,9 @@ def get_access_token(config: Config):
         logging.critical("❌ Arquivo 'private.pem' não encontrado. Encerrando.")
         raise
 
-    payload = {
-        'iss': config.SF_CLIENT_ID,
-        'sub': config.SF_USERNAME,
-        'aud': config.SF_AUDIENCE,
-        'exp': int(time.time()) + 300
-    }
+    payload = {'iss': config.SF_CLIENT_ID, 'sub': config.SF_USERNAME, 'aud': config.SF_AUDIENCE, 'exp': int(time.time()) + 300}
     assertion = jwt.encode(payload, private_key, algorithm='RS256')
-    params = {
-        'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-        'assertion': assertion
-    }
+    params = {'grant_type': 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion': assertion}
     
     token_url = urljoin(config.SF_LOGIN_URL, "/services/oauth2/token")
     proxies = {'http': config.PROXY_URL, 'https': config.PROXY_URL} if config.USE_PROXY and config.PROXY_URL else None
@@ -149,7 +134,7 @@ class SalesforceClient:
                                 next_url = data.get('nextRecordsUrl') or data.get('nextPageUrl')
                                 current_url = urljoin(str(self.session._base_url), next_url) if next_url else None
                             else:
-                                return data # Retorna o payload completo se não houver uma chave específica
+                                return data
                     return all_records
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     if attempt < self.config.MAX_RETRIES - 1:
@@ -160,12 +145,10 @@ class SalesforceClient:
                         return [] if key_name else None
 
     async def get_ssot_endpoint(self, endpoint_path, key_name=None):
-        """Busca dados de um endpoint SSOT genérico."""
         url = f"/services/data/{self.config.API_VERSION}/ssot/{endpoint_path}"
         return await self._fetch_with_retry(url, key_name=key_name)
 
     async def fetch_dmo_mapping_details(self, dmo_api_name: str):
-        """Busca os detalhes de mapeamento para um DMO específico."""
         params = {'dataspace': 'default', 'dmoDeveloperName': dmo_api_name}
         url_path = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings?{urlencode(params)}"
         return await self._fetch_with_retry(url_path)
@@ -178,6 +161,16 @@ async def main():
     config = Config()
     setup_logging(config.LOG_FILE)
     
+    logging.info("--- Verificando Configurações de Rede (Lógica Original) ---")
+    if config.USE_PROXY:
+        logging.info(f"PROXY ATIVADO. Usando URL: {config.PROXY_URL}")
+        if not config.PROXY_URL:
+            logging.warning("!!! ATENÇÃO: USE_PROXY=True, mas PROXY_URL não está definido no arquivo .env. A conexão provavelmente falhará.")
+    else:
+        logging.info("PROXY DESATIVADO. Tentando conexão direta.")
+    logging.info(f"Verificação de SSL: {config.VERIFY_SSL}")
+    logging.info("----------------------------------------------------------")
+    
     logging.info("🚀 Iniciando extrator de mapeamentos de DMOs...")
     
     try:
@@ -188,7 +181,6 @@ async def main():
 
     async with SalesforceClient(config, auth_data) as client:
         
-        # --- ETAPA 1: Buscar a lista de todos os DMOs ---
         logging.info("--- Etapa 1/3: Buscando a lista de DMOs... ---")
         dmo_metadata = await client.get_ssot_endpoint("metadata?entityType=DataModelObject", key_name='metadata')
         
@@ -199,19 +191,16 @@ async def main():
         dmo_names = sorted([dmo.get('name') for dmo in dmo_metadata if dmo.get('name')])
         logging.info(f"✅ Encontrados {len(dmo_names)} DMOs para verificar.")
 
-        # --- ETAPA 2: Buscar os mapeamentos para cada DMO ---
         logging.info("--- Etapa 2/3: Coletando os mapeamentos de cada DMO... ---")
         mapping_tasks = [client.fetch_dmo_mapping_details(name) for name in dmo_names]
         all_mappings_results = await tqdm.gather(*mapping_tasks, desc="Coletando mapeamentos")
 
-        # --- ETAPA 3: Processar os resultados e gerar o CSV ---
         logging.info("--- Etapa 3/3: Processando resultados e gerando o arquivo CSV... ---")
         csv_data = []
         
-        # Itera sobre os nomes e os resultados correspondentes
         for dmo_name, payload in zip(dmo_names, all_mappings_results):
             if not payload or 'objectSourceTargetMaps' not in payload:
-                continue # Pula DMOs sem mapeamentos ou com resposta de erro
+                continue
             
             mappings = payload.get('objectSourceTargetMaps', [])
             for mapping in mappings:
@@ -225,7 +214,6 @@ async def main():
             logging.warning("⚠️ Nenhum mapeamento foi encontrado para os DMOs verificados.")
             return
 
-        # Escreve o arquivo CSV
         try:
             fieldnames = ['DMO_API_NAME', 'DLO_SOURCE', 'OBJECT_MAP_NAME']
             with open(config.OUTPUT_CSV_FILE, 'w', newline='', encoding='utf-8') as f:
