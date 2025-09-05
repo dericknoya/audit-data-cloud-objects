@@ -2,17 +2,16 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 22.02 (Lógica de Fontes Corrigida e API v64.0)
-- BASE: v22.01
-- CORREÇÃO CRÍTICA (Fonte de Dados para Mapeamentos): A lógica foi reestruturada
-  para seguir o padrão correto de uso das APIs:
-  1. A lista principal de DMOs para auditoria agora vem do endpoint de metadados
-     da SSOT API, que contém o nome de API completo e o nome de exibição.
-  2. A consulta à Tooling API (MktDataModelObject) é usada exclusivamente para
-     enriquecer os dados com 'CreatedById' e 'CreatedDate'.
-  Isso garante que o filtro de DMOs de sistema e as chamadas à API de
-  mapeamentos utilizem o identificador correto.
-- CORREÇÃO (API Version): A versão da API foi fixada em 'v64.0'.
+Versão: 24.00 (Lógica de Mapeamento Corrigida)
+- BASE: v23.02
+- CORREÇÃO CRÍTICA (Lógica de Mapeamento): A lógica de coleta e processamento
+  de mapeamentos foi substituída pela abordagem validada no script extrator
+  fornecido pelo usuário. O script agora:
+  1. Busca mapeamentos para TODOS os DMOs, sem pré-filtragem.
+  2. Processa a resposta da API usando as chaves corretas: 'objectSourceTargetMaps'
+     e 'sourceEntityDeveloperName'.
+- OBJETIVO: Resolver definitivamente a inconsistência na detecção de mapeamentos
+  e garantir que o relatório final seja preciso.
 """
 import os
 import time
@@ -229,7 +228,7 @@ async def main():
     config = Config()
     setup_logging(config.LOG_FILE)
     
-    logging.info("🚀 Iniciando auditoria de objetos v22.02...")
+    logging.info("🚀 Iniciando auditoria de objetos v24.00...")
     auth_data = get_access_token(config)
     
     async with SalesforceClient(config, auth_data) as client:
@@ -253,26 +252,28 @@ async def main():
         # ETAPA 2: Coleta Segura de Mapeamentos e Processamento
         logging.info("--- Etapa 2/4: Processando dados e coletando mapeamentos... ---")
 
-        dmos_to_check_for_mappings = [
-            dmo_meta.get('name') for dmo_meta in data.get('dmo_metadata', [])
-            if (dmo_api_name := dmo_meta.get('name')) and not any(dmo_api_name.lower().startswith(p) for p in config.DMO_PREFIXES_TO_EXCLUDE)
-        ]
-        logging.info(f"Identificados {len(dmos_to_check_for_mappings)} DMOs para verificação de mapeamentos.")
+        # Busca mapeamentos para TODOS os DMOs, sem pre-filtragem
+        dmos_to_check_for_mappings = [dmo_meta.get('name') for dmo_meta in data.get('dmo_metadata', []) if dmo_meta.get('name')]
+        logging.info(f"Identificados {len(dmos_to_check_for_mappings)} DMOs para verificação de mapeamentos (incluindo DMOs de sistema).")
         
         mapping_tasks = [client.fetch_dmo_mapping_details(dmo_name) for dmo_name in dmos_to_check_for_mappings]
         all_mappings_results = await tqdm.gather(*mapping_tasks, desc="Coletando mapeamentos de DMOs")
 
+        ### CORREÇÃO: Usa as chaves corretas do payload de mapeamento, conforme script de extração ###
         dlo_to_dmos_map = defaultdict(list)
         dmos_with_mappings = set()
-        for payload in all_mappings_results:
-            if payload and (mappings := payload.get('objectMappings')):
+        # Associa o nome do DMO com sua respectiva resposta para uso correto
+        responses_with_dmo_names = dict(zip(dmos_to_check_for_mappings, all_mappings_results))
+
+        for dmo_api_name, payload in responses_with_dmo_names.items():
+            if payload and (mappings := payload.get('objectSourceTargetMaps')): # Chave correta!
                 for mapping in mappings:
-                    source_dlo = mapping.get('sourceObjectName')
-                    target_dmo = mapping.get('targetObjectName')
-                    if source_dlo and target_dmo:
+                    source_dlo = mapping.get('sourceEntityDeveloperName') # Chave correta!
+                    # O target é o DMO que foi consultado
+                    if source_dlo and dmo_api_name:
                         normalized_dlo = normalize_api_name(source_dlo)
-                        dlo_to_dmos_map[normalized_dlo].append(target_dmo)
-                        dmos_with_mappings.add(target_dmo)
+                        dlo_to_dmos_map[normalized_dlo].append(dmo_api_name)
+                        dmos_with_mappings.add(dmo_api_name)
         logging.info(f"Processados {len(dmos_with_mappings)} DMOs com mapeamentos.")
 
         all_creator_ids = set()
