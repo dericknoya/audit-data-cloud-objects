@@ -2,11 +2,17 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 23.01 (Versão da API Corrigida)
-- BASE: v23.00 (estável)
-- CORREÇÃO (API Version): A versão da API foi corrigida permanentemente para
-  'v64.0'. O uso de uma versão anterior estava causando inconsistências na
-  coleta de dados de mapeamento.
+Versão: 22.02 (Lógica de Fontes Corrigida e API v64.0)
+- BASE: v22.01
+- CORREÇÃO CRÍTICA (Fonte de Dados para Mapeamentos): A lógica foi reestruturada
+  para seguir o padrão correto de uso das APIs:
+  1. A lista principal de DMOs para auditoria agora vem do endpoint de metadados
+     da SSOT API, que contém o nome de API completo e o nome de exibição.
+  2. A consulta à Tooling API (MktDataModelObject) é usada exclusivamente para
+     enriquecer os dados com 'CreatedById' e 'CreatedDate'.
+  Isso garante que o filtro de DMOs de sistema e as chamadas à API de
+  mapeamentos utilizem o identificador correto.
+- CORREÇÃO (API Version): A versão da API foi fixada em 'v64.0'.
 """
 import os
 import time
@@ -34,7 +40,6 @@ class Config:
     USE_PROXY = os.getenv("USE_PROXY", "True").lower() == "true"
     PROXY_URL = os.getenv("PROXY_URL")
     VERIFY_SSL = os.getenv("VERIFY_SSL", "False").lower() == "true"
-    ### CORREÇÃO: Versão da API restaurada para 64.0 ###
     API_VERSION = "v64.0"
     SF_CLIENT_ID = os.getenv("SF_CLIENT_ID")
     SF_USERNAME = os.getenv("SF_USERNAME")
@@ -224,7 +229,7 @@ async def main():
     config = Config()
     setup_logging(config.LOG_FILE)
     
-    logging.info("🚀 Iniciando auditoria de objetos v23.01...")
+    logging.info("🚀 Iniciando auditoria de objetos v22.02...")
     auth_data = get_access_token(config)
     
     async with SalesforceClient(config, auth_data) as client:
