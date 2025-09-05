@@ -2,14 +2,11 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 22.03 (Debug Crítico de Mapeamentos)
-- BASE: v22.02
-- RECURSO DE DEBUG REINTRODUZIDO: A instrumentação para diagnosticar o problema
-  de mapeamentos não encontrados foi reinserida no script funcional.
-  - Gera 'debug_mapping_calls.csv': Registra cada URL consultada.
-  - Gera 'debug_mapping_responses.json': Salva a resposta bruta da API para análise.
-- OBJETIVO: Coletar dados precisos sobre as chamadas e respostas da API de
-  mapeamento para permitir uma correção definitiva.
+Versão: 23.01 (Versão da API Corrigida)
+- BASE: v23.00 (estável)
+- CORREÇÃO (API Version): A versão da API foi corrigida permanentemente para
+  'v64.0'. O uso de uma versão anterior estava causando inconsistências na
+  coleta de dados de mapeamento.
 """
 import os
 import time
@@ -37,7 +34,8 @@ class Config:
     USE_PROXY = os.getenv("USE_PROXY", "True").lower() == "true"
     PROXY_URL = os.getenv("PROXY_URL")
     VERIFY_SSL = os.getenv("VERIFY_SSL", "False").lower() == "true"
-    API_VERSION = "v60.0"
+    ### CORREÇÃO: Versão da API restaurada para 64.0 ###
+    API_VERSION = "v64.0"
     SF_CLIENT_ID = os.getenv("SF_CLIENT_ID")
     SF_USERNAME = os.getenv("SF_USERNAME")
     SF_AUDIENCE = os.getenv("SF_AUDIENCE")
@@ -52,9 +50,6 @@ class Config:
     OUTPUT_CSV_FILE = 'audit_objetos_para_exclusao.csv'
     ACTIVATION_FIELDS_CSV = 'ativacoes_campos.csv'
     LOG_FILE = 'audit_data_cloud_objects.log'
-    ### ARQUIVOS DE DEBUG ###
-    DEBUG_MAPPING_CALLS_CSV = 'debug_mapping_calls.csv'
-    DEBUG_MAPPING_RESPONSES_JSON = 'debug_mapping_responses.json'
 
 # ==============================================================================
 # --- 헬 FUNÇÕES AUXILIARES E LOGGING ---
@@ -167,18 +162,8 @@ class SalesforceClient:
     
     async def fetch_dmo_mapping_details(self, dmo_name: str):
         params = {'dataspace': 'default', 'dmoDeveloperName': dmo_name}
-        url_path = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings?{urlencode(params)}"
-        
-        ### DEBUG: Registra a chamada que será feita ###
-        try:
-            with open(self.config.DEBUG_MAPPING_CALLS_CSV, 'a', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                full_url = urljoin(self.instance_url, url_path)
-                writer.writerow([datetime.now().isoformat(), dmo_name, full_url])
-        except Exception as e:
-            logging.error(f"Falha ao escrever no arquivo de debug de chamadas: {e}")
-
-        return await self._fetch_with_retry(url_path)
+        url = f"/services/data/{self.config.API_VERSION}/ssot/data-model-object-mappings?{urlencode(params)}"
+        return await self._fetch_with_retry(url)
 
 # ==============================================================================
 # --- 📊 FUNÇÕES DE ANÁLISE DE DEPENDÊNCIA ---
@@ -239,7 +224,7 @@ async def main():
     config = Config()
     setup_logging(config.LOG_FILE)
     
-    logging.info("🚀 Iniciando auditoria de objetos v22.03 (Debug Crítico)...")
+    logging.info("🚀 Iniciando auditoria de objetos v23.01...")
     auth_data = get_access_token(config)
     
     async with SalesforceClient(config, auth_data) as client:
@@ -268,46 +253,23 @@ async def main():
             if (dmo_api_name := dmo_meta.get('name')) and not any(dmo_api_name.lower().startswith(p) for p in config.DMO_PREFIXES_TO_EXCLUDE)
         ]
         logging.info(f"Identificados {len(dmos_to_check_for_mappings)} DMOs para verificação de mapeamentos.")
-        logging.info(f"DEBUG: Amostra de DMOs a serem verificados: {dmos_to_check_for_mappings[:5]}")
         
-        try:
-            with open(config.DEBUG_MAPPING_CALLS_CSV, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(['timestamp', 'dmo_name_passed_to_api', 'full_url_called'])
-            logging.info(f"Arquivo de debug de chamadas '{config.DEBUG_MAPPING_CALLS_CSV}' inicializado.")
-        except Exception as e:
-            logging.error(f"Não foi possível criar o arquivo de debug de chamadas: {e}")
-
         mapping_tasks = [client.fetch_dmo_mapping_details(dmo_name) for dmo_name in dmos_to_check_for_mappings]
         all_mappings_results = await tqdm.gather(*mapping_tasks, desc="Coletando mapeamentos de DMOs")
-
-        logging.info(f"Recebidas {len(all_mappings_results)} respostas da API de mapeamentos.")
-        try:
-            responses_with_dmo_names = dict(zip(dmos_to_check_for_mappings, all_mappings_results))
-            with open(config.DEBUG_MAPPING_RESPONSES_JSON, 'w', encoding='utf-8') as f:
-                json.dump(responses_with_dmo_names, f, indent=4, ensure_ascii=False)
-            logging.info(f"Respostas brutas da API de mapeamento salvas em '{config.DEBUG_MAPPING_RESPONSES_JSON}'.")
-        except Exception as e:
-            logging.error(f"Não foi possível salvar o arquivo de debug de respostas: {e}")
 
         dlo_to_dmos_map = defaultdict(list)
         dmos_with_mappings = set()
         for payload in all_mappings_results:
-            mappings = []
-            if isinstance(payload, dict):
-                mappings = payload.get('objectSourceTargetMaps', [])
-            elif isinstance(payload, list):
-                mappings = payload
-            
-            for mapping in mappings:
-                source_dlo = mapping.get('sourceEntityDeveloperName')
-                target_dmo = mapping.get('targetEntityDeveloperName')
-                if source_dlo and target_dmo:
-                    normalized_dlo = normalize_api_name(source_dlo)
-                    dlo_to_dmos_map[normalized_dlo].append(target_dmo)
-                    dmos_with_mappings.add(target_dmo)
+            if payload and (mappings := payload.get('objectMappings')):
+                for mapping in mappings:
+                    source_dlo = mapping.get('sourceObjectName')
+                    target_dmo = mapping.get('targetObjectName')
+                    if source_dlo and target_dmo:
+                        normalized_dlo = normalize_api_name(source_dlo)
+                        dlo_to_dmos_map[normalized_dlo].append(target_dmo)
+                        dmos_with_mappings.add(target_dmo)
         logging.info(f"Processados {len(dmos_with_mappings)} DMOs com mapeamentos.")
-        
+
         all_creator_ids = set()
         for key in ["dmo_tooling", "all_segments", "all_activations", "datastream_sobjects"]:
             if data.get(key):
