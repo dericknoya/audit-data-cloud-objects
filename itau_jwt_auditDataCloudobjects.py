@@ -2,16 +2,71 @@
 """
 Script de auditoria Salesforce Data Cloud - Objetos órfãos e inativos
 
-Versão: 24.00 (Lógica de Mapeamento Corrigida)
-- BASE: v23.02
-- CORREÇÃO CRÍTICA (Lógica de Mapeamento): A lógica de coleta e processamento
-  de mapeamentos foi substituída pela abordagem validada no script extrator
-  fornecido pelo usuário. O script agora:
-  1. Busca mapeamentos para TODOS os DMOs, sem pré-filtragem.
-  2. Processa a resposta da API usando as chaves corretas: 'objectSourceTargetMaps'
-     e 'sourceEntityDeveloperName'.
-- OBJETIVO: Resolver definitivamente a inconsistência na detecção de mapeamentos
-  e garantir que o relatório final seja preciso.
+Versão: 25.01 (Final Estável com Regras Documentadas)
+- BASE: Lógica validada e estável da v25.00.
+- DOCUMENTAÇÃO: Adicionado um cabeçalho detalhado com as regras de negócio
+  aplicadas para cada tipo de objeto, conforme solicitado.
+
+-------------------------------------------------------------------------------
+Regras de Negócio para Classificação de Objetos
+-------------------------------------------------------------------------------
+
+Este script classifica objetos como "Órfão" ou "Inativo" com base nas seguintes
+regras de negócio:
+
+--- Data Model Objects (DMOs) ---
+
+Um DMO é considerado "Órfão" se TODAS as condições abaixo forem verdadeiras:
+    * Idade: Foi criado há mais de 90 dias.
+    * Uso Direto: NÃO é utilizado em Segmentos, Calculated Insights, Data Graphs
+      ou Data Actions.
+    * Uso em Ativação: NÃO é referenciado no arquivo de dependências de
+      ativações (ativacoes_campos.csv).
+    * Uso em Ingestão: NÃO é o alvo de um mapeamento de um Data Stream.
+
+    Nota: DMOs de sistema (com prefixos como 'ssot_', 'unified_', etc.) são
+    automaticamente ignorados pela auditoria.
+
+--- Data Streams ---
+
+Um Data Stream é avaliado se sua última ingestão ocorreu há mais de 30 dias.
+Nesse caso, ele é classificado como:
+
+    * Status: Inativo
+        - Condição: Está mapeado para pelo menos um DMO que NÃO é órfão.
+        - Razão: O Data Stream está configurado, mas inativo. Manter para
+          análise, pois sua exclusão pode não ser desejada.
+
+    * Status: Órfão
+        - Condição A: Não possui mapeamento para nenhum DMO.
+        - Condição B (Órfão por Herança): Está mapeado, mas TODOS os DMOs de
+          destino também foram classificados como "Órfãos" nesta auditoria.
+        - Razão: O Data Stream está inativo e não alimenta nenhum DMO ativo,
+          sendo um forte candidato à exclusão.
+
+--- Segmentos ---
+
+Um Segmento é avaliado se sua última publicação ocorreu há mais de 30 dias.
+Nesse caso, ele é classificado como:
+
+    * Status: Inativo
+        - Condição: É utilizado como filtro (aninhado) em outro Segmento.
+        - Razão: Embora não seja publicado, sua exclusão quebraria a lógica
+          de outros segmentos que dependem dele.
+
+    * Status: Órfão
+        - Condição: NÃO é utilizado como filtro em nenhum outro Segmento.
+        - Razão: Não é publicado e não possui dependências, sendo um forte
+          candidato à exclusão.
+
+--- Ativações (Activations) ---
+
+A regra para Ativações é direta e baseada em herança:
+
+    * Status: Órfã
+        - Condição: Está associada a um Segmento que foi classificado como "Órfão".
+        - Razão: Se o Segmento de origem for excluído, a Ativação perde sua
+          utilidade.
 """
 import os
 import time
@@ -228,7 +283,7 @@ async def main():
     config = Config()
     setup_logging(config.LOG_FILE)
     
-    logging.info("🚀 Iniciando auditoria de objetos v24.00...")
+    logging.info("🚀 Iniciando auditoria de objetos v25.00 (Versão Estável Final)...")
     auth_data = get_access_token(config)
     
     async with SalesforceClient(config, auth_data) as client:
@@ -252,24 +307,23 @@ async def main():
         # ETAPA 2: Coleta Segura de Mapeamentos e Processamento
         logging.info("--- Etapa 2/4: Processando dados e coletando mapeamentos... ---")
 
-        # Busca mapeamentos para TODOS os DMOs, sem pre-filtragem
-        dmos_to_check_for_mappings = [dmo_meta.get('name') for dmo_meta in data.get('dmo_metadata', []) if dmo_meta.get('name')]
-        logging.info(f"Identificados {len(dmos_to_check_for_mappings)} DMOs para verificação de mapeamentos (incluindo DMOs de sistema).")
+        dmos_to_check_for_mappings = [
+            dmo_meta.get('name') for dmo_meta in data.get('dmo_metadata', [])
+            if (dmo_api_name := dmo_meta.get('name')) and not any(dmo_api_name.lower().startswith(p) for p in config.DMO_PREFIXES_TO_EXCLUDE)
+        ]
+        logging.info(f"Identificados {len(dmos_to_check_for_mappings)} DMOs para verificação de mapeamentos.")
         
         mapping_tasks = [client.fetch_dmo_mapping_details(dmo_name) for dmo_name in dmos_to_check_for_mappings]
         all_mappings_results = await tqdm.gather(*mapping_tasks, desc="Coletando mapeamentos de DMOs")
 
-        ### CORREÇÃO: Usa as chaves corretas do payload de mapeamento, conforme script de extração ###
         dlo_to_dmos_map = defaultdict(list)
         dmos_with_mappings = set()
-        # Associa o nome do DMO com sua respectiva resposta para uso correto
         responses_with_dmo_names = dict(zip(dmos_to_check_for_mappings, all_mappings_results))
 
         for dmo_api_name, payload in responses_with_dmo_names.items():
-            if payload and (mappings := payload.get('objectSourceTargetMaps')): # Chave correta!
+             if payload and (mappings := payload.get('objectSourceTargetMaps')):
                 for mapping in mappings:
-                    source_dlo = mapping.get('sourceEntityDeveloperName') # Chave correta!
-                    # O target é o DMO que foi consultado
+                    source_dlo = mapping.get('sourceEntityDeveloperName')
                     if source_dlo and dmo_api_name:
                         normalized_dlo = normalize_api_name(source_dlo)
                         dlo_to_dmos_map[normalized_dlo].append(dmo_api_name)
